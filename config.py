@@ -1,0 +1,25 @@
+DISCORD_USER_TOKEN = "USER_TOKEN"
+
+# Target channel ID for monitoring
+TARGET_CHANNEL_ID = 1315754807595761695
+
+# Complaint/violation channel IDs for nickname cross-checking
+COMPLAINT_CHANNEL_IDS = [
+    1253763748603367464,  # LUST STATION
+    920845668153700393,  # SS14/Corvax (complaints)
+    921508655856234537,  # SS14/Corvax (appeals)
+    1173186338753884220,  # SS14/Corvax (responses)
+    1241728803949252618,  # SS220
+    1234367190040318053,  # Imperial
+    1306191493530128454,  # Corvax 18+
+    1175578453567864863,  # SUNRISE
+    1157956566213992468,  # Fish Station
+    1112658022859284500,  # Space Stories
+    1291023511607054387,  # Adventure Time
+    1241692667214168166,  # Space Stories - Marines
+    1264636346610221068,  # FIRE STATION 2.0
+]
+
+# Admin credentials for admin.deadspace14.net
+ADMIN_USERNAME = "USERNAME"
+ADMIN_PASSWORD = "PASSWORD"
