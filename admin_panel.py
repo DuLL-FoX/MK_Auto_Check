@@ -2,7 +2,11 @@ from typing import Dict, Union, List
 import requests
 from bs4 import BeautifulSoup
 import re
+import logging
 
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+)
 
 class AdminPanel:
     def __init__(self, username, password):
@@ -19,18 +23,19 @@ class AdminPanel:
         try:
             response = self.session.get(initial_url, allow_redirects=True)
             response.raise_for_status()
+            logging.info(f"Successfully accessed initial URL: {initial_url}")
         except requests.exceptions.RequestException as e:
-            print(f"[-] Error accessing admin site: {e}")
+            logging.error(f"Error accessing admin site: {e}")
             return False
 
         if 'account.spacestation14.com' not in response.url:
-            print("[-] Did not get redirected to the SSO login page.")
+            logging.warning("Did not get redirected to the SSO login page.")
             return False
 
         soup = BeautifulSoup(response.text, 'html.parser')
         token_input = soup.find('input', {'name': '__RequestVerificationToken'})
         if not token_input:
-            print("[-] Could not find anti-forgery token on login page.")
+            logging.error("Could not find anti-forgery token on login page.")
             return False
 
         token = token_input.get('value')
@@ -51,15 +56,16 @@ class AdminPanel:
         try:
             response = self.session.post(login_url, data=payload, headers=headers, allow_redirects=True)
             response.raise_for_status()
+            logging.info("Login request successful.")
         except requests.exceptions.RequestException as e:
-            print(f"[-] Error during login request: {e}")
+            logging.error(f"Error during login request: {e}")
             return False
 
         if 'admin.deadspace14.net/signin-oidc' in response.text:
             soup = BeautifulSoup(response.text, 'html.parser')
             form = soup.find('form')
             if not form:
-                print("[-] Could not find the redirect form after login.")
+                logging.error("Could not find the redirect form after login.")
                 return False
 
             action_url = form.get('action')
@@ -74,18 +80,19 @@ class AdminPanel:
                     allow_redirects=True
                 )
                 response.raise_for_status()
+                logging.info("Redirect form submission successful.")
             except requests.exceptions.RequestException as e:
-                print(f"[-] Error submitting redirect form: {e}")
+                logging.error(f"Error submitting redirect form: {e}")
                 return False
 
             if 'Logout' in response.text or 'Players' in response.text:
-                print("[+] Successfully authenticated to admin.deadspace14.net!")
+                logging.info("Successfully authenticated to admin.deadspace14.net!")
                 return True
             else:
-                print("[-] The final redirect to admin.deadspace14.net failed.")
+                logging.warning("The final redirect to admin.deadspace14.net failed.")
                 return False
         else:
-            print("[-] Did not get the expected redirect form from SSO. Possibly wrong credentials.")
+            logging.warning("Did not get the expected redirect form from SSO. Possibly wrong credentials.")
             return False
 
     def check_account_on_site(self, url: str) -> Dict[str, Union[str, List[str], None, bool, int]]:
@@ -108,6 +115,7 @@ class AdminPanel:
             html = resp.text
             result["raw_html_snippet"] = html[:500]
             soup = BeautifulSoup(html, 'html.parser')
+            logging.debug(f"Successfully fetched and parsed URL: {url}")
 
             rows = soup.find_all("tr")
             found_denied = False
@@ -179,9 +187,9 @@ class AdminPanel:
                         result["status"] = "banned"
 
         except requests.exceptions.RequestException as e:
-            print(f"[-] Error checking {url}: {e}")
+            logging.error(f"Error checking {url}: {e}")
         except Exception as e:
-            print(f"[-] Exception checking {url}: {e}")
+            logging.error(f"Exception checking {url}: {e}", exc_info=True)
 
         return result
 
@@ -195,8 +203,9 @@ class AdminPanel:
         try:
             resp = self.session.get(info_url)
             resp.raise_for_status()
+            logging.debug(f"Successfully fetched player info for user ID: {user_id}")
         except requests.exceptions.RequestException as e:
-            print(f"[-] Error fetching player info for {user_id}: {e}")
+            logging.error(f"Error fetching player info for {user_id}: {e}")
             return info_result
 
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -219,6 +228,7 @@ class AdminPanel:
 
             info_result["ban_counts"] = len(ban_reasons)
             info_result["ban_reasons"] = ban_reasons
+            logging.debug(f"Found {info_result['ban_counts']} bans for user ID: {user_id}")
 
         return info_result
 
