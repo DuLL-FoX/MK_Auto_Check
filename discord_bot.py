@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import List, Dict, Any, Optional
 
 import discord
@@ -15,6 +16,7 @@ logging.basicConfig(
 
 MESSAGE_LINK_FORMAT = "https://discord.com/channels/{}/{}/{}"
 SCAN_REPORT_FILENAME = "scan_report.json"
+COMPLAINT_CACHE_FILENAME = "complaint_message_cache.json"
 SHARED_HWID_INFO_FORMAT = "Shared HWID with: {}"
 COMPLAINT_LINKS_SUMMARY_FORMAT = "\n      Found in complaint messages:\n{}"
 COMPLAINT_LINK_ITEM_FORMAT = "      - {}"
@@ -29,21 +31,27 @@ SUSPICIOUS_VERDICT = "SUSPICIOUS / CHECK SERVER BANS"
 UNKNOWN_VERDICT = "UNKNOWN / NEED MANUAL CHECK"
 N_A = "N/A"
 
+EMBED_FIELDS_TO_CACHE = ["title", "description", "fields"]
+
+
 class DiscordBot(discord.Client):
 
     def __init__(
-            self,
-            admin_panel: AdminPanel,
-            message_limit: int = 10,
-            complaint_message_history_limit: int = 200,
-            *args,
-            **kwargs
+        self,
+        admin_panel: AdminPanel,
+        message_limit: int = 10,
+        complaint_message_history_limit: int = 6000,
+        *args,
+        **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
         self.admin_panel = admin_panel
         self.message_limit = message_limit
         self.complaint_message_history_limit = complaint_message_history_limit
         self.target_channel: Optional[discord.TextChannel] = None
+        self.complaint_channels: Dict[int, discord.TextChannel] = {}
+
+        self.complaint_message_cache: Dict[int, Dict[str, Any]] = {}
 
     async def _login_to_admin_panel(self) -> bool:
         logging.info("Logging in to the admin panel...")
@@ -62,6 +70,71 @@ class DiscordBot(discord.Client):
         logging.info(f"Target channel found: '{self.target_channel.name}' ({TARGET_CHANNEL_ID})")
         return True
 
+    async def _fetch_complaint_channels(self) -> bool:
+        logging.info("Fetching complaint channels...")
+        for ch_id in COMPLAINT_CHANNEL_IDS:
+            channel = self.get_channel(ch_id)
+            if not channel:
+                logging.warning(f"Could not find complaint channel with ID: {ch_id}")
+                continue
+            self.complaint_channels[ch_id] = channel
+            logging.info(f"Complaint channel found: '{channel.name}' ({ch_id})")
+        return True
+
+    async def _load_complaint_cache(self) -> None:
+        logging.info("Loading complaint message cache...")
+        if os.path.exists(COMPLAINT_CACHE_FILENAME):
+            try:
+                with open(COMPLAINT_CACHE_FILENAME, 'r', encoding='utf-8') as f:
+                    raw_data = json.load(f)
+
+                for ch_str_id, ch_data in raw_data.items():
+                    ch_id = int(ch_str_id)
+                    self.complaint_message_cache[ch_id] = {
+                        "messages": ch_data.get("messages", []),
+                        "last_cached_id": ch_data.get("last_cached_id", None)
+                    }
+                logging.info(
+                    f"Loaded cache for {len(self.complaint_message_cache)} channels "
+                    f"from '{COMPLAINT_CACHE_FILENAME}'."
+                )
+            except Exception as e:
+                logging.error(f"Error loading complaint cache: {e}")
+        else:
+            logging.info("Complaint message cache file not found.")
+
+    async def _save_complaint_cache(self) -> None:
+        logging.info("Saving complaint message cache...")
+        cache_data: Dict[str, Any] = {}
+
+        for ch_id, ch_cache in self.complaint_message_cache.items():
+            saved_messages = []
+            for msg in ch_cache["messages"]:
+                saved_messages.append({
+                    "id": msg['id'],
+                    "content": msg['content'],
+                    "embeds": [
+                        {
+                            k: embed_data[k]
+                            for k in EMBED_FIELDS_TO_CACHE
+                            if k in embed_data
+                        }
+                        for embed_data in msg.get('embeds', [])
+                    ]
+                })
+
+            cache_data[str(ch_id)] = {
+                "messages": saved_messages,
+                "last_cached_id": ch_cache.get("last_cached_id")
+            }
+
+        try:
+            with open(COMPLAINT_CACHE_FILENAME, 'w', encoding='utf-8') as f:
+                json.dump(cache_data, f, ensure_ascii=False, indent=4)
+            logging.info(f"Saved complaint message cache to '{COMPLAINT_CACHE_FILENAME}'.")
+        except Exception as e:
+            logging.error(f"Error saving complaint cache: {e}")
+
     async def setup(self) -> bool:
         logging.info("Setting up the bot...")
 
@@ -73,6 +146,11 @@ class DiscordBot(discord.Client):
             await self.close()
             return False
 
+        if not await self._fetch_complaint_channels():
+            await self.close()
+            return False
+
+        await self._load_complaint_cache()
         return True
 
     async def on_ready(self) -> None:
@@ -84,6 +162,7 @@ class DiscordBot(discord.Client):
         report_data = await self.process_messages()
 
         self.write_json_report(report_data, file_name=SCAN_REPORT_FILENAME)
+        await self._save_complaint_cache()
 
         logging.info("Finished scanning messages. Disconnecting from Discord.")
         await self.close()
@@ -99,10 +178,15 @@ class DiscordBot(discord.Client):
         )
 
         report_data: List[Dict[str, Any]] = []
+        processed_message_ids = set()
 
         async for message in self.target_channel.history(
-                limit=self.message_limit, oldest_first=False
+            limit=self.message_limit, oldest_first=False
         ):
+            if message.id in processed_message_ids:
+                continue
+            processed_message_ids.add(message.id)
+
             if not message.embeds:
                 continue
 
@@ -114,7 +198,7 @@ class DiscordBot(discord.Client):
         return report_data
 
     async def _process_message(
-            self, message: discord.Message
+        self, message: discord.Message
     ) -> Optional[Dict[str, Any]]:
         partial_results_for_message: List[Dict[str, Any]] = []
 
@@ -168,21 +252,84 @@ class DiscordBot(discord.Client):
         found_links: List[str] = []
 
         for ch_id in COMPLAINT_CHANNEL_IDS:
-            channel = self.get_channel(ch_id)
+            channel = self.complaint_channels.get(ch_id)
             if not channel:
-                logging.warning(f"Could not find complaint channel with ID: {ch_id}")
+                logging.warning(f"Could not find pre-fetched complaint channel with ID: {ch_id}")
                 continue
 
+            channel_cache = self.complaint_message_cache.get(
+                ch_id,
+                {"messages": [], "last_cached_id": None}
+            )
+            cached_messages = channel_cache["messages"]
+            cached_message_ids = {msg["id"] for msg in cached_messages}
+            last_cached_id = channel_cache["last_cached_id"]
+
+            if last_cached_id:
+                history_kwargs = {
+                    "after": discord.Object(id=last_cached_id),
+                    "oldest_first": False
+                }
+            else:
+                history_kwargs = {
+                    "limit": self.complaint_message_history_limit,
+                    "oldest_first": False
+                }
+
+            new_messages: List[discord.Message] = []
             try:
-                async for msg in channel.history(limit=self.complaint_message_history_limit):
-                    if lower_nick in msg.content.lower():
-                        jump_link = MESSAGE_LINK_FORMAT.format(msg.guild.id, channel.id, msg.id)
+                async for msg in channel.history(**history_kwargs):
+                    if msg.id not in cached_message_ids:
+                        new_messages.append(msg)
+
+                if new_messages:
+                    logging.info(
+                        f"Fetched {len(new_messages)} new messages for channel "
+                        f"{channel.name} ({ch_id})."
+                    )
+
+                    for m in new_messages:
+                        channel_cache["messages"].append({
+                            "id": m.id,
+                            "content": m.content,
+                            "embeds": [
+                                {
+                                    k: e.to_dict()[k]
+                                    for k in EMBED_FIELDS_TO_CACHE
+                                    if k in e.to_dict()
+                                }
+                                for e in m.embeds
+                            ]
+                        })
+
+                    channel_cache["messages"].sort(key=lambda x: x["id"], reverse=True)
+
+                    max_new_id = max(m.id for m in new_messages)
+                    if not last_cached_id or max_new_id > last_cached_id:
+                        channel_cache["last_cached_id"] = max_new_id
+
+                    channel_cache["messages"] = channel_cache["messages"][:self.complaint_message_history_limit]
+                else:
+                    if cached_messages:
+                        logging.info(
+                            f"No new messages found in channel {channel.name} ({ch_id}). "
+                            "All existing messages are cached."
+                        )
+
+                for cached_msg_data in channel_cache["messages"]:
+                    if lower_nick in cached_msg_data['content'].lower():
+                        jump_link = MESSAGE_LINK_FORMAT.format(
+                            channel.guild.id, channel.id, cached_msg_data['id']
+                        )
                         found_links.append(jump_link)
                         continue
 
-                    for embed in msg.embeds:
+                    for embed_data in cached_msg_data.get('embeds', []):
+                        embed = discord.Embed.from_dict(embed_data)
                         if embed_contains_nickname(embed, nickname):
-                            jump_link = MESSAGE_LINK_FORMAT.format(msg.guild.id, channel.id, msg.id)
+                            jump_link = MESSAGE_LINK_FORMAT.format(
+                                channel.guild.id, channel.id, cached_msg_data['id']
+                            )
                             found_links.append(jump_link)
                             break
 
@@ -201,6 +348,8 @@ class DiscordBot(discord.Client):
                     f"Unexpected error reading channel {channel.name} ({ch_id}): {e}",
                     exc_info=True,
                 )
+
+            self.complaint_message_cache[ch_id] = channel_cache
 
         return found_links
 
@@ -235,7 +384,8 @@ class DiscordBot(discord.Client):
             complaint_summary = NO_COMPLAINTS_FOUND
             if result.get("complaint_links"):
                 complaint_links = "\n".join(
-                    COMPLAINT_LINK_ITEM_FORMAT.format(link) for link in result["complaint_links"]
+                    COMPLAINT_LINK_ITEM_FORMAT.format(link)
+                    for link in result["complaint_links"]
                 )
                 complaint_summary = COMPLAINT_LINKS_SUMMARY_FORMAT.format(complaint_links)
 
@@ -253,9 +403,9 @@ class DiscordBot(discord.Client):
         logging.info("=" * 60)
 
     def write_json_report(
-            self,
-            report_data: List[Dict[str, Any]],
-            file_name: str = SCAN_REPORT_FILENAME
+        self,
+        report_data: List[Dict[str, Any]],
+        file_name: str = SCAN_REPORT_FILENAME
     ) -> None:
         try:
             with open(file_name, "w", encoding="utf-8") as f:
