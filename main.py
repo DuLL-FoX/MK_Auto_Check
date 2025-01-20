@@ -1,18 +1,20 @@
-import discord
 import logging
-from config import DISCORD_USER_TOKEN, ADMIN_USERNAME, ADMIN_PASSWORD
+import discord
+
+from config_backup_v2 import DISCORD_USER_TOKEN, ADMIN_USERNAME, ADMIN_PASSWORD
 from admin_panel import AdminPanel
 from discord_bot import DiscordBot
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
 )
 
 def main():
     intents = discord.Intents.default()
 
-    username = "Test"
-    message_limit = None
+    username = None
+    message_limit = 10
 
     admin_panel = AdminPanel(ADMIN_USERNAME, ADMIN_PASSWORD)
     bot = DiscordBot(

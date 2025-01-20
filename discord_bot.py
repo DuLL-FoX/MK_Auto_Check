@@ -13,32 +13,33 @@ from config_backup_v2 import (
 )
 from utils import embed_contains_nickname, collect_unique_links_from_embed
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(module)s - %(message)s"
-)
-
 MESSAGE_LINK_FORMAT = "https://discord.com/channels/{}/{}/{}"
 SCAN_REPORT_FILENAME = "scan_report.json"
 COMPLAINT_CACHE_FILENAME = "complaint_message_cache.json"
+
+# Format strings for logs and text
 SHARED_HWID_INFO_FORMAT = "Shared HWID with: {}"
 COMPLAINT_LINKS_SUMMARY_FORMAT = "\n      Found in complaint messages:\n{}"
 COMPLAINT_LINK_ITEM_FORMAT = "      - {}"
-NICKNAMES_FORMAT = ", ".join
-BAN_REASONS_FORMAT = ", ".join
-NO_BAN_REASONS = "None"
-NO_COMPLAINTS_FOUND = "None found"
+
+# Various “verdict” constants
 UNKNOWN_STATUS = "unknown"
 BANNED_VERDICT = "POSSIBLE BYPASS / BANNED"
 CLEAN_VERDICT = "CLEAN / NO BYPASS"
 SUSPICIOUS_VERDICT = "SUSPICIOUS / SHARED HWID - MANUAL CHECK REQUIRED"
 UNKNOWN_VERDICT = "UNKNOWN / NEED MANUAL CHECK"
+
+# Misc constants
+NO_BAN_REASONS = "None"
+NO_COMPLAINTS_FOUND = "None found"
+NICKNAMES_FORMAT = ", ".join
+BAN_REASONS_FORMAT = ", ".join
 N_A = "N/A"
 
 EMBED_FIELDS_TO_CACHE = ["title", "description", "fields"]
 
-class DiscordBot(discord.Client):
 
+class DiscordBot(discord.Client):
     def __init__(
         self,
         admin_panel: AdminPanel,
@@ -55,7 +56,45 @@ class DiscordBot(discord.Client):
         self.target_channel: Optional[discord.TextChannel] = None
         self.complaint_channels: Dict[int, discord.TextChannel] = {}
 
+        # complaint_message_cache[ch_id] = {
+        #   "messages": [{ "id": int, "content": str, "embeds": [...] }, ...],
+        #   "last_cached_id": Optional[int]
+        # }
         self.complaint_message_cache: Dict[int, Dict[str, Any]] = {}
+
+    async def on_ready(self) -> None:
+        logging.info(f"Logged in to Discord as: {self.user} (ID: {self.user.id})")
+        if not await self.setup():
+            return
+
+        if self.username and self.message_limit is None:
+            report_data = await self.process_nickname_search(self.username)
+        else:
+            report_data = await self.process_messages()
+
+        self.write_json_report(report_data, file_name=SCAN_REPORT_FILENAME)
+        self.save_complaint_cache()
+
+        logging.info("Finished scanning. Disconnecting from Discord.")
+        await self.close()
+
+    async def setup(self) -> bool:
+        logging.info("Setting up the bot...")
+        if not self.login_to_admin_panel():
+            await self.close()
+            return False
+
+        if self.username is None and self.message_limit is not None:
+            if not self.fetch_target_channel():
+                await self.close()
+                return False
+
+        if not self.fetch_complaint_channels():
+            await self.close()
+            return False
+
+        self.load_complaint_cache()
+        return True
 
     def login_to_admin_panel(self) -> bool:
         logging.info("Logging in to the admin panel...")
@@ -87,24 +126,25 @@ class DiscordBot(discord.Client):
 
     def load_complaint_cache(self) -> None:
         logging.info("Loading complaint message cache...")
-        if os.path.exists(COMPLAINT_CACHE_FILENAME):
-            try:
-                with open(COMPLAINT_CACHE_FILENAME, 'r', encoding='utf-8') as f:
-                    raw_data = json.load(f)
-                for ch_str_id, ch_data in raw_data.items():
-                    ch_id = int(ch_str_id)
-                    self.complaint_message_cache[ch_id] = {
-                        "messages": ch_data.get("messages", []),
-                        "last_cached_id": ch_data.get("last_cached_id", None)
-                    }
-                logging.info(
-                    f"Loaded cache for {len(self.complaint_message_cache)} channel(s) "
-                    f"from '{COMPLAINT_CACHE_FILENAME}'."
-                )
-            except Exception as e:
-                logging.error(f"Error loading complaint cache: {e}")
-        else:
+        if not os.path.exists(COMPLAINT_CACHE_FILENAME):
             logging.info("Complaint message cache file not found.")
+            return
+
+        try:
+            with open(COMPLAINT_CACHE_FILENAME, 'r', encoding='utf-8') as f:
+                raw_data = json.load(f)
+            for ch_str_id, ch_data in raw_data.items():
+                ch_id = int(ch_str_id)
+                self.complaint_message_cache[ch_id] = {
+                    "messages": ch_data.get("messages", []),
+                    "last_cached_id": ch_data.get("last_cached_id", None)
+                }
+            logging.info(
+                f"Loaded cache for {len(self.complaint_message_cache)} channel(s) "
+                f"from '{COMPLAINT_CACHE_FILENAME}'."
+            )
+        except Exception as e:
+            logging.error(f"Error loading complaint cache: {e}")
 
     def save_complaint_cache(self) -> None:
         logging.info("Saving complaint message cache...")
@@ -137,82 +177,40 @@ class DiscordBot(discord.Client):
         except IOError as e:
             logging.error(f"Error saving complaint cache: {e}")
 
-    async def setup(self) -> bool:
-        logging.info("Setting up the bot...")
-        if not self.login_to_admin_panel():
-            await self.close()
-            return False
-
-        if self.username is None and self.message_limit is not None:
-            if not self.fetch_target_channel():
-                await self.close()
-                return False
-
-        if not self.fetch_complaint_channels():
-            await self.close()
-            return False
-
-        self.load_complaint_cache()
-        return True
-
-    async def on_ready(self) -> None:
-        logging.info(f"Logged in to Discord as: {self.user} (ID: {self.user.id})")
-        if not await self.setup():
-            return
-
-        if self.username and self.message_limit is None:
-            report_data = await self.process_nickname_search(self.username)
-        else:
-            report_data = await self.process_messages()
-
-        self.write_json_report(report_data, file_name=SCAN_REPORT_FILENAME)
-        self.save_complaint_cache()
-
-        logging.info("Finished scanning. Disconnecting from Discord.")
-        await self.close()
-
     async def process_nickname_search(self, username: str) -> List[Dict[str, Any]]:
         logging.info(f"** Nickname-search mode ** Searching for nickname: {username}")
 
-        nickname_link = (
+        base_link = (
             "https://admin.deadspace14.net/Connections"
-            f"?showSet=true&search={username}&showAccepted=true&showBanned=true"
+            "?showSet=true&search={}&showAccepted=true&showBanned=true"
             "&showWhitelist=true&showFull=true&showPanic=true"
         )
+        nickname_link = base_link.format(username)
 
-        try:
-            single_result = self.admin_panel.check_account_on_site(nickname_link)
-        except Exception as e:
-            logging.error(f"Error checking account on site for {nickname_link}: {e}")
+        def try_check(link: str):
+            try:
+                return self.admin_panel.check_account_on_site(link)
+            except Exception as e:
+                logging.error(f"Error checking account on site for {link}: {e}")
+                return {}
+
+        # 1) Search by nickname
+        single_result = try_check(nickname_link)
+        if not single_result:
             return []
 
         results_to_merge = [single_result]
-
         last_ip = single_result.get("last_used_ip")
         if last_ip:
-            ip_link = (
-                "https://admin.deadspace14.net/Connections"
-                f"?showSet=true&search={last_ip}&showAccepted=true&showBanned=true"
-                "&showWhitelist=true&showFull=true&showPanic=true"
-            )
-            try:
-                ip_result = self.admin_panel.check_account_on_site(ip_link)
+            ip_result = try_check(base_link.format(last_ip))
+            if ip_result:
                 results_to_merge.append(ip_result)
-            except Exception as e:
-                logging.error(f"Error checking account on site for IP {last_ip}: {e}")
 
         last_hwid = single_result.get("last_used_hwid")
         if last_hwid:
-            hwid_link = (
-                "https://admin.deadspace14.net/Connections"
-                f"?showSet=true&search={last_hwid}&showAccepted=true&showBanned=true"
-                "&showWhitelist=true&showFull=true&showPanic=true"
-            )
-            try:
-                hwid_result = self.admin_panel.check_account_on_site(hwid_link)
+            hwid_result = try_check(base_link.format(last_hwid))
+            if hwid_result:
                 results_to_merge.append(hwid_result)
-            except Exception as e:
-                logging.error(f"Error checking account on site for HWID {last_hwid}: {e}")
 
         merged_player_results = self.admin_panel.aggregate_player_info(results_to_merge)
         if not merged_player_results:
@@ -230,7 +228,6 @@ class DiscordBot(discord.Client):
         }
 
         self.log_message_summary(message_info)
-
         return [message_info]
 
     async def process_messages(self) -> List[Dict[str, Any]]:
@@ -246,7 +243,10 @@ class DiscordBot(discord.Client):
         report_data: List[Dict[str, Any]] = []
         processed_message_ids = set()
 
-        async for message in self.target_channel.history(limit=self.message_limit, oldest_first=False):
+        async for message in self.target_channel.history(
+            limit=self.message_limit,
+            oldest_first=False
+        ):
             if message.id in processed_message_ids:
                 continue
             processed_message_ids.add(message.id)
@@ -312,14 +312,16 @@ class DiscordBot(discord.Client):
                 continue
 
             channel_cache = self.complaint_message_cache.get(ch_id, {"messages": [], "last_cached_id": None})
-            cached_messages = channel_cache["messages"]
-            cached_message_ids = {msg["id"] for msg in cached_messages}
+            cached_message_ids = {msg["id"] for msg in channel_cache["messages"]}
             last_cached_id = channel_cache["last_cached_id"]
 
+            history_kwargs = {}
             if last_cached_id:
-                history_kwargs = {"after": discord.Object(id=last_cached_id), "oldest_first": False}
+                history_kwargs["after"] = discord.Object(id=last_cached_id)
+                history_kwargs["oldest_first"] = False
             else:
-                history_kwargs = {"limit": COMPLAINT_MESSAGE_HISTORY_LIMIT, "oldest_first": False}
+                history_kwargs["limit"] = COMPLAINT_MESSAGE_HISTORY_LIMIT
+                history_kwargs["oldest_first"] = False
 
             new_messages = []
             try:
@@ -348,11 +350,9 @@ class DiscordBot(discord.Client):
                         channel_cache["last_cached_id"] = max_new_id
 
                     channel_cache["messages"] = channel_cache["messages"][:COMPLAINT_MESSAGE_HISTORY_LIMIT]
+
                 else:
-                    if cached_messages:
-                        logging.info(
-                            f"No new messages found in channel {channel.name} ({ch_id}). Using cached messages."
-                        )
+                    logging.info(f"No new messages found in channel {channel.name} ({ch_id}). Using cached messages.")
 
                 for cached_msg_data in channel_cache["messages"]:
                     content_lower = cached_msg_data['content'].lower()
@@ -397,8 +397,8 @@ class DiscordBot(discord.Client):
         results = message_info["results"]
         logging.info("=" * 60)
         logging.info(
-            f"Message ID {message_info['message_id']} by {message_info['author_name']} had "
-            f"{len(results)} merged result(s)."
+            f"Message ID {message_info['message_id']} by {message_info['author_name']} "
+            f"had {len(results)} merged result(s)."
         )
         logging.info(f"Message link: {message_info['message_link']}")
 
@@ -412,23 +412,25 @@ class DiscordBot(discord.Client):
                 shared_names = NICKNAMES_FORMAT(result["shared_hwid_nicknames"])
                 shared_info = SHARED_HWID_INFO_FORMAT.format(shared_names)
 
-            complaint_summary = NO_COMPLAINTS_FOUND
-            if result.get("complaint_links"):
-                complaint_links = "\n".join(
-                    COMPLAINT_LINK_ITEM_FORMAT.format(link) for link in result["complaint_links"]
-                )
-                complaint_summary = COMPLAINT_LINKS_SUMMARY_FORMAT.format(complaint_links)
+            complaint_links = result.get("complaint_links", [])
+            if complaint_links:
+                complaint_list = "\n".join(COMPLAINT_LINK_ITEM_FORMAT.format(link) for link in complaint_links)
+                complaint_summary = COMPLAINT_LINKS_SUMMARY_FORMAT.format(complaint_list)
+            else:
+                complaint_summary = NO_COMPLAINTS_FOUND
 
-            ban_reasons = BAN_REASONS_FORMAT(result.get("ban_reasons", [])) or NO_BAN_REASONS
+            ban_reasons = result.get("ban_reasons", [])
+            ban_reasons_str = BAN_REASONS_FORMAT(ban_reasons) if ban_reasons else NO_BAN_REASONS
+            ban_counts = result.get("ban_counts", 0)
 
             logging.info(
                 f"{idx}) Nicknames: {NICKNAMES_FORMAT(result.get('nicknames', [N_A]))}\n"
-                f"   Status: {status} (Ban count: {result.get('ban_counts', 0)})\n"
+                f"   Status: {status} (Ban count: {ban_counts})\n"
                 f"   Suspected VPN: {result.get('suspected_vpn', False)}\n"
-                f"   Ban reasons: {ban_reasons}\n"
+                f"   Ban reasons: {ban_reasons_str}\n"
                 f"   Verdict: {verdict}\n"
                 f"   {shared_info}\n"
-                f"   Found in complaint messages: {complaint_summary}"
+                f"   {complaint_summary}"
             )
         logging.info("=" * 60)
 

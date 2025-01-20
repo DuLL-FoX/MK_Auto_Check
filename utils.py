@@ -5,10 +5,6 @@ import logging
 
 import discord
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
-)
-
 def embed_contains_nickname(embed: discord.Embed, nickname: str) -> bool:
     lower_nick = nickname.lower()
     embed_text: List[str] = []
@@ -43,10 +39,12 @@ def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:
     for field in embed.fields:
         if field.name == "Name":
             continue
+
         links = extract_markdown_links(field.value)
         for link in links:
             if "admin.deadspace14.net/Connections" not in link:
                 continue
+
             parsed = urlparse(link)
             qs = parse_qs(parsed.query)
             search_vals = qs.get('search', [])

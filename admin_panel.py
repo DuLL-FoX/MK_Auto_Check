@@ -1,13 +1,9 @@
-from typing import Dict, Union, List, Any
-import requests
-from bs4 import BeautifulSoup
-import re
 import logging
+import re
+import requests
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(filename)s:%(lineno)d - %(message)s"
-)
+from bs4 import BeautifulSoup
+from typing import Dict, Union, List, Any
 
 class AdminPanel:
     BASE_ADMIN_URL = "https://admin.deadspace14.net"
@@ -29,7 +25,7 @@ class AdminPanel:
             return False
 
         if self.ACCOUNT_URL not in response.url:
-            logging.warning("Did not get redirected to the SSO login page. Check if SSO is down.")
+            logging.warning("Expected SSO login page not reached. Check if SSO is down.")
             return False
 
         soup = BeautifulSoup(response.text, "html.parser")
@@ -55,10 +51,7 @@ class AdminPanel:
 
         try:
             response = self.session.post(
-                sso_login_url,
-                data=payload,
-                headers=headers,
-                allow_redirects=True
+                sso_login_url, data=payload, headers=headers, allow_redirects=True
             )
             response.raise_for_status()
             logging.info("Login request successful.")
@@ -94,11 +87,11 @@ class AdminPanel:
                 logging.info("Successfully authenticated to admin.deadspace14.net!")
                 return True
             else:
-                logging.warning("The final redirect to admin.deadspace14.net failed.")
+                logging.warning("The final redirect to admin.deadspace14.net failed or was unexpected.")
                 return False
 
         else:
-            logging.warning("Did not get the expected redirect form from SSO. Possibly wrong credentials.")
+            logging.warning("Did not get the expected redirect form from SSO. Possibly incorrect credentials.")
             return False
 
     def check_account_on_site(self, url: str) -> Dict[str, Union[str, List[str], bool, int]]:
@@ -191,7 +184,7 @@ class AdminPanel:
 
     def _check_suspected_vpn(self, mapping: Dict[str, set]) -> bool:
         for _, associated_nicks in mapping.items():
-            if len(associated_nicks) >= 4:
+            if len(associated_nicks) >= 5:
                 return True
         return False
 
@@ -200,7 +193,6 @@ class AdminPanel:
             "ban_counts": 0,
             "ban_reasons": []
         }
-
         info_url = f"{self.BASE_ADMIN_URL}/Players/Info/{user_id}"
         try:
             resp = self.session.get(info_url)
