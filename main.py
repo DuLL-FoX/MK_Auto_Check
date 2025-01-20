@@ -11,10 +11,16 @@ logging.basicConfig(
 def main():
     intents = discord.Intents.default()
 
-    message_limit = 9
+    username = "Test"
+    message_limit = None
 
     admin_panel = AdminPanel(ADMIN_USERNAME, ADMIN_PASSWORD)
-    bot = DiscordBot(admin_panel, message_limit=message_limit, intents=intents)
+    bot = DiscordBot(
+        admin_panel,
+        message_limit=message_limit,
+        username=username,
+        intents=intents
+    )
 
     try:
         bot.run(DISCORD_USER_TOKEN, bot=False)

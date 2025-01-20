@@ -42,13 +42,15 @@ class DiscordBot(discord.Client):
     def __init__(
         self,
         admin_panel: AdminPanel,
-        message_limit: int = 10,
+        message_limit: Optional[int] = 10,
+        username: Optional[str] = None,
         *args,
         **kwargs
     ) -> None:
         super().__init__(*args, **kwargs)
         self.admin_panel = admin_panel
         self.message_limit = message_limit
+        self.username = username
 
         self.target_channel: Optional[discord.TextChannel] = None
         self.complaint_channels: Dict[int, discord.TextChannel] = {}
@@ -141,9 +143,10 @@ class DiscordBot(discord.Client):
             await self.close()
             return False
 
-        if not self.fetch_target_channel():
-            await self.close()
-            return False
+        if self.username is None and self.message_limit is not None:
+            if not self.fetch_target_channel():
+                await self.close()
+                return False
 
         if not self.fetch_complaint_channels():
             await self.close()
@@ -157,12 +160,78 @@ class DiscordBot(discord.Client):
         if not await self.setup():
             return
 
-        report_data = await self.process_messages()
+        if self.username and self.message_limit is None:
+            report_data = await self.process_nickname_search(self.username)
+        else:
+            report_data = await self.process_messages()
+
         self.write_json_report(report_data, file_name=SCAN_REPORT_FILENAME)
         self.save_complaint_cache()
 
-        logging.info("Finished scanning messages. Disconnecting from Discord.")
+        logging.info("Finished scanning. Disconnecting from Discord.")
         await self.close()
+
+    async def process_nickname_search(self, username: str) -> List[Dict[str, Any]]:
+        logging.info(f"** Nickname-search mode ** Searching for nickname: {username}")
+
+        nickname_link = (
+            "https://admin.deadspace14.net/Connections"
+            f"?showSet=true&search={username}&showAccepted=true&showBanned=true"
+            "&showWhitelist=true&showFull=true&showPanic=true"
+        )
+
+        try:
+            single_result = self.admin_panel.check_account_on_site(nickname_link)
+        except Exception as e:
+            logging.error(f"Error checking account on site for {nickname_link}: {e}")
+            return []
+
+        results_to_merge = [single_result]
+
+        last_ip = single_result.get("last_used_ip")
+        if last_ip:
+            ip_link = (
+                "https://admin.deadspace14.net/Connections"
+                f"?showSet=true&search={last_ip}&showAccepted=true&showBanned=true"
+                "&showWhitelist=true&showFull=true&showPanic=true"
+            )
+            try:
+                ip_result = self.admin_panel.check_account_on_site(ip_link)
+                results_to_merge.append(ip_result)
+            except Exception as e:
+                logging.error(f"Error checking account on site for IP {last_ip}: {e}")
+
+        last_hwid = single_result.get("last_used_hwid")
+        if last_hwid:
+            hwid_link = (
+                "https://admin.deadspace14.net/Connections"
+                f"?showSet=true&search={last_hwid}&showAccepted=true&showBanned=true"
+                "&showWhitelist=true&showFull=true&showPanic=true"
+            )
+            try:
+                hwid_result = self.admin_panel.check_account_on_site(hwid_link)
+                results_to_merge.append(hwid_result)
+            except Exception as e:
+                logging.error(f"Error checking account on site for HWID {last_hwid}: {e}")
+
+        merged_player_results = self.admin_panel.aggregate_player_info(results_to_merge)
+        if not merged_player_results:
+            return []
+
+        for player_res in merged_player_results:
+            await self.enrich_player_results(player_res)
+
+        message_info = {
+            "message_id": "N/A",
+            "message_link": "N/A",
+            "author_name": f"NicknameSearch({username})",
+            "author_id": "N/A",
+            "results": merged_player_results
+        }
+
+        self.log_message_summary(message_info)
+
+        return [message_info]
 
     async def process_messages(self) -> List[Dict[str, Any]]:
         if not self.target_channel:
