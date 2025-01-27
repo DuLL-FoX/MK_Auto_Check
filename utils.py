@@ -42,7 +42,7 @@ def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:
 
         links = extract_markdown_links(field.value)
         for link in links:
-            if "admin.deadspace14.net/Connections" not in link:
+            if "/Connections" not in link: #relative check to allow both BASE_ADMIN_URL and direct link
                 continue
 
             parsed = urlparse(link)

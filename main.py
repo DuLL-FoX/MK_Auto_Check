@@ -1,5 +1,6 @@
 import logging
 import discord
+import traceback
 
 from config_backup_v2 import DISCORD_USER_TOKEN, ADMIN_USERNAME, ADMIN_PASSWORD
 from admin_panel import AdminPanel
@@ -28,6 +29,7 @@ def main():
         bot.run(DISCORD_USER_TOKEN, bot=False)
     except discord.errors.LoginFailure:
         logging.error("Discord login failed. Ensure your token is correct.")
+        traceback.print_exc()
     except Exception as e:
         logging.error(f"An unexpected error occurred: {e}", exc_info=True)
 

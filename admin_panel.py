@@ -102,62 +102,80 @@ class AdminPanel:
             "suspected_vpn": False,
             "ban_counts": 0,
             "ban_reasons": [],
-            "shared_hwid_nicknames": []
+            "shared_hwid_nicknames": [],
+            "associated_ips": [],
+            "associated_hwids": []
         }
+        collected_ips = set()
+        collected_hwids = set()
+
 
         ip_to_nickname_map = {}
         hwid_to_nickname_map = {}
 
         try:
-            resp = self.session.get(url)
-            resp.raise_for_status()
-            html = resp.text
-            result["raw_html_snippet"] = html[:500]
+            current_url = url
+            page_num = 1
+            while current_url:
+                resp = self.session.get(current_url)
+                resp.raise_for_status()
+                html = resp.text
+                if page_num == 1: # Only store snippet from the first page
+                    result["raw_html_snippet"] = html[:500]
 
-            soup = BeautifulSoup(html, "html.parser")
-            logging.debug(f"Successfully fetched and parsed URL: {url}")
+                soup = BeautifulSoup(html, "html.parser")
+                logging.debug(f"Successfully fetched and parsed URL: {current_url}")
 
-            table_rows = soup.find_all("tr")
-            banned_found = False
-            accepted_found = False
-            nicknames = set()
+                table_rows = soup.find_all("tr")
+                banned_found = False
+                accepted_found = False
+                nicknames = set()
 
-            for row in table_rows:
-                cols = row.find_all("td")
-                if len(cols) < 6:
-                    continue
+                for row in table_rows:
+                    cols = row.find_all("td")
+                    if len(cols) < 6:
+                        continue
 
-                nickname_col = cols[0].get_text(strip=True)
-                ip_col = cols[3].get_text(strip=True)
-                hwid_col = cols[4].get_text(strip=True)
-                status_col = cols[5].get_text(strip=True)
+                    nickname_col = cols[0].get_text(strip=True)
+                    ip_col = cols[3].get_text(strip=True)
+                    hwid_col = cols[4].get_text(strip=True)
+                    status_col = cols[5].get_text(strip=True)
 
-                if nickname_col:
-                    nicknames.add(nickname_col)
+                    if nickname_col:
+                        nicknames.add(nickname_col)
 
-                if ip_col:
-                    ip_to_nickname_map.setdefault(ip_col, set()).add(nickname_col)
-                if hwid_col:
-                    hwid_to_nickname_map.setdefault(hwid_col, set()).add(nickname_col)
+                    if ip_col and ip_col != "N/A":
+                        ip_to_nickname_map.setdefault(ip_col, set()).add(nickname_col)
+                        collected_ips.add(ip_col)
+                    if hwid_col and hwid_col != "N/A":
+                        hwid_to_nickname_map.setdefault(hwid_col, set()).add(nickname_col)
+                        collected_hwids.add(hwid_col)
 
-                if "Denied: Banned" in status_col:
-                    banned_found = True
-                elif "Accepted" in status_col:
-                    accepted_found = True
+                    if "Denied: Banned" in status_col:
+                        banned_found = True
+                    elif "Accepted" in status_col:
+                        accepted_found = True
 
-            if banned_found:
-                result["status"] = "banned"
-            elif accepted_found:
-                result["status"] = "clean"
+                if banned_found:
+                    result["status"] = "banned"
+                elif accepted_found:
+                    result["status"] = "clean"
 
-            result["nicknames"] = list(nicknames)
+                result["nicknames"].extend(list(nicknames)) # extend to keep all names from all pages
+
+                next_page_link = soup.find("a", class_="page-link", rel="next")
+                if next_page_link:
+                    current_url = f"{self.BASE_ADMIN_URL}{next_page_link['href']}"
+                    page_num += 1
+                else:
+                    current_url = None # No next page, stop looping
 
             if self._check_suspected_vpn(ip_to_nickname_map) or self._check_suspected_vpn(hwid_to_nickname_map):
                 result["suspected_vpn"] = True
 
             shared_hwid_nicks = set()
             for hwid, nicks in hwid_to_nickname_map.items():
-                if len(nicks) > 1:
+                if len(nicks) > 1 and hwid != "N/A":
                     shared_hwid_nicks.update(nicks)
             result["shared_hwid_nicknames"] = list(shared_hwid_nicks)
 
@@ -167,6 +185,9 @@ class AdminPanel:
                 player_info = self.fetch_player_info(user_id)
                 result["ban_counts"] = player_info["ban_counts"]
                 result["ban_reasons"] = player_info["ban_reasons"]
+
+                result["associated_ips"] = list(collected_ips)
+                result["associated_hwids"] = list(collected_hwids)
 
                 if result["ban_counts"] > 0:
                     if result["ban_counts"] >= 5:
@@ -246,6 +267,8 @@ class AdminPanel:
                 "ban_counts": result_i["ban_counts"],
                 "ban_reasons": set(result_i["ban_reasons"]),
                 "shared_hwid_nicknames": set(result_i["shared_hwid_nicknames"]),
+                "associated_ips": set(result_i["associated_ips"]),
+                "associated_hwids": set(result_i["associated_hwids"]),
             }
             used[i] = True
             merged_nicknames = set(result_i["nicknames"])
@@ -261,6 +284,8 @@ class AdminPanel:
                     merged_dict["nicknames"].update(result_j["nicknames"])
                     merged_dict["ban_reasons"].update(result_j["ban_reasons"])
                     merged_dict["shared_hwid_nicknames"].update(result_j["shared_hwid_nicknames"])
+                    merged_dict["associated_ips"].update(result_j["associated_ips"])
+                    merged_dict["associated_hwids"].update(result_j["associated_hwids"])
                     merged_dict["ban_counts"] += result_j["ban_counts"]
                     merged_dict["suspected_vpn"] = merged_dict["suspected_vpn"] or result_j["suspected_vpn"]
                     merged_dict["status"] = self._merge_statuses(
@@ -270,6 +295,8 @@ class AdminPanel:
             merged_dict["nicknames"] = list(merged_dict["nicknames"])
             merged_dict["ban_reasons"] = list(merged_dict["ban_reasons"])
             merged_dict["shared_hwid_nicknames"] = list(merged_dict["shared_hwid_nicknames"])
+            merged_dict["associated_ips"] = list(merged_dict["associated_ips"])
+            merged_dict["associated_hwids"] = list(merged_dict["associated_hwids"])
 
             merged_results.append(merged_dict)
 

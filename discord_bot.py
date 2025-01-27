@@ -20,6 +20,8 @@ COMPLAINT_CACHE_FILENAME = "complaint_message_cache.json"
 # Format strings for logs and text
 SHARED_HWID_INFO_FORMAT = "Shared HWID with: {}"
 COMPLAINT_LINKS_SUMMARY_FORMAT = "\n      Found in complaint messages:\n{}"
+ASSOCIATED_IPS_FORMAT = "   Associated IPs:\n{}"
+ASSOCIATED_HWIDS_FORMAT = "   Associated HWIDs:\n{}"
 COMPLAINT_LINK_ITEM_FORMAT = "      - {}"
 
 # Various “verdict” constants
@@ -183,7 +185,7 @@ class DiscordBot(discord.Client):
         base_link = (
             "https://admin.deadspace14.net/Connections"
             "?showSet=true&search={}&showAccepted=true&showBanned=true"
-            "&showWhitelist=true&showFull=true&showPanic=true"
+            "&showWhitelist=true&showFull=true&showPanic=true&perPage=2000"
         )
         nickname_link = base_link.format(username)
 
@@ -194,7 +196,6 @@ class DiscordBot(discord.Client):
                 logging.error(f"Error checking account on site for {link}: {e}")
                 return {}
 
-        # 1) Search by nickname
         single_result = try_check(nickname_link)
         if not single_result:
             return []
@@ -217,6 +218,8 @@ class DiscordBot(discord.Client):
             return []
 
         for player_res in merged_player_results:
+            if not player_res.get("nicknames"):
+                player_res["nicknames"] = [username]
             await self.enrich_player_results(player_res)
 
         message_info = {
@@ -412,6 +415,19 @@ class DiscordBot(discord.Client):
                 shared_names = NICKNAMES_FORMAT(result["shared_hwid_nicknames"])
                 shared_info = SHARED_HWID_INFO_FORMAT.format(shared_names)
 
+            associated_ips = result.get("associated_ips", [])
+            if associated_ips:
+                ip_list = "\n".join(f"      - {ip}" for ip in associated_ips)
+                ip_summary = ASSOCIATED_IPS_FORMAT.format(ip_list)
+            else:
+                ip_summary = "   No associated IPs found."
+
+            associated_hwids = result.get("associated_hwids", [])
+            if associated_hwids:
+                hwid_list = "\n".join(f"      - {hwid}" for hwid in associated_hwids)
+                hwid_summary = ASSOCIATED_HWIDS_FORMAT.format(hwid_list)
+            else:
+                hwid_summary = "   No associated HWIDs found."
             complaint_links = result.get("complaint_links", [])
             if complaint_links:
                 complaint_list = "\n".join(COMPLAINT_LINK_ITEM_FORMAT.format(link) for link in complaint_links)
@@ -430,6 +446,8 @@ class DiscordBot(discord.Client):
                 f"   Ban reasons: {ban_reasons_str}\n"
                 f"   Verdict: {verdict}\n"
                 f"   {shared_info}\n"
+                f"   {ip_summary}\n"
+                f"   {hwid_summary}\n"
                 f"   {complaint_summary}"
             )
         logging.info("=" * 60)
