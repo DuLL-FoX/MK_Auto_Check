@@ -1,9 +1,10 @@
 import logging
 import re
-import requests
-
-from bs4 import BeautifulSoup
 from typing import Dict, Union, List, Any
+
+import requests
+from bs4 import BeautifulSoup
+
 
 class AdminPanel:
     BASE_ADMIN_URL = "https://admin.deadspace14.net"
@@ -103,15 +104,9 @@ class AdminPanel:
             "ban_counts": 0,
             "ban_reasons": [],
             "shared_hwid_nicknames": [],
-            "associated_ips": [],
-            "associated_hwids": []
+            "associated_ips": {},
+            "associated_hwids": {}
         }
-        collected_ips = set()
-        collected_hwids = set()
-
-
-        ip_to_nickname_map = {}
-        hwid_to_nickname_map = {}
 
         try:
             current_url = url
@@ -120,7 +115,7 @@ class AdminPanel:
                 resp = self.session.get(current_url)
                 resp.raise_for_status()
                 html = resp.text
-                if page_num == 1: # Only store snippet from the first page
+                if page_num == 1:
                     result["raw_html_snippet"] = html[:500]
 
                 soup = BeautifulSoup(html, "html.parser")
@@ -145,11 +140,16 @@ class AdminPanel:
                         nicknames.add(nickname_col)
 
                     if ip_col and ip_col != "N/A":
-                        ip_to_nickname_map.setdefault(ip_col, set()).add(nickname_col)
-                        collected_ips.add(ip_col)
+                        if ip_col not in result["associated_ips"]:
+                            result["associated_ips"][ip_col] = []
+                        if nickname_col not in result["associated_ips"][ip_col]:
+                            result["associated_ips"][ip_col].append(nickname_col)
+
                     if hwid_col and hwid_col != "N/A":
-                        hwid_to_nickname_map.setdefault(hwid_col, set()).add(nickname_col)
-                        collected_hwids.add(hwid_col)
+                        if hwid_col not in result["associated_hwids"]:
+                            result["associated_hwids"][hwid_col] = []
+                        if nickname_col not in result["associated_hwids"][hwid_col]:
+                            result["associated_hwids"][hwid_col].append(nickname_col)
 
                     if "Denied: Banned" in status_col:
                         banned_found = True
@@ -161,20 +161,17 @@ class AdminPanel:
                 elif accepted_found:
                     result["status"] = "clean"
 
-                result["nicknames"].extend(list(nicknames)) # extend to keep all names from all pages
+                result["nicknames"].extend(list(nicknames))
 
                 next_page_link = soup.find("a", class_="page-link", rel="next")
                 if next_page_link:
                     current_url = f"{self.BASE_ADMIN_URL}{next_page_link['href']}"
                     page_num += 1
                 else:
-                    current_url = None # No next page, stop looping
-
-            if self._check_suspected_vpn(ip_to_nickname_map) or self._check_suspected_vpn(hwid_to_nickname_map):
-                result["suspected_vpn"] = True
+                    current_url = None
 
             shared_hwid_nicks = set()
-            for hwid, nicks in hwid_to_nickname_map.items():
+            for hwid, nicks in result["associated_hwids"].items():
                 if len(nicks) > 1 and hwid != "N/A":
                     shared_hwid_nicks.update(nicks)
             result["shared_hwid_nicknames"] = list(shared_hwid_nicks)
@@ -186,8 +183,6 @@ class AdminPanel:
                 result["ban_counts"] = player_info["ban_counts"]
                 result["ban_reasons"] = player_info["ban_reasons"]
 
-                result["associated_ips"] = list(collected_ips)
-                result["associated_hwids"] = list(collected_hwids)
 
                 if result["ban_counts"] > 0:
                     if result["ban_counts"] >= 5:
@@ -202,12 +197,6 @@ class AdminPanel:
             logging.error(f"Exception checking {url}: {e}", exc_info=True)
 
         return result
-
-    def _check_suspected_vpn(self, mapping: Dict[str, set]) -> bool:
-        for _, associated_nicks in mapping.items():
-            if len(associated_nicks) >= 5:
-                return True
-        return False
 
     def fetch_player_info(self, user_id: str) -> Dict[str, Union[int, List[str]]]:
         info_result = {
@@ -253,6 +242,7 @@ class AdminPanel:
         self,
         partial_results_list: List[Dict[str, Any]]
     ) -> List[Dict[str, Union[str, List[str], bool, int]]]:
+
         merged_results = []
         used = [False] * len(partial_results_list)
 
@@ -267,8 +257,8 @@ class AdminPanel:
                 "ban_counts": result_i["ban_counts"],
                 "ban_reasons": set(result_i["ban_reasons"]),
                 "shared_hwid_nicknames": set(result_i["shared_hwid_nicknames"]),
-                "associated_ips": set(result_i["associated_ips"]),
-                "associated_hwids": set(result_i["associated_hwids"]),
+                "associated_ips": result_i["associated_ips"].copy(),
+                "associated_hwids": result_i["associated_hwids"].copy(),
             }
             used[i] = True
             merged_nicknames = set(result_i["nicknames"])
@@ -284,19 +274,28 @@ class AdminPanel:
                     merged_dict["nicknames"].update(result_j["nicknames"])
                     merged_dict["ban_reasons"].update(result_j["ban_reasons"])
                     merged_dict["shared_hwid_nicknames"].update(result_j["shared_hwid_nicknames"])
-                    merged_dict["associated_ips"].update(result_j["associated_ips"])
-                    merged_dict["associated_hwids"].update(result_j["associated_hwids"])
                     merged_dict["ban_counts"] += result_j["ban_counts"]
                     merged_dict["suspected_vpn"] = merged_dict["suspected_vpn"] or result_j["suspected_vpn"]
                     merged_dict["status"] = self._merge_statuses(
                         merged_dict["status"], result_j["status"]
                     )
 
+                    for ip, nicks in result_j["associated_ips"].items():
+                        if ip not in merged_dict["associated_ips"]:
+                            merged_dict["associated_ips"][ip] = []
+                        merged_dict["associated_ips"][ip].extend(
+                            [nick for nick in nicks if nick not in merged_dict["associated_ips"][ip]])
+
+                    for hwid, nicks in result_j["associated_hwids"].items():
+                        if hwid not in merged_dict["associated_hwids"]:
+                            merged_dict["associated_hwids"][hwid] = []
+                        merged_dict["associated_hwids"][hwid].extend(
+                            [nick for nick in nicks if nick not in merged_dict["associated_hwids"][hwid]])
+
+
             merged_dict["nicknames"] = list(merged_dict["nicknames"])
             merged_dict["ban_reasons"] = list(merged_dict["ban_reasons"])
             merged_dict["shared_hwid_nicknames"] = list(merged_dict["shared_hwid_nicknames"])
-            merged_dict["associated_ips"] = list(merged_dict["associated_ips"])
-            merged_dict["associated_hwids"] = list(merged_dict["associated_hwids"])
 
             merged_results.append(merged_dict)
 

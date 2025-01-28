@@ -1,9 +1,10 @@
+import logging
 import re
 from typing import List, Dict
 from urllib.parse import urlparse, parse_qs
-import logging
 
 import discord
+
 
 def embed_contains_nickname(embed: discord.Embed, nickname: str) -> bool:
     lower_nick = nickname.lower()
@@ -42,7 +43,7 @@ def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:
 
         links = extract_markdown_links(field.value)
         for link in links:
-            if "/Connections" not in link: #relative check to allow both BASE_ADMIN_URL and direct link
+            if "/Connections" not in link:
                 continue
 
             parsed = urlparse(link)
