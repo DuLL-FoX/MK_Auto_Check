@@ -1,0 +1,6 @@
+scan_report.json
+username_popokok_report.json
+complaint_message_cache.json
+.idea/*
+__pycache__/*
+

@@ -14,6 +14,7 @@ from config_backup_v2 import (
     COMPLAINT_MESSAGE_HISTORY_LIMIT
 )
 from utils import embed_contains_nickname, collect_unique_links_from_embed
+from urllib.parse import quote_plus
 
 MESSAGE_LINK_FORMAT = "https://discord.com/channels/{}/{}/{}"
 SCAN_REPORT_FILENAME = "scan_report.json"
@@ -208,13 +209,15 @@ class DiscordBot(discord.Client):
         associated_ips = single_result.get("associated_ips", {})
         for ip in associated_ips.keys():
             if ip and ip not in processed_ips:
-                check_tasks.append(asyncio.to_thread(try_check_partial, link=base_link.format(ip)))
+                encoded_ip = quote_plus(ip)
+                check_tasks.append(asyncio.to_thread(try_check_partial, link=base_link.format(encoded_ip)))
                 processed_ips.add(ip)
 
         associated_hwids = single_result.get("associated_hwids", {})
         for hwid in associated_hwids.keys():
             if hwid and hwid not in processed_hwids:
-                check_tasks.append(asyncio.to_thread(try_check_partial, link=base_link.format(hwid)))
+                encoded_hwid = quote_plus(hwid)
+                check_tasks.append(asyncio.to_thread(try_check_partial, link=base_link.format(encoded_hwid)))
                 processed_hwids.add(hwid)
 
         concurrent_results = await asyncio.gather(*check_tasks)

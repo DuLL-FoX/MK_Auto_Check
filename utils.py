@@ -1,7 +1,7 @@
 import logging
 import re
 from typing import List, Dict
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote_plus, urlencode, urlunparse
 
 import discord
 
@@ -35,6 +35,7 @@ def extract_markdown_links(text: str) -> List[str]:
     logging.debug(f"Extracted markdown links from text: {links}")
     return links
 
+
 def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:
     unique_links = {}
     for field in embed.fields:
@@ -42,19 +43,36 @@ def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:
             continue
 
         links = extract_markdown_links(field.value)
-        for link in links:
-            if "/Connections" not in link:
+        for original_link in links:
+            if "/Connections" not in original_link:
                 continue
 
-            parsed = urlparse(link)
-            qs = parse_qs(parsed.query)
-            search_vals = qs.get('search', [])
-            if not search_vals:
+            parsed = urlparse(original_link)
+
+            search_value = None
+            query_parts = parsed.query.split('&')
+            for part in query_parts:
+                if part.startswith('search='):
+                    search_value = part.split('=', 1)[1]
+                    break
+
+            if not search_value:
                 continue
 
-            search_value = search_vals[0]
+            encoded_search = quote_plus(search_value)
+
+            new_query = []
+            for part in query_parts:
+                if part.startswith('search='):
+                    new_query.append(f"search={encoded_search}")
+                else:
+                    new_query.append(part)
+
+            new_parsed = parsed._replace(query="&".join(new_query))
+            reconstructed_link = urlunparse(new_parsed)
+
             if search_value not in unique_links:
-                unique_links[search_value] = link
-                logging.debug(f"Collected unique link: {link} with search value: {search_value}")
+                unique_links[search_value] = reconstructed_link
+                logging.debug(f"Collected corrected link: {reconstructed_link}")
 
     return unique_links
