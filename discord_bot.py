@@ -257,47 +257,65 @@ class DiscordBot(discord.Client):
 
     async def process_message(self, message: discord.Message) -> Optional[Dict[str, Any]]:
         partial_results_for_message = []
+        unique_links_dict = {}
 
         for embed in message.embeds:
-            unique_links_dict = collect_unique_links_from_embed(embed)
-            if not unique_links_dict:
+            embed_links = collect_unique_links_from_embed(embed)
+            unique_links_dict.update(embed_links)
+
+        if not unique_links_dict:
+            return None
+
+        processed_terms = set()
+
+        for term_type, term_url in unique_links_dict.items():
+            effective_term = extract_effective_search_term(term_url)
+            if effective_term in processed_terms:
+                logging.debug(f"Term '{effective_term}' already processed in this message, skipping.")
+                continue
+            processed_terms.add(effective_term)
+
+            search_url = f"{self.base_admin_connections_url}&search={quote_plus(effective_term)}"
+            logging.info(
+                f"Processing {term_type} search:{effective_term} term: {effective_term} from message {message.id} with URL: {search_url}")
+
+            initial_account_result = await asyncio.to_thread(self.try_check_partial, link=search_url,
+                                                             single_user=True)
+            if not initial_account_result:
+                logging.warning(
+                    f"No account info found for {term_type}: {effective_term} from message {message.id}")
                 continue
 
-            for term_url in unique_links_dict.values():
-                effective_term = extract_effective_search_term(term_url)
-                search_url = f"{self.base_admin_connections_url}&search={quote_plus(unquote_plus(effective_term))}"
-                logging.info(
-                    f"Processing initial search term: {effective_term} from message {message.id} with URL: {search_url}")
+            player_result = {
+                "initial_account": initial_account_result,
+                "ip_nicks": {},
+                "hwid_nicks": {},
+                "nicknames": initial_account_result.get("nicknames", [])
+            }
 
-                initial_account_result = await asyncio.to_thread(self.try_check_partial, link=search_url,
-                                                                 single_user=True)
-                if not initial_account_result:
-                    logging.warning(
-                        f"No account info found for initial term: {effective_term} from message {message.id}")
-                    continue
+            initial_ips = initial_account_result.get("associated_ips", {})
+            initial_hwids = initial_account_result.get("associated_hwids", {})
 
-                player_result = {
-                    "initial_account": initial_account_result,
-                    "ip_nicks": {},
-                    "hwid_nicks": {},
-                    "nicknames": initial_account_result.get("nicknames", [])
-                }
+            player_result["ip_nicks"] = await self._get_associated_nicks(initial_ips, 'ip')
+            player_result["hwid_nicks"] = await self._get_associated_nicks(initial_hwids, 'hwid')
 
-                initial_ips = initial_account_result.get("associated_ips", {})
-                initial_hwids = initial_account_result.get("associated_hwids", {})
-
-                player_result["ip_nicks"] = await self._get_associated_nicks(initial_ips, 'ip')
-                player_result["hwid_nicks"] = await self._get_associated_nicks(initial_hwids, 'hwid')
-
-
-                partial_results_for_message.append(player_result)
+            partial_results_for_message.append(player_result)
 
         if not partial_results_for_message:
             return None
 
+        unique_results = []
+        seen_accounts = set()
+        for res in partial_results_for_message:
+            main_nickname = res['initial_account'].get('nicknames', [None])[0] or "NO_NICKNAME"
+            if main_nickname not in seen_accounts:
+                unique_results.append(res)
+                seen_accounts.add(main_nickname)
+
+
         message_info = self._create_message_info(str(message.author), str(message.author.id),
                                                  MESSAGE_LINK_FORMAT.format(message.guild.id, message.channel.id,
-                                                                            message.id), partial_results_for_message)
+                                                                            message.id), unique_results)
 
         for player_res in message_info["results"]:
             complaint_links = await self.enrich_player_results(player_res["initial_account"].get("nicknames", []))

@@ -1,7 +1,7 @@
 import logging
 import re
 from typing import List, Dict, Optional
-from urllib.parse import urlparse, parse_qs, quote_plus, urlencode, urlunparse
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, unquote
 
 import discord
 
@@ -52,7 +52,7 @@ def normalize_url(url_str: str) -> str:
                             'showWhitelist', 'showFull', 'showPanic', 'perPage', 'sort', 'pageIndex']
         filtered_params = {k: v for k, v in query_params.items() if k in essential_params}
 
-        encoded_params = {k: [quote_plus(vi) for vi in v] for k, v in filtered_params.items()}
+        encoded_params = filtered_params
         sorted_params = sorted(encoded_params.items())
         encoded_query = urlencode(sorted_params, doseq=True)
 
@@ -63,6 +63,7 @@ def normalize_url(url_str: str) -> str:
     except Exception as e:
         logging.warning(f"URL normalization failed for '{url_str}': {e}. Returning original URL.")
         return url_str
+
 
 
 def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:
@@ -109,9 +110,13 @@ def extract_effective_search_term(term: str) -> str:
     if term.startswith("http"):
         try:
             parsed = urlparse(term)
-            qs = parse_qs(parsed.query)
-            if "search" in qs and qs["search"]:
-                return qs["search"][0]
+            raw_query = parsed.query
+            import re
+            m = re.search(r'(?:^|&)search=([^&]+)', raw_query)
+            if m:
+                raw_value = m.group(1)
+                decoded_value = unquote(raw_value)
+                return decoded_value
         except Exception as e:
             logging.warning(f"Error parsing URL '{term}' to extract search term: {e}. Returning original term.")
             return term
