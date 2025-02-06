@@ -17,30 +17,49 @@ class AdminPanel:
     PLAYER_INFO_URL_PATTERN = f"{BASE_ADMIN_URL}/Players/Info/{{}}"
     CONNECTIONS_URL_PATTERN = f"{BASE_ADMIN_URL}/Connections?showSet=true&search={{}}&showAccepted={{}}&showBanned={{}}&showWhitelist={{}}&showFull={{}}&showPanic={{}}&perPage=2000"
     BANS_URL = f"{BASE_ADMIN_URL}/Bans"
+    LOGIN_RETRY_LIMIT = 3
 
     def __init__(self, username: str, password: str) -> None:
         self.username = username
         self.password = password
         self.session = requests.Session()
+        self.login_attempts = 0
+
 
     def login(self) -> bool:
+        while self.login_attempts < self.LOGIN_RETRY_LIMIT:
+            self.login_attempts += 1
+            logging.info(f"Login attempt {self.login_attempts}/{self.LOGIN_RETRY_LIMIT}...")
+            try:
+                if self._attempt_login():
+                    return True
+            except Exception as e:
+                logging.error(f"Exception during login attempt {self.login_attempts}: {e}", exc_info=True)
+            logging.warning(f"Login attempt {self.login_attempts} failed.")
+        logging.error(f"Login failed after {self.LOGIN_RETRY_LIMIT} attempts.")
+        return False
+
+    def _attempt_login(self) -> bool:
         try:
-            response = self.session.get(self.PLAYERS_URL, allow_redirects=True)
+            response = self.session.get(self.PLAYERS_URL, allow_redirects=True, timeout=10)
             response.raise_for_status()
-            logging.info(f"Successfully accessed initial URL: {self.PLAYERS_URL}")
+            logging.debug(f"Successfully accessed initial URL for login: {self.PLAYERS_URL}")
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error accessing admin site: {e}")
-            return False
+            logging.error(f"Error accessing admin site for login: {e}")
+            raise
+
 
         if self.ACCOUNT_URL not in response.url:
             logging.warning("Expected SSO login page not reached. Check if SSO is down.")
             return False
+
 
         soup = BeautifulSoup(response.text, "html.parser")
         token_input = soup.find("input", {"name": "__RequestVerificationToken"})
         if not token_input:
             logging.error("Could not find anti-forgery token on login page.")
             return False
+
 
         token = token_input.get("value")
         payload = {
@@ -56,12 +75,13 @@ class AdminPanel:
             "User-Agent": "Mozilla/5.0 (compatible)"
         }
         try:
-            response = self.session.post(sso_login_url, data=payload, headers=headers, allow_redirects=True)
+            response = self.session.post(sso_login_url, data=payload, headers=headers, allow_redirects=True, timeout=10)
             response.raise_for_status()
-            logging.info("Login request successful.")
+            logging.debug("Login request successful to SSO.")
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error during login request: {e}")
+            logging.error(f"Error during login request to SSO: {e}")
             return False
+
 
         if f"{self.BASE_ADMIN_URL}/signin-oidc" in response.text:
             soup = BeautifulSoup(response.text, "html.parser")
@@ -70,26 +90,30 @@ class AdminPanel:
                 logging.error("Could not find the redirect form after login.")
                 return False
 
+
             redirect_action_url = form.get("action")
             inputs = form.find_all("input")
             form_data = {inp.get("name"): inp.get("value", "") for inp in inputs}
             try:
                 response = self.session.post(redirect_action_url, data=form_data, headers={"Referer": response.url},
-                                             allow_redirects=True)
+                                             allow_redirects=True, timeout=10)
                 response.raise_for_status()
-                logging.info("Redirect form submission successful.")
+                logging.debug("Redirect form submission successful.")
             except requests.exceptions.RequestException as e:
                 logging.error(f"Error submitting redirect form: {e}")
                 return False
 
+
             if "Logout" in response.text or "Players" in response.text:
                 logging.info("Successfully authenticated to admin.deadspace14.net!")
+                self.login_attempts = 0
                 return True
             else:
                 logging.warning("The final redirect to admin.deadspace14.net failed or was unexpected.")
                 return False
         else:
-            logging.warning("Did not get the expected redirect form from SSO. Possibly incorrect credentials.")
+            logging.warning(
+                "Did not get the expected redirect form from SSO. Possibly incorrect credentials or SSO issue.")
             return False
 
     def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, str]]:
@@ -103,17 +127,17 @@ class AdminPanel:
                 logging.info(f"Reached max pages limit: {max_pages}.")
                 break
             try:
-                response = self.session.get(current_url)
+                response = self.session.get(current_url, timeout=10)
                 response.raise_for_status()
                 soup = BeautifulSoup(response.text, "html.parser")
                 logging.info(f"Fetched ban hit connections page {page_num}: {current_url}")
                 table = soup.find("table", class_="table")
                 if not table:
-                    logging.warning("No connection table found.")
+                    logging.warning("No connection table found on ban hit page.")
                     break
                 tbody = table.find("tbody")
                 if not tbody:
-                    logging.warning("No tbody in table.")
+                    logging.warning("No tbody in ban hit table.")
                     break
                 rows = tbody.find_all("tr")
                 for row in rows:
@@ -140,10 +164,10 @@ class AdminPanel:
                 else:
                     current_url = None
             except requests.exceptions.RequestException as e:
-                logging.error(f"Error fetching page {page_num}: {e}")
+                logging.error(f"Error fetching ban hit page {page_num}: {e}")
                 break
             except Exception as e:
-                logging.error(f"Error parsing page {page_num}: {e}", exc_info=True)
+                logging.error(f"Error parsing ban hit page {page_num}: {e}", exc_info=True)
                 break
         logging.info(f"Fetched {len(ban_hit_connections)} ban hits from {pages_fetched} pages.")
         return ban_hit_connections
@@ -151,10 +175,9 @@ class AdminPanel:
     def fetch_ban_info(self, ban_hits_link: str) -> Dict[str, str]:
         ban_info = {}
         try:
-            response = self.session.get(ban_hits_link)
+            response = self.session.get(ban_hits_link, timeout=10)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
-            # Попытка извлечь основные данные из блока <dl>
             dl = soup.find("dl")
             if dl:
                 dt_tags = dl.find_all("dt")
@@ -168,7 +191,6 @@ class AdminPanel:
                 ban_info["ip_address"] = info.get("IP", "")
                 ban_info["hwid"] = info.get("HWID", "")
                 ban_info["time"] = info.get("Time", "")
-            # Если в странице присутствует таблица с подробностями (например, для ban_time, expires)
             table = soup.find("table", class_="table")
             if table:
                 rows = table.find_all("tr")
@@ -183,26 +205,28 @@ class AdminPanel:
                             if m:
                                 ban_info["ban_id"] = m.group(1)
                         break
-            logging.info(f"Fetched ban info from: {ban_hits_link}")
+            logging.debug(f"Fetched ban info from: {ban_hits_link}")
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Error fetching ban info from {ban_hits_link}: {e}")
         except Exception as e:
-            logging.error(f"Error fetching ban info from {ban_hits_link}: {e}", exc_info=True)
+            logging.error(f"Error parsing ban info from {ban_hits_link}: {e}", exc_info=True)
         return ban_info
 
     def fetch_connections_for_user(self, user_id: str) -> List[Dict[str, str]]:
         connections = []
         url = self.get_connections_url(user_id=user_id)
         try:
-            response = self.session.get(url)
+            response = self.session.get(url, timeout=10)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
-            logging.info(f"Fetched connections for user ID {user_id}: {url}")
+            logging.debug(f"Fetched connections for user ID {user_id}: {url}")
             table = soup.find('table', class_='table')
             if not table:
-                logging.warning(f"No connection table found for user ID {user_id}.")
+                logging.warning(f"No connection table found for user ID {user_id} at {url}.")
                 return []
             tbody = table.find('tbody')
             if not tbody:
-                logging.warning(f"No tbody found in connection table for user ID {user_id}.")
+                logging.warning(f"No tbody found in connection table for user ID {user_id} at {url}.")
                 return []
             rows = tbody.find_all('tr')
             for row in rows:
@@ -220,9 +244,9 @@ class AdminPanel:
                     }
                     connections.append(connection_data)
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error fetching connections for user ID {user_id}: {e}")
+            logging.error(f"Error fetching connections for user ID {user_id}: {e} at {url}")
         except Exception as e:
-            logging.error(f"Error parsing connections for user ID {user_id}: {e}", exc_info=True)
+            logging.error(f"Error parsing connections for user ID {user_id}: {e} at {url}", exc_info=True)
         return connections
 
     def get_connections_url(self, user_id: str = "", search: str = "", show_accepted: str = "true",
@@ -239,7 +263,7 @@ class AdminPanel:
             current_url = url
             page_num = 1
             while current_url:
-                resp = self.session.get(current_url)
+                resp = self.session.get(current_url, timeout=10)
                 resp.raise_for_status()
                 soup = BeautifulSoup(resp.text, "html.parser")
                 logging.debug(f"Successfully fetched and parsed URL: {current_url}")
@@ -345,7 +369,7 @@ class AdminPanel:
         }
         info_url = self.PLAYER_INFO_URL_PATTERN.format(user_id)
         try:
-            resp = self.session.get(info_url)
+            resp = self.session.get(info_url, timeout=10)
             resp.raise_for_status()
             logging.debug(f"Successfully fetched player info for user ID: {user_id}")
         except requests.exceptions.RequestException as e:

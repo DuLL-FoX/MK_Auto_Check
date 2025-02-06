@@ -16,7 +16,7 @@ logging.basicConfig(
 def main():
     intents = discord.Intents.default()
 
-    username = "Lolkok32"
+    username = "Urzelish"
     message_limit = None
     check_ban_bypass = False
     ban_bypass_pages = 5

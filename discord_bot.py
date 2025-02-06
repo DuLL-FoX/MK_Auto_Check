@@ -4,7 +4,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from urllib.parse import quote_plus, unquote_plus
 
 import discord
@@ -41,6 +41,7 @@ DEFAULT_BAN_BYPASS_PAGES = 5
 IP_MATCH_TIMEDELTA_MINUTES = 30
 SUSPICIOUS_TIMEDELTA_MINUTES = 60
 
+
 class DiscordBot(discord.Client):
     def __init__(self, admin_panel: AdminPanel, message_limit: Optional[int] = 10, username: Optional[str] = None,
                  check_ban_bypass: bool = False, ban_bypass_pages: int = DEFAULT_BAN_BYPASS_PAGES, *args,
@@ -57,17 +58,25 @@ class DiscordBot(discord.Client):
         self.hwid_cache: Dict[str, Dict[str, Any]] = {}
         self.ip_cache: Dict[str, Dict[str, Any]] = {}
 
+        self.base_admin_connections_url = "https://admin.deadspace14.net/Connections?showSet=true&showAccepted=true&showBanned=true&showWhitelist=true&showFull=true&showPanic=true&perPage=2000"
+        self.try_check_partial = functools.partial(self._try_check, base_link=self.base_admin_connections_url)
+
+
     async def on_ready(self) -> None:
         logging.info(f"Logged in as: {self.user} (ID: {self.user.id})")
         if not await self.setup():
             return
+
         report_data = []
         if self.check_ban_bypass:
             report_data = await self.process_ban_bypass_check()
-        elif self.username and self.message_limit is None:
+        elif self.username:
             report_data = await self.process_nickname_search(self.username)
-        else:
+        elif self.message_limit is not None and self.target_channel:
             report_data = await self.process_messages()
+        else:
+            logging.warning("No scan type specified or missing parameters. Doing nothing.")
+
         self.write_json_report(report_data, SCAN_REPORT_FILENAME)
         self.save_complaint_cache()
         logging.info("Scan complete. Disconnecting from Discord.")
@@ -76,13 +85,10 @@ class DiscordBot(discord.Client):
     async def setup(self) -> bool:
         logging.info("Setting up the bot...")
         if not await self.login_to_admin_panel():
-            await self.close()
             return False
         if self.username is None and self.message_limit is not None and not self.fetch_target_channel():
-            await self.close()
             return False
         if not self.fetch_complaint_channels():
-            await self.close()
             return False
         self.load_complaint_cache()
         return True
@@ -106,6 +112,7 @@ class DiscordBot(discord.Client):
 
     def fetch_complaint_channels(self) -> bool:
         logging.info("Fetching complaint channels...")
+        self.complaint_channels = {}
         for ch_id in COMPLAINT_CHANNEL_IDS:
             channel = self.get_channel(ch_id)
             if not channel:
@@ -124,11 +131,31 @@ class DiscordBot(discord.Client):
             with open(COMPLAINT_CACHE_FILENAME, 'r', encoding='utf-8') as f:
                 raw_data = json.load(f)
             for ch_str_id, ch_data in raw_data.items():
-                ch_id = int(ch_str_id)
-                self.complaint_message_cache[ch_id] = ch_data
+                try:
+                    ch_id = int(ch_str_id)
+                    self.complaint_message_cache[ch_id] = {
+                        "messages": [
+                            {
+                                "id": msg['id'],
+                                "content": msg['content'],
+                                "embeds": [
+                                    {k: embed_data[k] for k in EMBED_FIELDS_TO_CACHE if k in embed_data}
+                                    for embed_data in msg.get('embeds', [])
+                                ]
+                            }
+                            for msg in ch_data.get("messages", [])
+                        ],
+                        "last_cached_id": ch_data.get("last_cached_id")
+                    }
+                except (ValueError, TypeError, KeyError) as e:
+                    logging.warning(f"Error loading cache for channel ID {ch_str_id}: {e}. Skipping channel cache.")
+
             logging.info(f"Loaded cache for {len(self.complaint_message_cache)} channel(s).")
+        except json.JSONDecodeError as e:
+            logging.error(f"JSON decode error loading complaint cache: {e}. Cache file might be corrupted.")
         except Exception as e:
             logging.error(f"Error loading complaint cache: {e}")
+
 
     def save_complaint_cache(self) -> None:
         logging.info("Saving complaint message cache...")
@@ -143,7 +170,7 @@ class DiscordBot(discord.Client):
                             for embed_data in msg.get('embeds', [])
                         ]
                     }
-                    for msg in ch_cache["messages"]
+                    for msg in ch_cache.get("messages", [])
                 ],
                 "last_cached_id": ch_cache.get("last_cached_id")
             }
@@ -158,65 +185,49 @@ class DiscordBot(discord.Client):
 
     async def process_nickname_search(self, username: str) -> List[Dict[str, Any]]:
         logging.info(f"Searching for nickname: {username}")
-        base_link = "https://admin.deadspace14.net/Connections?showSet=true&search={}&showAccepted=true&showBanned=true&showWhitelist=true&showFull=true&showPanic=true&perPage=2000"
-        try_check_partial = functools.partial(self._try_check, base_link=base_link)
-
         clean_username = quote_plus(unquote_plus(username))
-        search_url = base_link.format(clean_username)
+        search_url = f"{self.base_admin_connections_url}&search={clean_username}"
         logging.info(f"Processing nickname search for: {username} with URL: {search_url}")
-        initial_account_result = await asyncio.to_thread(try_check_partial, link=search_url, single_user=True)
 
+        initial_account_result = await asyncio.to_thread(self.try_check_partial, link=search_url, single_user=True)
         if not initial_account_result:
             logging.info(f"No account info found for nickname: {username}")
             return []
 
+        player_result = {
+            "initial_account": initial_account_result,
+            "ip_nicks": {},
+            "hwid_nicks": {},
+            "nicknames": [username]
+        }
+
         initial_ips = initial_account_result.get("associated_ips", {})
         initial_hwids = initial_account_result.get("associated_hwids", {})
 
-        ip_associated_nicks = {}
-        for ip in initial_ips.keys():
-            ip_search_url = base_link.format(quote_plus(unquote_plus(ip)))
-            ip_result = await asyncio.to_thread(try_check_partial, link=ip_search_url, single_user=True)
-            if ip_result and "nicknames" in ip_result:
-                ip_associated_nicks[ip] = ip_result["nicknames"]
+        player_result["ip_nicks"] = await self._get_associated_nicks(initial_ips, 'ip')
+        player_result["hwid_nicks"] = await self._get_associated_nicks(initial_hwids, 'hwid')
 
-        hwid_associated_nicks = {}
-        for hwid in initial_hwids.keys():
-            hwid_search_url = base_link.format(quote_plus(unquote_plus(hwid)))
-            hwid_result = await asyncio.to_thread(try_check_partial, link=hwid_search_url, single_user=True)
-            if hwid_result and "nicknames" in hwid_result:
-                hwid_associated_nicks[hwid] = hwid_result["nicknames"]
-
-        player_result = {
-            "initial_account": initial_account_result,
-            "ip_nicks": ip_associated_nicks,
-            "hwid_nicks": hwid_associated_nicks,
-            "nicknames": [username]  # Use initial search username for complaints
-        }
-        results_to_merge = [player_result]
-
-        merged_player_results = self.admin_panel.aggregate_player_info(
-            [res["initial_account"] for res in results_to_merge])  # Aggregate info from initial account only
-        if not merged_player_results:
+        merged_player_results = self.admin_panel.aggregate_player_info([player_result["initial_account"]])
+        if merged_player_results:
+            player_result["initial_account"].update(merged_player_results[0])
+            complaint_links = await self.enrich_player_results(player_result["initial_account"].get("nicknames", []))
+            player_result["complaint_links"] = complaint_links
+            message_info = self._create_message_info(f"NicknameSearch({username})", "N/A", "N/A", [player_result])
+            self.log_message_summary(message_info)
+            return [message_info]
+        else:
+            logging.warning(f"No aggregated player info found for nickname: {username}")
             return []
 
-        message_info = {
-            "message_id": "N/A",
-            "message_link": "N/A",
-            "author_name": f"NicknameSearch({username})",
-            "author_id": "N/A",
-            "results": []
-        }
+    async def _get_associated_nicks(self, ids: Dict[str, Any], id_type: str) -> Dict[str, List[str]]:
+        associated_nicks = {}
+        for id_val in ids.keys():
+            search_url = f"{self.base_admin_connections_url}&search={quote_plus(id_val)}"
+            id_result = await asyncio.to_thread(self.try_check_partial, link=search_url, single_user=True)
+            if id_result and "nicknames" in id_result:
+                associated_nicks[id_val] = id_result["nicknames"]
+        return associated_nicks
 
-        for player_res in results_to_merge:
-            # Merge aggregated data into the player_res for consistent output in log_message_summary and report
-            player_res["initial_account"].update(merged_player_results[0])
-            await self.enrich_player_results(player_res["initial_account"])  # Enrich based on initial account nicks
-            message_info["results"].append(player_res)
-
-
-        self.log_message_summary(message_info)
-        return [message_info]
 
     def _try_check(self, link: str, base_link: str, single_user: bool):
         try:
@@ -246,8 +257,6 @@ class DiscordBot(discord.Client):
 
     async def process_message(self, message: discord.Message) -> Optional[Dict[str, Any]]:
         partial_results_for_message = []
-        base_link = "https://admin.deadspace14.net/Connections?showSet=true&search={}&showAccepted=true&showBanned=true&showWhitelist=true&showFull=true&showPanic=true&perPage=2000"
-        try_check_partial = functools.partial(self._try_check, base_link=base_link)
 
         for embed in message.embeds:
             unique_links_dict = collect_unique_links_from_embed(embed)
@@ -256,67 +265,60 @@ class DiscordBot(discord.Client):
 
             for term_url in unique_links_dict.values():
                 effective_term = extract_effective_search_term(term_url)
-                clean_term = quote_plus(unquote_plus(effective_term))
-                search_url = base_link.format(clean_term)
-                logging.info(f"Processing initial search term: {effective_term} with URL: {search_url}")
-                initial_account_result = await asyncio.to_thread(try_check_partial, link=search_url, single_user=True)
+                search_url = f"{self.base_admin_connections_url}&search={quote_plus(unquote_plus(effective_term))}"
+                logging.info(
+                    f"Processing initial search term: {effective_term} from message {message.id} with URL: {search_url}")
 
+                initial_account_result = await asyncio.to_thread(self.try_check_partial, link=search_url,
+                                                                 single_user=True)
                 if not initial_account_result:
-                    logging.warning(f"No account info found for initial term: {effective_term}")
+                    logging.warning(
+                        f"No account info found for initial term: {effective_term} from message {message.id}")
                     continue
+
+                player_result = {
+                    "initial_account": initial_account_result,
+                    "ip_nicks": {},
+                    "hwid_nicks": {},
+                    "nicknames": initial_account_result.get("nicknames", [])
+                }
 
                 initial_ips = initial_account_result.get("associated_ips", {})
                 initial_hwids = initial_account_result.get("associated_hwids", {})
 
-                ip_associated_nicks = {}
-                for ip in initial_ips.keys():
-                    ip_search_url = base_link.format(quote_plus(unquote_plus(ip)))
-                    ip_result = await asyncio.to_thread(try_check_partial, link=ip_search_url, single_user=True)
-                    if ip_result and "nicknames" in ip_result:
-                        ip_associated_nicks[ip] = ip_result["nicknames"]
+                player_result["ip_nicks"] = await self._get_associated_nicks(initial_ips, 'ip')
+                player_result["hwid_nicks"] = await self._get_associated_nicks(initial_hwids, 'hwid')
 
-                hwid_associated_nicks = {}
-                for hwid in initial_hwids.keys():
-                    hwid_search_url = base_link.format(quote_plus(unquote_plus(hwid)))
-                    hwid_result = await asyncio.to_thread(try_check_partial, link=hwid_search_url, single_user=True)
-                    if hwid_result and "nicknames" in hwid_result:
-                        hwid_associated_nicks[hwid] = hwid_result["nicknames"]
 
-                player_result = {
-                    "initial_account": initial_account_result,
-                    "ip_nicks": ip_associated_nicks,
-                    "hwid_nicks": hwid_associated_nicks,
-                    "nicknames": initial_account_result.get("nicknames", [])
-                    # Use initial account nicknames for complaints
-                }
                 partial_results_for_message.append(player_result)
 
         if not partial_results_for_message:
             return None
 
-        message_info = {
-            "message_id": str(message.id),
-            "message_link": MESSAGE_LINK_FORMAT.format(message.guild.id, message.channel.id, message.id),
-            "author_name": str(message.author),
-            "author_id": str(message.author.id),
-            "results": []
-        }
+        message_info = self._create_message_info(str(message.author), str(message.author.id),
+                                                 MESSAGE_LINK_FORMAT.format(message.guild.id, message.channel.id,
+                                                                            message.id), partial_results_for_message)
 
-        for player_res in partial_results_for_message:
-            await self.enrich_player_results(player_res["nicknames"])  # Enrich based on initial nicknames
-            message_info["results"].append(player_res)
+        for player_res in message_info["results"]:
+            complaint_links = await self.enrich_player_results(player_res["initial_account"].get("nicknames", []))
+            player_res["complaint_links"] = complaint_links
 
         return message_info
 
-    async def enrich_player_results(self, nicknames: List[str]) -> None:  # Modified to accept nicknames directly
-        # Собираем все поисковые строки: никнеймы, IP и HWID
-        search_terms = set(nicknames)
+    def _create_message_info(self, author_name: str, author_id: str, message_link: str,
+                             results: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "message_id": "N/A" if message_link == "N/A" else message_link.split('/')[-1],
+            "message_link": message_link,
+            "author_name": author_name,
+            "author_id": author_id,
+            "results": results
+        }
 
-        # Выполняем один запрос с объединённым списком поисковых строк
-        complaint_links = await self.check_name_in_channels(list(search_terms))
-        # No need to return, directly modify player_res, but now we don't have player_res here.
-        # We need to store complaint_links somewhere accessible for log_message_summary.
-        # Let's rethink where to store complaint links. For now, just return them.
+    async def enrich_player_results(self, nicknames: List[str]) -> List[Dict[str, Any]]:
+        if not nicknames:
+            return []
+        complaint_links = await self.check_name_in_channels(nicknames)
         return complaint_links
 
 
@@ -335,10 +337,9 @@ class DiscordBot(discord.Client):
             history_kwargs = {}
             if last_cached_id:
                 history_kwargs["after"] = discord.Object(id=last_cached_id)
-                history_kwargs["oldest_first"] = False
             else:
                 history_kwargs["limit"] = COMPLAINT_MESSAGE_HISTORY_LIMIT
-                history_kwargs["oldest_first"] = False
+            history_kwargs["oldest_first"] = False
             new_messages = []
             try:
                 async for msg in channel.history(**history_kwargs):
@@ -346,22 +347,23 @@ class DiscordBot(discord.Client):
                         new_messages.append(msg)
                 if new_messages:
                     logging.info(f"Fetched {len(new_messages)} new messages for channel {channel.name} ({ch_id}).")
-                    for m in new_messages:
-                        channel_cache["messages"].append({
-                            "id": m.id,
-                            "content": m.content,
-                            "embeds": [
-                                {k: e.to_dict()[k] for k in EMBED_FIELDS_TO_CACHE if k in e.to_dict()}
-                                for e in m.embeds
-                            ]
-                        })
+                    channel_cache["messages"].extend([{
+                        "id": m.id,
+                        "content": m.content,
+                        "embeds": [
+                            {k: e.to_dict()[k] for k in EMBED_FIELDS_TO_CACHE if k in e.to_dict()}
+                            for e in m.embeds
+                        ]
+                    } for m in new_messages])
+
                     channel_cache["messages"].sort(key=lambda x: x["id"], reverse=True)
-                    max_new_id = max(m.id for m in new_messages) if new_messages else last_cached_id
-                    if not last_cached_id or (max_new_id and max_new_id > last_cached_id):
-                        channel_cache["last_cached_id"] = max_new_id
                     channel_cache["messages"] = channel_cache["messages"][:COMPLAINT_MESSAGE_HISTORY_LIMIT]
+                    channel_cache["last_cached_id"] = channel_cache["messages"][0]["id"] if channel_cache[
+                        "messages"] else last_cached_id
+
                 else:
                     logging.info(f"No new messages found in channel {channel.name} ({ch_id}). Using cached messages.")
+
                 for cached_msg_data in channel_cache["messages"]:
                     content_lower = cached_msg_data['content'].lower()
                     found_nicks_in_content = [original_nick for original_nick, lower_nick in zip(nicknames, lower_nicknames) if lower_nick in content_lower]
@@ -375,6 +377,7 @@ class DiscordBot(discord.Client):
                             jump_link = MESSAGE_LINK_FORMAT.format(channel.guild.id, channel.id, cached_msg_data['id'])
                             channel_complaint_info.append({"link": jump_link, "nicknames": found_nicks_in_embed})
                             break
+
             except discord.Forbidden:
                 logging.warning(f"Could not read channel {channel.name} ({ch_id}). Insufficient permissions.")
             except discord.HTTPException as e:
@@ -383,14 +386,22 @@ class DiscordBot(discord.Client):
                 logging.error(f"Unexpected error reading channel {channel.name} ({ch_id}): {e}", exc_info=True)
             self.complaint_message_cache[ch_id] = channel_cache
             found_complaints_info.extend(channel_complaint_info)
-        return found_complaints_info
+
+        unique_complaints = []
+        seen_links: Set[str] = set()
+        for complaint in found_complaints_info:
+            if complaint["link"] not in seen_links:
+                unique_complaints.append(complaint)
+                seen_links.add(complaint["link"])
+        return unique_complaints
+
 
     def get_player_verdict(self, result: Dict[str, Any]) -> str:
         confidence = result.get("ban_bypass_confidence", "")
         if confidence in (HWID_MATCH_CONFIDENCE, IP_TIME_MATCH_CONFIDENCE, "IP+Time Match (5-10 min)"):
             return f"{POTENTIAL_BYPASS_VERDICT} - {confidence}"
         if result.get("aggregated_account", {}).get("ban_counts", 0) >= 5:
-            return "SUSPICIOUS - multiple bans"
+            return f"{SUSPICIOUS_VERDICT} - multiple bans"
         status = result.get("aggregated_account", {}).get("status", "unknown")
         if status == "banned":
             return BANNED_VERDICT
@@ -424,59 +435,47 @@ class DiscordBot(discord.Client):
                 ip_address = ban_info.get("ip_address") or ban_hit.get("ip_address", "")
                 hwid = ban_info.get("hwid") or ban_hit.get("hwid", "")
 
-                # Определяем время бана и дату окончания (если доступны)
-                if "ban_time" in ban_info and "expires" in ban_info:
-                    ban_time_str = ban_info["ban_time"]
-                    ban_expires_str = ban_info["expires"]
-                else:
-                    ban_time_str = ban_hit['time']
-                    ban_expires_str = ban_hit['time']
+                ban_time_str = ban_info.get("ban_time", ban_hit['time'])
+                ban_expires_str = ban_info.get("expires", ban_hit['time'])
 
-                # Параллельное получение всех соединений (по user_id, hwid и ip)
+
                 con_tasks = [
                     asyncio.to_thread(self.admin_panel.fetch_connections_for_user, user_id),
                     asyncio.to_thread(self.admin_panel.fetch_connections_for_user, hwid),
                     asyncio.to_thread(self.admin_panel.fetch_connections_for_user, ip_address)
                 ]
-                connections_results = await asyncio.gather(*con_tasks)
-                connections = connections_results[0] + connections_results[1] + connections_results[2]
+                connections_results = await asyncio.gather(*con_tasks, return_exceptions=True)
+                connections = []
+                for res in connections_results:
+                    if isinstance(res, BaseException):
+                        logging.error(f"Error fetching connections: {res}", exc_info=res)
+                    else:
+                        connections.extend(res)
+
                 account_info = self.admin_panel.aggregate_single_user_info(connections)
 
-                # Определяем причину (confidence) бан‑байпаса и список потенциальных bypass-ников.
-                # Новая логика: сначала проверяем совпадение по HWID только если бан‑хит содержит корректный HWID,
-                # затем, если совпадение не найдено, смотрим по IP.
                 bypass_reason = NO_MATCH_CONFIDENCE
                 bypass_user_names = []
-                # Проверяем HWID: ищем совпадение именно по HWID из бан‑хита
+
                 if hwid != N_A and hwid in account_info.get("associated_hwids", {}):
                     hwid_nicks = account_info["associated_hwids"][hwid]
-                    # Если найдено более одного никнейма (то есть бан был ранее и использовался один HWID на нескольких аккаунтах)
                     if len(set(hwid_nicks)) > 1:
                         bypass_reason = HWID_MATCH_CONFIDENCE
                         bypass_user_names = sorted(set(hwid_nicks) - {banned_user_name})
-                # Если по HWID совпадения не обнаружены, пробуем проверить IP
+
                 if bypass_reason == NO_MATCH_CONFIDENCE and ip_address != N_A and ip_address in account_info.get(
                         "associated_ips", {}):
                     ip_nicks = account_info["associated_ips"][ip_address]
                     if len(set(ip_nicks)) > 1:
                         bypass_reason = IP_TIME_MATCH_CONFIDENCE
                         bypass_user_names = sorted(set(ip_nicks) - {banned_user_name})
-                    try:
-                        ban_hit_dt = datetime.strptime(ban_hit['time'], "%Y-%m-%d %H:%M:%S")
-                        time_suspected_users = []
-                        for conn in connections:
-                            if conn.get("ip_address") == ip_address and conn.get("user_name") != banned_user_name:
-                                conn_dt = datetime.strptime(conn["time"], "%Y-%m-%d %H:%M:%S")
-                                diff_minutes = (conn_dt - ban_hit_dt).total_seconds() / 60.0
-                                if 5 <= diff_minutes <= 10:
-                                    time_suspected_users.append(conn.get("user_name"))
-                        if time_suspected_users:
-                            bypass_reason = "IP+Time Match (5-10 min)"
-                            bypass_user_names = sorted(set(bypass_user_names).union(set(time_suspected_users)))
-                    except Exception as ex:
-                        logging.error(
-                            f"Error processing time difference for ban hit {ban_hit.get('ban_hits_link')}: {ex}",
-                            exc_info=True)
+
+                    time_suspected_users = self._check_time_based_bypass(ban_hit_time, ip_address, banned_user_name,
+                                                                         connections)
+                    if time_suspected_users:
+                        bypass_reason = "IP+Time Match (5-10 min)"
+                        bypass_user_names = sorted(set(bypass_user_names).union(set(time_suspected_users)))
+
 
                 ban_hit_enriched = ban_hit.copy()
                 ban_hit_enriched.update({
@@ -490,104 +489,112 @@ class DiscordBot(discord.Client):
                     "banned_user_name": banned_user_name,
                     "user_id": user_id,
                     "ip_address": ip_address,
-                    "hwid": hwid
+                    "hwid": hwid,
+                    "complaint_links": []
                 })
-                enriched_complaint_links = await self.enrich_player_results(
-                    [ban_hit_enriched['banned_user_name']])  # Enrich based on banned user name
+                enriched_complaint_links = await self.enrich_player_results([ban_hit_enriched['banned_user_name']])
                 ban_hit_enriched["complaint_links"] = enriched_complaint_links
 
-                message_data = {
-                    "message_id": "N/A",
-                    "message_link": ban_hit_enriched.get("ban_hit_link"),
-                    "author_name": "BanBypassCheck",
-                    "author_id": "N/A",
-                    "results": [ban_hit_enriched]
-                }
+                message_data = self._create_message_info("BanBypassCheck", "N/A",
+                                                         ban_hit_enriched.get("ban_hit_link", "N/A"),
+                                                         [ban_hit_enriched])
                 report_data.append(message_data)
                 self.log_message_summary(message_data)
+
             except Exception as e:
                 logging.error(f"Error processing ban hit {ban_hit.get('ban_hits_link')}: {e}", exc_info=True)
         logging.info("Ban Bypass Check Complete.")
         return report_data
 
+    def _check_time_based_bypass(self, ban_hit_time: datetime, ip_address: str, banned_user_name: str,
+                                 connections: List[Dict]) -> List[str]:
+        time_suspected_users = []
+        if ip_address != N_A:
+            try:
+                ban_hit_dt = ban_hit_time
+                for conn in connections:
+                    if conn.get("ip_address") == ip_address and conn.get("user_name") != banned_user_name:
+                        conn_dt = datetime.strptime(conn["time"], "%Y-%m-%d %H:%M:%S")
+                        diff_minutes = abs((conn_dt - ban_hit_dt).total_seconds() / 60.0)
+                        if 5 <= diff_minutes <= 10:
+                            time_suspected_users.append(conn.get("user_name"))
+            except Exception as ex:
+                logging.error(f"Error processing time difference for ban hit : {ex}", exc_info=True)
+        return time_suspected_users
+
 
     def log_message_summary(self, message_info: Dict[str, Any]) -> None:
         results = message_info["results"]
         logging.info("=" * 60)
-        logging.info(
-            f"Message ID {message_info['message_id']} by {message_info['author_name']} had {len(results)} result(s).")
-        logging.info(f"Message link: {message_info['message_link']}")
-        for idx, result_data in enumerate(results,
-                                          start=1):  # result_data is now a dict containing 'initial_account', 'ip_nicks', 'hwid_nicks'
-            result = result_data.get('initial_account',
-                                     {})  # Use aggregated initial account info for verdict and most fields
+        log_header = f"Message ID {message_info['message_id']} by {message_info['author_name']} had {len(results)} result(s)."
+        if message_info['message_link'] != "N/A":
+            log_header += f" Message link: {message_info['message_link']}"
+        logging.info(log_header)
+
+        for idx, result_data in enumerate(results, start=1):
+            result = result_data.get('initial_account', {})
             verdict = self.get_player_verdict(result)
             shared_info = ""
             if result.get("shared_hwid_nicknames"):
                 shared_names = ", ".join(sorted(result["shared_hwid_nicknames"]))
                 shared_info = SHARED_HWID_INFO_FORMAT.format(shared_names)
-            associated_ips = result.get("associated_ips", {})
-            # Display only initial IPs and their associated nicks
+
             ip_nicks_to_display = result_data.get("ip_nicks", {})
             ip_summary = (ASSOCIATED_IPS_FORMAT.format("\n".join(
                 [f"      - {ip}: {', '.join(sorted(nicks))}" for ip, nicks in sorted(ip_nicks_to_display.items())]
             )) if ip_nicks_to_display else "      No associated IPs found.")
 
-            associated_hwids = result.get("associated_hwids", {})
-            # Display only initial HWIDs and their associated nicks
             hwid_nicks_to_display = result_data.get("hwid_nicks", {})
             hwid_summary = (ASSOCIATED_HWIDS_FORMAT.format("\n".join(
                 [f"      - {hwid}: {', '.join(sorted(nicks))}" for hwid, nicks in sorted(hwid_nicks_to_display.items())]
             )) if hwid_nicks_to_display else "      No associated HWIDs found.")
 
-            complaint_info = result.get("complaint_links", [])
+            complaint_info = result_data.get("complaint_links", [])
             complaint_summary = (COMPLAINT_LINKS_SUMMARY_FORMAT.format("\n".join(
                 [COMPLAINT_LINK_ITEM_FORMAT.format(f"{complaint['link']} - {', '.join(sorted(complaint['nicknames']))}")
                  for complaint in complaint_info]
             )) if complaint_info else NO_COMPLAINTS_FOUND)
+
             ban_reasons = result.get("ban_reasons", [])
             ban_reasons_str = ", ".join(ban_reasons) if ban_reasons else NO_BAN_REASONS
             ban_counts = result.get("ban_counts", 0)
             connection_link = result.get("connection_link", "N/A")
-            banned_user = result.get('banned_user_name', N_A)  # Banned user name might not be relevant here
-            bypass_users = ", ".join(
-                sorted(result.get('bypass_user_names', [N_A])))  # Bypass users also might not be relevant
 
-            # Если это результат BanBypassCheck (есть ban_hit_link), выводим дополнительные данные
-            if result_data.get("ban_hit_link"):
+            if "ban_hit_link" in result_data:
                 ban_time = result_data.get("ban_time", "N/A")
                 ban_expires = result_data.get("ban_expires", "N/A")
-                logging.info(
-                    f"{idx}) Banned User: {banned_user}\n"  # Banned user name might not be relevant here
-                    f"   Ban Time: {ban_time}   Expires: {ban_expires}\n"
-                    f"   Status: {result.get('status', UNKNOWN_STATUS)} (Bans: {ban_counts})\n"
-                    f"   Suspected VPN: {result.get('suspected_vpn', False)}\n"
-                    f"   Ban reasons: {ban_reasons_str}\n"
-                    f"   Verdict: {verdict}\n"
-                    f"   Connection Link: {connection_link}\n"
-                    f"   Ban Hit Link: {result_data.get('ban_hit_link')}\n"
-                    f"   IP: {result_data.get('ip_address', 'N/A')}\n"  # IP address might not be relevant here
-                    f"   HWID: {result_data.get('hwid', 'N/A')}\n"  # HWID might not be relevant here
-                    f"   Potential Bypassers: {bypass_users}\n"  # Bypass users also might not be relevant
-                    f"   {shared_info}\n"
-                    f"   {ip_summary}\n"
-                    f"   {hwid_summary}\n"
-                    f"   Complaint Links: {complaint_summary}"
-                )
+                banned_user = result_data.get('banned_user_name', N_A)
+                bypass_users = ", ".join(sorted(result_data.get('bypass_user_names', [N_A])))
+
+                log_output = f"""{idx}) Banned User: {banned_user}
+   Ban Time: {ban_time}   Expires: {ban_expires}
+   Status: {result.get('status', UNKNOWN_STATUS)} (Bans: {ban_counts})
+   Suspected VPN: {result.get('suspected_vpn', False)}
+   Ban reasons: {ban_reasons_str}
+   Verdict: {verdict}
+   Connection Link: {connection_link}
+   Ban Hit Link: {result_data.get('ban_hit_link')}
+   IP: {result_data.get('ip_address', 'N/A')}
+   HWID: {result_data.get('hwid', 'N/A')}
+   Potential Bypassers: {bypass_users}
+   {shared_info}
+   {ip_summary}
+   {hwid_summary}
+   Complaint Links: {complaint_summary}"""
             else:
-                # Оригинальный вывод для других результатов
-                logging.info(
-                    f"{idx}) Searched Nickname: {message_info['author_name']}\n"  # Using author_name which is set to NicknameSearch(username)
-                    f"   Status: {result.get('status', UNKNOWN_STATUS)} (Bans: {ban_counts})\n"
-                    f"   Suspected VPN: {result.get('suspected_vpn', False)}\n"
-                    f"   Ban reasons: {ban_reasons_str}\n"
-                    f"   Verdict: {verdict}\n"
-                    f"   Connection Link: {connection_link}\n"
-                    f"   {shared_info}\n"
-                    f"   {ip_summary}\n"
-                    f"   {hwid_summary}\n"
-                    f"   Complaint Links: {complaint_summary}"
-                )
+                log_output = f"""{idx}) Searched Nickname: {message_info['author_name']}
+   Status: {result.get('status', UNKNOWN_STATUS)} (Bans: {ban_counts})
+   Suspected VPN: {result.get('suspected_vpn', False)}
+   Ban reasons: {ban_reasons_str}
+   Verdict: {verdict}
+   Connection Link: {connection_link}
+   {shared_info}
+   {ip_summary}
+   {hwid_summary}
+   Complaint Links: {complaint_summary}"""
+
+            logging.info(log_output.strip())
+
         logging.info("=" * 60)
 
     def write_json_report(self, report_data: List[Dict[str, Any]], file_name: str = SCAN_REPORT_FILENAME) -> None:
