@@ -16,18 +16,18 @@ logging.basicConfig(
 def main():
     intents = discord.Intents.default()
 
-    username = "Hero"
+    username = "Lolkok32"
     message_limit = None
-    check_ban_bypass = False  # Enable ban bypass check mode
-    ban_bypass_pages = 1  # Specify the number of pages to fetch for ban bypass check
+    check_ban_bypass = False
+    ban_bypass_pages = 5
     admin_panel = AdminPanel(ADMIN_USERNAME, ADMIN_PASSWORD)
     bot = DiscordBot(
         admin_panel,
         message_limit=message_limit,
         username=username,
         intents=intents,
-        check_ban_bypass=check_ban_bypass,  # Pass the flag to DiscordBot
-        ban_bypass_pages=ban_bypass_pages  # Pass the page limit
+        check_ban_bypass=check_ban_bypass,
+        ban_bypass_pages=ban_bypass_pages
     )
 
     try:
