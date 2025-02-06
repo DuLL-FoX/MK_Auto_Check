@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import List, Dict
+from typing import List, Dict, Optional
 from urllib.parse import urlparse, parse_qs, quote_plus, urlencode, urlunparse
 
 import discord
@@ -8,71 +8,111 @@ import discord
 
 def embed_contains_nickname(embed: discord.Embed, nickname: str) -> bool:
     lower_nick = nickname.lower()
-    embed_text: List[str] = []
 
-    if embed.title:
-        embed_text.append(embed.title)
-    if embed.description:
-        embed_text.append(embed.description)
-    if embed.footer and embed.footer.text:
-        embed_text.append(embed.footer.text)
-    if embed.author and embed.author.name:
-        embed_text.append(embed.author.name)
+    def check_text(text: Optional[str]) -> bool:
+        if isinstance(text, discord.embeds._EmptyEmbed):
+            return False
+        return text is not None and lower_nick in text.lower()
+
+    if check_text(embed.title) or check_text(embed.description):
+        return True
+    if embed.footer and check_text(embed.footer.text):
+        return True
+    if embed.author and check_text(embed.author.name):
+        return True
 
     for field in embed.fields:
-        if field.name:
-            embed_text.append(field.name)
-        if field.value:
-            embed_text.append(field.value)
+        if check_text(field.name) or check_text(field.value):
+            return True
 
-    contains = any(lower_nick in text.lower() for text in embed_text)
-    logging.debug(f"Checking if embed contains nickname '{nickname}': {contains}")
-    return contains
+    logging.debug(f"Checking if embed contains nickname '{nickname}': False")
+    return False
+
 
 def extract_markdown_links(text: str) -> List[str]:
-    pattern = r'\((https?://[^\)]+)\)'
+    pattern = r'\[.*?\]\(\s*(https?://[^\s\)]+)\s*\)'
     links = re.findall(pattern, text)
     logging.debug(f"Extracted markdown links from text: {links}")
     return links
 
 
+def extract_plain_links(text: str) -> List[str]:
+    pattern = r'\bhttps?://\S+\b'
+    links = re.findall(pattern, text)
+    logging.debug(f"Extracted plain links from text: {links}")
+    return links
+
+
+def normalize_url(url_str: str) -> str:
+    try:
+        parsed = urlparse(url_str)
+        query_params = parse_qs(parsed.query)
+
+        essential_params = ['search', 'connection', 'showSet', 'showAccepted', 'showBanned',
+                            'showWhitelist', 'showFull', 'showPanic', 'perPage', 'sort', 'pageIndex']
+        filtered_params = {k: v for k, v in query_params.items() if k in essential_params}
+
+        encoded_params = {k: [quote_plus(vi) for vi in v] for k, v in filtered_params.items()}
+        sorted_params = sorted(encoded_params.items())
+        encoded_query = urlencode(sorted_params, doseq=True)
+
+        new_parsed = parsed._replace(query=encoded_query)
+        normalized = urlunparse(new_parsed)
+        logging.debug(f"Normalized URL: {normalized}")
+        return normalized
+    except Exception as e:
+        logging.warning(f"URL normalization failed for '{url_str}': {e}. Returning original URL.")
+        return url_str
+
+
 def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:
-    unique_links = {}
+    unique_links: Dict[str, str] = {}
+
+    def add_link(url: str):
+        if "/Connections" not in url and "Players/Info" not in url and "Bans/Hits" not in url:
+            return
+
+        normalized = normalize_url(url)
+        parsed = urlparse(normalized)
+
+        if "search=" in parsed.query:
+            search_value = parse_qs(parsed.query).get("search", [""])[0]
+            key = f"search:{search_value}"
+        elif "connection=" in parsed.query:
+            connection_value = parse_qs(parsed.query).get("connection", [""])[0]
+            key = f"connection:{connection_value}"
+        else:
+            key = parsed.path
+
+        if key not in unique_links:
+            unique_links[key] = normalized
+            logging.debug(f"Collected link: {normalized} with key: {key}")
+
     for field in embed.fields:
         if field.name == "Name":
             continue
 
-        links = extract_markdown_links(field.value)
-        for original_link in links:
-            if "/Connections" not in original_link:
-                continue
+        if field.value:
+            for url in extract_markdown_links(field.value):
+                add_link(url)
+            for url in extract_plain_links(field.value):
+                add_link(url)
 
-            parsed = urlparse(original_link)
-
-            search_value = None
-            query_parts = parsed.query.split('&')
-            for part in query_parts:
-                if part.startswith('search='):
-                    search_value = part.split('=', 1)[1]
-                    break
-
-            if not search_value:
-                continue
-
-            encoded_search = quote_plus(search_value)
-
-            new_query = []
-            for part in query_parts:
-                if part.startswith('search='):
-                    new_query.append(f"search={encoded_search}")
-                else:
-                    new_query.append(part)
-
-            new_parsed = parsed._replace(query="&".join(new_query))
-            reconstructed_link = urlunparse(new_parsed)
-
-            if search_value not in unique_links:
-                unique_links[search_value] = reconstructed_link
-                logging.debug(f"Collected corrected link: {reconstructed_link}")
+    if not unique_links and embed.description:
+        for url in extract_plain_links(embed.description):
+            add_link(url)
 
     return unique_links
+
+
+def extract_effective_search_term(term: str) -> str:
+    if term.startswith("http"):
+        try:
+            parsed = urlparse(term)
+            qs = parse_qs(parsed.query)
+            if "search" in qs and qs["search"]:
+                return qs["search"][0]
+        except Exception as e:
+            logging.warning(f"Error parsing URL '{term}' to extract search term: {e}. Returning original term.")
+            return term
+    return term
