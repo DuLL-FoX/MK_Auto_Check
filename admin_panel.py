@@ -1,15 +1,18 @@
 import logging
 import re
 from typing import Dict, Union, List, Any
+from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
 
+N_A = "N/A"
 
 class AdminPanel:
     BASE_ADMIN_URL = "https://admin.deadspace14.net"
     PLAYERS_URL = f"{BASE_ADMIN_URL}/Players"
     ACCOUNT_URL = "https://account.spacestation14.com"
+    CONNECTIONS_URL = f"{BASE_ADMIN_URL}/Connections"
 
     def __init__(self, username: str, password: str) -> None:
         self.username = username
@@ -95,7 +98,84 @@ class AdminPanel:
             logging.warning("Did not get the expected redirect form from SSO. Possibly incorrect credentials.")
             return False
 
+    def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, str]]:
+        """
+        Fetches the list of banned connections from the admin panel,
+        optionally limiting the number of pages fetched.
+        Returns a list of dictionaries, each containing connection details.
+
+        Args:
+            max_pages (int): Maximum number of pages to fetch. 0 for unlimited.
+        """
+        ban_hit_connections = []
+        url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true"
+        current_url = url
+        page_num = 1
+        pages_fetched = 0
+
+        while current_url:
+            if max_pages > 0 and pages_fetched >= max_pages:
+                logging.info(f"Reached maximum pages limit: {max_pages}. Stopping fetching ban hit connections.")
+                break
+
+            try:
+                response = self.session.get(current_url)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
+                logging.info(f"Fetched ban hit connections page {page_num}: {current_url}")
+
+                table = soup.find('table', class_='table')
+                if not table:
+                    logging.warning("No connection table found on page.")
+                    break
+
+                tbody = table.find('tbody')
+                if not tbody:
+                    logging.warning("No tbody found in connection table.")
+                    break
+
+                rows = tbody.find_all('tr')
+                if not rows:
+                    logging.info("No banned connections found on this page.")
+
+                for row in rows:
+                    cols = row.find_all('td')
+                    if len(cols) >= 9:
+                        connection_data = {
+                            'user_name': cols[0].strong.text.strip() if cols[0].strong else cols[0].text.strip(),
+                            'user_id': cols[1].text.strip(),
+                            'time': cols[2].text.strip(),
+                            'ip_address': cols[3].text.strip(),
+                            'hwid': cols[4].text.strip(),
+                            'status': cols[5].strong.text.strip() if cols[5].strong else cols[5].text.strip(),
+                            'server': cols[6].text.strip(),
+                            'trust_score': cols[7].text.strip(),
+                            'ban_hits_link': urljoin(self.BASE_ADMIN_URL, cols[8].find('a')['href']) if cols[8].find(
+                                'a') else None
+                        }
+                        ban_hit_connections.append(connection_data)
+
+                next_page_link = soup.find("a", class_="btn", string=re.compile(r"Next"))
+                if next_page_link and 'disabled' not in next_page_link.get('class', []):
+                    current_url = urljoin(self.BASE_ADMIN_URL, next_page_link['href'])
+                    page_num += 1
+                    pages_fetched += 1
+                else:
+                    current_url = None
+
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Error fetching ban hit connections page {page_num}: {e}")
+                break
+            except Exception as e:
+                logging.error(f"Error parsing ban hit connections page {page_num}: {e}", exc_info=True)
+                break
+
+        logging.info(f"Total ban hit connections fetched: {len(ban_hit_connections)} from {pages_fetched} page(s).")
+        return ban_hit_connections
+
+
     def check_account_on_site(self, url: str) -> Dict[str, Union[str, List[str], bool, int]]:
+
         result: Dict[str, Any] = {
             "status": "unknown",
             "nicknames": [],
@@ -110,6 +190,9 @@ class AdminPanel:
 
         try:
             current_url = url
+            all_nicknames = set()
+            all_ips = {}
+            all_hwids = {}
             page_num = 1
             while current_url:
                 resp = self.session.get(current_url)
@@ -123,7 +206,6 @@ class AdminPanel:
 
                 table_rows = soup.find_all("tr")
                 banned_found = False
-                accepted_found = False
                 nicknames = set()
 
                 for row in table_rows:
@@ -139,27 +221,25 @@ class AdminPanel:
                     if nickname_col:
                         nicknames.add(nickname_col)
 
-                    if ip_col and ip_col != "N/A":
-                        if ip_col not in result["associated_ips"]:
-                            result["associated_ips"][ip_col] = []
-                        if nickname_col not in result["associated_ips"][ip_col]:
-                            result["associated_ips"][ip_col].append(nickname_col)
+                    if ip_col and ip_col != N_A:
+                        if ip_col not in all_ips:
+                            all_ips[ip_col] = set()
+                        all_ips[ip_col].add(nickname_col)
 
-                    if hwid_col and hwid_col != "N/A":
-                        if hwid_col not in result["associated_hwids"]:
-                            result["associated_hwids"][hwid_col] = []
-                        if nickname_col not in result["associated_hwids"][hwid_col]:
-                            result["associated_hwids"][hwid_col].append(nickname_col)
+                    if hwid_col and hwid_col != N_A:
+                        if hwid_col not in all_hwids:
+                            all_hwids[hwid_col] = set()
+                        all_hwids[hwid_col].add(nickname_col)
 
+                    if "Accepted" in status_col:
+                        result["status"] = "clean"
                     if "Denied: Banned" in status_col:
                         banned_found = True
                     elif "Accepted" in status_col:
-                        accepted_found = True
+                        pass
 
                 if banned_found:
                     result["status"] = "banned"
-                elif accepted_found:
-                    result["status"] = "clean"
 
                 result["nicknames"].extend(list(nicknames))
 
@@ -170,9 +250,13 @@ class AdminPanel:
                 else:
                     current_url = None
 
+            result["associated_ips"] = {ip: list(nicks) for ip, nicks in all_ips.items()}
+            result["associated_hwids"] = {hwid: list(nicks) for hwid, nicks in all_hwids.items()}
+
+
             shared_hwid_nicks = set()
             for hwid, nicks in result["associated_hwids"].items():
-                if len(nicks) > 1 and hwid != "N/A":
+                if len(nicks) > 1 and hwid != N_A:
                     shared_hwid_nicks.update(nicks)
             result["shared_hwid_nicknames"] = list(shared_hwid_nicks)
 
@@ -242,7 +326,6 @@ class AdminPanel:
         self,
         partial_results_list: List[Dict[str, Any]]
     ) -> List[Dict[str, Union[str, List[str], bool, int]]]:
-
         merged_results = []
         used = [False] * len(partial_results_list)
 
@@ -268,7 +351,7 @@ class AdminPanel:
                     continue
                 result_j = partial_results_list[j]
 
-                if merged_nicknames.intersection(result_j["nicknames"]):
+                if merged_nicknames.intersection(set(result_j["nicknames"])):
                     used[j] = True
                     merged_nicknames.update(result_j["nicknames"])
                     merged_dict["nicknames"].update(result_j["nicknames"])
