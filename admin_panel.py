@@ -25,7 +25,6 @@ class AdminPanel:
         self.session = requests.Session()
         self.login_attempts = 0
 
-
     def login(self) -> bool:
         while self.login_attempts < self.LOGIN_RETRY_LIMIT:
             self.login_attempts += 1
@@ -43,54 +42,37 @@ class AdminPanel:
         try:
             response = self.session.get(self.PLAYERS_URL, allow_redirects=True, timeout=10)
             response.raise_for_status()
-            logging.debug(f"Successfully accessed initial URL for login: {self.PLAYERS_URL}")
+            logging.debug(f"Accessed {self.PLAYERS_URL} successfully.")
         except requests.exceptions.RequestException as e:
             logging.error(f"Error accessing admin site for login: {e}")
             raise
-
-
         if self.ACCOUNT_URL not in response.url:
-            logging.warning("Expected SSO login page not reached. Check if SSO is down.")
+            logging.warning("SSO login page not reached. Check SSO status.")
             return False
-
-
         soup = BeautifulSoup(response.text, "html.parser")
         token_input = soup.find("input", {"name": "__RequestVerificationToken"})
         if not token_input:
-            logging.error("Could not find anti-forgery token on login page.")
+            logging.error("Anti-forgery token not found on login page.")
             return False
-
-
         token = token_input.get("value")
-        payload = {
-            "Input.EmailOrUsername": self.username,
-            "Input.Password": self.password,
-            "__RequestVerificationToken": token
-        }
+        payload = {"Input.EmailOrUsername": self.username, "Input.Password": self.password,
+                   "__RequestVerificationToken": token}
         sso_login_url = response.url
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Referer": sso_login_url,
-            "Origin": self.ACCOUNT_URL,
-            "User-Agent": "Mozilla/5.0 (compatible)"
-        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded", "Referer": sso_login_url,
+                   "Origin": self.ACCOUNT_URL, "User-Agent": "Mozilla/5.0 (compatible)"}
         try:
             response = self.session.post(sso_login_url, data=payload, headers=headers, allow_redirects=True, timeout=10)
             response.raise_for_status()
-            logging.debug("Login request successful to SSO.")
+            logging.debug("SSO login request successful.")
         except requests.exceptions.RequestException as e:
-            logging.error(f"Error during login request to SSO: {e}")
+            logging.error(f"Error during SSO login request: {e}")
             return False
-
-
         if f"{self.BASE_ADMIN_URL}/signin-oidc" in response.text:
             soup = BeautifulSoup(response.text, "html.parser")
             form = soup.find("form")
             if not form:
-                logging.error("Could not find the redirect form after login.")
+                logging.error("Redirect form not found after login.")
                 return False
-
-
             redirect_action_url = form.get("action")
             inputs = form.find_all("input")
             form_data = {inp.get("name"): inp.get("value", "") for inp in inputs}
@@ -102,22 +84,19 @@ class AdminPanel:
             except requests.exceptions.RequestException as e:
                 logging.error(f"Error submitting redirect form: {e}")
                 return False
-
-
             if "Logout" in response.text or "Players" in response.text:
-                logging.info("Successfully authenticated to admin.deadspace14.net!")
+                logging.info("Successfully authenticated on admin.deadspace14.net!")
                 self.login_attempts = 0
                 return True
             else:
-                logging.warning("The final redirect to admin.deadspace14.net failed or was unexpected.")
+                logging.warning("Final redirect to admin.deadspace14.net failed or unexpected.")
                 return False
         else:
-            logging.warning(
-                "Did not get the expected redirect form from SSO. Possibly incorrect credentials or SSO issue.")
+            logging.warning("Did not receive expected SSO redirect form. Check credentials or SSO issues.")
             return False
 
     def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, str]]:
-        ban_hit_connections = []
+        ban_hit_connections: List[Dict[str, str]] = []
         url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true"
         current_url = url
         page_num = 1
@@ -169,11 +148,11 @@ class AdminPanel:
             except Exception as e:
                 logging.error(f"Error parsing ban hit page {page_num}: {e}", exc_info=True)
                 break
-        logging.info(f"Fetched {len(ban_hit_connections)} ban hits from {pages_fetched} pages.")
+        logging.info(f"Fetched {len(ban_hit_connections)} ban hits from {pages_fetched} page(s).")
         return ban_hit_connections
 
     def fetch_ban_info(self, ban_hits_link: str) -> Dict[str, str]:
-        ban_info = {}
+        ban_info: Dict[str, str] = {}
         try:
             response = self.session.get(ban_hits_link, timeout=10)
             response.raise_for_status()
@@ -213,7 +192,7 @@ class AdminPanel:
         return ban_info
 
     def fetch_connections_for_user(self, user_id: str) -> List[Dict[str, str]]:
-        connections = []
+        connections: List[Dict[str, str]] = []
         url = self.get_connections_url(user_id=user_id)
         try:
             response = self.session.get(url, timeout=10)
@@ -258,10 +237,9 @@ class AdminPanel:
 
     def check_account_on_site(self, url: str, single_user: bool = False) -> Union[
         List[Dict[str, str]], Dict[str, Union[str, List[str], bool, int]]]:
-        connections = []
+        connections: List[Dict[str, str]] = []
         try:
             current_url = url
-            page_num = 1
             while current_url:
                 resp = self.session.get(current_url, timeout=10)
                 resp.raise_for_status()
@@ -293,7 +271,6 @@ class AdminPanel:
                 next_page_link = soup.find("a", class_="page-link", rel="next")
                 if next_page_link:
                     current_url = f"{self.BASE_ADMIN_URL}{next_page_link['href']}"
-                    page_num += 1
                 else:
                     current_url = None
             if single_user:
@@ -308,26 +285,18 @@ class AdminPanel:
 
     def aggregate_single_user_info(self, connections: List[Dict[str, str]]) -> Dict[
         str, Union[str, List[str], bool, int]]:
-        result: Dict[str, Any] = {
-            "status": "unknown",
-            "nicknames": [],
-            "raw_html_snippet": [],
-            "suspected_vpn": False,
-            "ban_counts": 0,
-            "ban_reasons": [],
-            "shared_hwid_nicknames": [],
-            "associated_ips": {},
-            "associated_hwids": {}
-        }
+        result: Dict[str, Any] = {"status": "unknown", "nicknames": [], "raw_html_snippet": [], "suspected_vpn": False,
+                                  "ban_counts": 0, "ban_reasons": [], "shared_hwid_nicknames": [], "associated_ips": {},
+                                  "associated_hwids": {}}
         all_nicknames = set()
         all_ips = {}
         all_hwids = {}
         banned_found = False
         for connection in connections:
-            nickname = connection['user_name']
-            ip_address = connection['ip_address']
-            hwid = connection['hwid']
-            status = connection['status']
+            nickname = connection["user_name"]
+            ip_address = connection["ip_address"]
+            hwid = connection["hwid"]
+            status = connection["status"]
             all_nicknames.add(nickname)
             if ip_address and ip_address != N_A:
                 all_ips.setdefault(ip_address, set()).add(nickname)
@@ -342,7 +311,7 @@ class AdminPanel:
         result["nicknames"] = list(all_nicknames)
         result["associated_ips"] = {ip: list(nicks) for ip, nicks in all_ips.items()}
         result["associated_hwids"] = {hwid: list(nicks) for hwid, nicks in all_hwids.items()}
-        user_id = connections[0]['user_id'] if connections else None
+        user_id = connections[0]["user_id"] if connections else None
         if user_id:
             player_info = self.fetch_player_info(user_id)
             result["ban_counts"] = player_info["ban_counts"]
@@ -363,15 +332,12 @@ class AdminPanel:
         return result
 
     def fetch_player_info(self, user_id: str) -> Dict[str, Union[int, List[str]]]:
-        info_result = {
-            "ban_counts": 0,
-            "ban_reasons": []
-        }
+        info_result = {"ban_counts": 0, "ban_reasons": []}
         info_url = self.PLAYER_INFO_URL_PATTERN.format(user_id)
         try:
             resp = self.session.get(info_url, timeout=10)
             resp.raise_for_status()
-            logging.debug(f"Successfully fetched player info for user ID: {user_id}")
+            logging.debug(f"Fetched player info for user ID: {user_id}")
         except requests.exceptions.RequestException as e:
             logging.error(f"Error fetching player info for {user_id}: {e}")
             return info_result
@@ -419,7 +385,7 @@ class AdminPanel:
                 if used[j]:
                     continue
                 result_j = partial_results_list[j]
-                if merged_nicknames.intersection(set(result_j["nicknames"])):
+                if merged_nicknames.intersection(result_j["nicknames"]):
                     used[j] = True
                     merged_nicknames.update(result_j["nicknames"])
                     merged_dict["nicknames"].update(result_j["nicknames"])
