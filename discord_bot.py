@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 from urllib.parse import quote_plus, unquote_plus
@@ -14,7 +15,7 @@ from config_backup_v2 import TARGET_CHANNEL_ID, COMPLAINT_CHANNEL_IDS, COMPLAINT
 from utils import embed_contains_nickname, collect_unique_links_from_embed, extract_effective_search_term
 
 MESSAGE_LINK_FORMAT = "https://discord.com/channels/{}/{}/{}"
-SCAN_REPORT_FILENAME = "scan_report_1.json"
+SCAN_REPORT_FILENAME = "scan_report.json"
 COMPLAINT_CACHE_FILENAME = "complaint_message_cache.json"
 SHARED_HWID_INFO_FORMAT = "Shared HWID with: {}"
 COMPLAINT_LINKS_SUMMARY_FORMAT = "\n      Found in complaint messages:\n{}"
@@ -352,20 +353,14 @@ class DiscordBot(discord.Client):
             "results": results,
         }
 
-    async def enrich_player_results(self, nicknames: List[str]) -> List[Dict[str, Any]]:
-        if not nicknames:
-            return []
-        return await self.check_name_in_channels(nicknames)
-
-    async def check_name_in_channels(self, nicknames: List[str]) -> List[Dict[str, Any]]:
-        found_complaints_info: List[Dict[str, Any]] = []
-        lower_nicknames = [n.lower() for n in nicknames]
+    async def update_complaint_message_cache(self) -> None:
+        logging.info("Updating complaint message cache for all complaint channels...")
         for ch_id in COMPLAINT_CHANNEL_IDS:
             channel = self.complaint_channels.get(ch_id)
             if not channel:
                 logging.warning(f"Complaint channel with ID {ch_id} not pre-fetched.")
                 continue
-            channel_complaint_info: List[Dict[str, Any]] = []
+
             channel_cache = self.complaint_message_cache.get(ch_id, {"messages": [], "last_cached_id": None})
             cached_message_ids = {msg["id"] for msg in channel_cache["messages"]}
             last_cached_id = channel_cache.get("last_cached_id")
@@ -374,6 +369,7 @@ class DiscordBot(discord.Client):
                 history_kwargs["after"] = discord.Object(id=last_cached_id)
             else:
                 history_kwargs["limit"] = COMPLAINT_MESSAGE_HISTORY_LIMIT
+
             new_messages = []
             try:
                 async for msg in channel.history(**history_kwargs):
@@ -381,51 +377,83 @@ class DiscordBot(discord.Client):
                         new_messages.append(msg)
                 if new_messages:
                     logging.info(f"Fetched {len(new_messages)} new messages for channel {channel.name} ({ch_id}).")
-                    channel_cache["messages"].extend([{
-                        "id": m.id,
-                        "content": m.content,
-                        "embeds": [
-                            {k: e.to_dict()[k] for k in EMBED_FIELDS_TO_CACHE if k in e.to_dict()}
-                            for e in m.embeds
-                        ],
-                    } for m in new_messages])
+                    channel_cache["messages"].extend([
+                        {
+                            "id": m.id,
+                            "content": m.content,
+                            "embeds": [
+                                {k: e.to_dict()[k] for k in EMBED_FIELDS_TO_CACHE if k in e.to_dict()}
+                                for e in m.embeds
+                            ],
+                        } for m in new_messages
+                    ])
                     channel_cache["messages"].sort(key=lambda x: x["id"], reverse=True)
                     channel_cache["messages"] = channel_cache["messages"][:COMPLAINT_MESSAGE_HISTORY_LIMIT]
-                    channel_cache["last_cached_id"] = channel_cache["messages"][0]["id"] if channel_cache[
-                        "messages"] else last_cached_id
+                    channel_cache["last_cached_id"] = (
+                        channel_cache["messages"][0]["id"] if channel_cache["messages"] else last_cached_id
+                    )
                 else:
-                    logging.info(f"No new messages found in channel {channel.name} ({ch_id}). Using cache.")
-                for cached_msg in channel_cache["messages"]:
-                    content_lower = cached_msg["content"].lower()
-                    found_nicks_in_content = [original_nick for original_nick, lower_nick in
-                                              zip(nicknames, lower_nicknames) if lower_nick in content_lower]
-                    if found_nicks_in_content:
-                        jump_link = MESSAGE_LINK_FORMAT.format(channel.guild.id, channel.id, cached_msg["id"])
-                        channel_complaint_info.append({"link": jump_link, "nicknames": found_nicks_in_content})
-                    else:
-                        for embed_data in cached_msg.get("embeds", []):
-                            embed = discord.Embed.from_dict(embed_data)
-                            matched_nicks = [nick for nick in nicknames if embed_contains_nickname(embed, nick)]
-                            if matched_nicks:
-                                jump_link = MESSAGE_LINK_FORMAT.format(channel.guild.id, channel.id, cached_msg["id"])
-                                channel_complaint_info.append({"link": jump_link, "nicknames": matched_nicks})
-                                break
-
+                    logging.info(f"No new messages found in channel {channel.name} ({ch_id}).")
             except discord.Forbidden:
                 logging.warning(f"Insufficient permissions to read channel {channel.name} ({ch_id}).")
             except discord.HTTPException as e:
                 logging.error(f"Discord API error reading channel {channel.name} ({ch_id}): {e}")
             except Exception as e:
                 logging.error(f"Unexpected error reading channel {channel.name} ({ch_id}): {e}", exc_info=True)
+
             self.complaint_message_cache[ch_id] = channel_cache
+
+
+    async def enrich_player_results(self, nicknames: List[str]) -> List[Dict[str, Any]]:
+        if not nicknames:
+            return []
+        return await self.check_name_in_channels(nicknames)
+
+    async def check_name_in_channels(self, nicknames: List[str]) -> List[Dict[str, Any]]:
+        patterns = {
+            nick: re.compile(r'(?<!\w)' + re.escape(nick) + r'(?!\w)', flags=re.IGNORECASE)
+            for nick in nicknames
+        }
+
+        found_complaints_info: List[Dict[str, Any]] = []
+        for ch_id in COMPLAINT_CHANNEL_IDS:
+            channel = self.complaint_channels.get(ch_id)
+            if not channel:
+                logging.warning(f"Complaint channel with ID {ch_id} not pre-fetched.")
+                continue
+
+            channel_cache = self.complaint_message_cache.get(ch_id, {"messages": [], "last_cached_id": None})
+            channel_complaint_info: List[Dict[str, Any]] = []
+            for cached_msg in channel_cache["messages"]:
+                found_nicks_in_content = [
+                    nick for nick, pattern in patterns.items()
+                    if pattern.search(cached_msg["content"])
+                ]
+                if found_nicks_in_content:
+                    jump_link = MESSAGE_LINK_FORMAT.format(channel.guild.id, channel.id, cached_msg["id"])
+                    channel_complaint_info.append({"link": jump_link, "nicknames": found_nicks_in_content})
+                else:
+                    for embed_data in cached_msg.get("embeds", []):
+                        embed = discord.Embed.from_dict(embed_data)
+                        matched_nicks = [
+                            nick for nick in nicknames
+                            if embed_contains_nickname(embed, nick)
+                        ]
+                        if matched_nicks:
+                            jump_link = MESSAGE_LINK_FORMAT.format(channel.guild.id, channel.id, cached_msg["id"])
+                            channel_complaint_info.append({"link": jump_link, "nicknames": matched_nicks})
+                            break
             found_complaints_info.extend(channel_complaint_info)
+
         unique_complaints = []
         seen_links: Set[str] = set()
         for comp in found_complaints_info:
             if comp["link"] not in seen_links:
                 unique_complaints.append(comp)
                 seen_links.add(comp["link"])
+
         return unique_complaints
+
 
     def get_player_verdict(self, result: Dict[str, Any]) -> str:
         account = result.get("aggregated_account", result)
@@ -445,8 +473,12 @@ class DiscordBot(discord.Client):
 
     async def process_ban_bypass_check(self) -> List[Dict[str, Any]]:
         logging.info(f"Starting Ban Bypass Check, fetching up to {self.ban_bypass_pages} pages...")
-        ban_hit_connections = await asyncio.to_thread(self.admin_panel.fetch_ban_hit_connections,
-                                                      max_pages=self.ban_bypass_pages)
+        await self.update_complaint_message_cache()
+
+        ban_hit_connections = await asyncio.to_thread(
+            self.admin_panel.fetch_ban_hit_connections,
+            max_pages=self.ban_bypass_pages
+        )
         if not ban_hit_connections:
             logging.info("No ban hit connections found.")
             return []
@@ -487,15 +519,17 @@ class DiscordBot(discord.Client):
                         bypass_user_names = sorted(set(hwid_nicks) - {banned_user_name})
                 if bypass_reason == NO_MATCH_CONFIDENCE and ip_address != N_A and ip_address in account_info.get(
                         "associated_ips", {}):
-                    ip_nicks = account_info["associated_ips"][ip_address]
-                    if len(set(ip_nicks)) > 1:
-                        bypass_reason = IP_TIME_MATCH_CONFIDENCE
-                        bypass_user_names = sorted(set(ip_nicks) - {banned_user_name})
                     time_suspected_users = self._check_time_based_bypass(ban_hit_time, ip_address, banned_user_name,
                                                                          connections)
                     if time_suspected_users:
-                        bypass_reason = "IP+Time Match (5-10 min)"
-                        bypass_user_names = sorted(set(bypass_user_names).union(time_suspected_users))
+                        bypass_reason = "IP+Time Match (5-10 min, 30-50%)"
+                        bypass_user_names = sorted(set(time_suspected_users))
+                    else:
+                        ip_nicks = account_info["associated_ips"][ip_address]
+                        if len(set(ip_nicks)) > 1:
+                            bypass_reason = "IP Match (1-10%)"
+                            bypass_user_names = sorted(set(ip_nicks) - {banned_user_name})
+
                 ban_hit_enriched = ban_hit.copy()
                 ban_hit_enriched.update({
                     "connection_link": self.admin_panel.get_connections_url(user_id=user_id),
@@ -511,11 +545,17 @@ class DiscordBot(discord.Client):
                     "hwid": hwid,
                     "complaint_links": [],
                 })
+
+                ban_hit_enriched["initial_account"] = account_info
+
                 ban_hit_enriched["complaint_links"] = await self.enrich_player_results(
-                    [ban_hit_enriched["banned_user_name"]])
-                message_data = self._create_message_info("BanBypassCheck", "N/A",
-                                                         ban_hit_enriched.get("ban_hit_link", "N/A"),
-                                                         [ban_hit_enriched])
+                    [ban_hit_enriched["banned_user_name"]]
+                )
+                message_data = self._create_message_info(
+                    "BanBypassCheck", "N/A",
+                    ban_hit_enriched.get("ban_hit_link", "N/A"),
+                    [ban_hit_enriched]
+                )
                 report_data.append(message_data)
                 self.log_message_summary(message_data)
             except Exception as e:
