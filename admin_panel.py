@@ -5,8 +5,10 @@ from urllib.parse import urljoin, quote_plus
 
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter, Retry
 
 N_A = "N/A"
+TIMEOUT = 20
 
 class AdminPanel:
     BASE_ADMIN_URL = "https://admin.deadspace14.net"
@@ -23,6 +25,15 @@ class AdminPanel:
         self.username = username
         self.password = password
         self.session = requests.Session()
+        retries = Retry(
+            total=5,
+            backoff_factor=1,
+            status_forcelist=[502, 503, 504],
+            allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=100, pool_maxsize=100)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
         self.login_attempts = 0
 
     def login(self) -> bool:
@@ -40,7 +51,7 @@ class AdminPanel:
 
     def _attempt_login(self) -> bool:
         try:
-            response = self.session.get(self.PLAYERS_URL, allow_redirects=True, timeout=10)
+            response = self.session.get(self.PLAYERS_URL, allow_redirects=True, timeout=TIMEOUT)
             response.raise_for_status()
             logging.debug(f"Accessed {self.PLAYERS_URL} successfully.")
         except requests.exceptions.RequestException as e:
@@ -55,13 +66,21 @@ class AdminPanel:
             logging.error("Anti-forgery token not found on login page.")
             return False
         token = token_input.get("value")
-        payload = {"Input.EmailOrUsername": self.username, "Input.Password": self.password,
-                   "__RequestVerificationToken": token}
+        payload = {
+            "Input.EmailOrUsername": self.username,
+            "Input.Password": self.password,
+            "__RequestVerificationToken": token
+        }
         sso_login_url = response.url
-        headers = {"Content-Type": "application/x-www-form-urlencoded", "Referer": sso_login_url,
-                   "Origin": self.ACCOUNT_URL, "User-Agent": "Mozilla/5.0 (compatible)"}
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": sso_login_url,
+            "Origin": self.ACCOUNT_URL,
+            "User-Agent": "Mozilla/5.0 (compatible)"
+        }
         try:
-            response = self.session.post(sso_login_url, data=payload, headers=headers, allow_redirects=True, timeout=10)
+            response = self.session.post(sso_login_url, data=payload, headers=headers, allow_redirects=True,
+                                         timeout=TIMEOUT)
             response.raise_for_status()
             logging.debug("SSO login request successful.")
         except requests.exceptions.RequestException as e:
@@ -77,8 +96,13 @@ class AdminPanel:
             inputs = form.find_all("input")
             form_data = {inp.get("name"): inp.get("value", "") for inp in inputs}
             try:
-                response = self.session.post(redirect_action_url, data=form_data, headers={"Referer": response.url},
-                                             allow_redirects=True, timeout=10)
+                response = self.session.post(
+                    redirect_action_url,
+                    data=form_data,
+                    headers={"Referer": response.url},
+                    allow_redirects=True,
+                    timeout=TIMEOUT
+                )
                 response.raise_for_status()
                 logging.debug("Redirect form submission successful.")
             except requests.exceptions.RequestException as e:
@@ -106,7 +130,7 @@ class AdminPanel:
                 logging.info(f"Reached max pages limit: {max_pages}.")
                 break
             try:
-                response = self.session.get(current_url, timeout=10)
+                response = self.session.get(current_url, timeout=TIMEOUT)
                 response.raise_for_status()
                 soup = BeautifulSoup(response.text, "html.parser")
                 logging.info(f"Fetched ban hit connections page {page_num}: {current_url}")
@@ -154,7 +178,7 @@ class AdminPanel:
     def fetch_ban_info(self, ban_hits_link: str) -> Dict[str, str]:
         ban_info: Dict[str, str] = {}
         try:
-            response = self.session.get(ban_hits_link, timeout=10)
+            response = self.session.get(ban_hits_link, timeout=TIMEOUT)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             dl = soup.find("dl")
@@ -195,7 +219,7 @@ class AdminPanel:
         connections: List[Dict[str, str]] = []
         url = self.get_connections_url(user_id=user_id)
         try:
-            response = self.session.get(url, timeout=10)
+            response = self.session.get(url, timeout=TIMEOUT)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             logging.debug(f"Fetched connections for user ID {user_id}: {url}")
@@ -241,7 +265,7 @@ class AdminPanel:
         try:
             current_url = url
             while current_url:
-                resp = self.session.get(current_url, timeout=10)
+                resp = self.session.get(current_url, timeout=TIMEOUT)
                 resp.raise_for_status()
                 soup = BeautifulSoup(resp.text, "html.parser")
                 logging.debug(f"Successfully fetched and parsed URL: {current_url}")
@@ -285,9 +309,17 @@ class AdminPanel:
 
     def aggregate_single_user_info(self, connections: List[Dict[str, str]]) -> Dict[
         str, Union[str, List[str], bool, int]]:
-        result: Dict[str, Any] = {"status": "unknown", "nicknames": [], "raw_html_snippet": [], "suspected_vpn": False,
-                                  "ban_counts": 0, "ban_reasons": [], "shared_hwid_nicknames": [], "associated_ips": {},
-                                  "associated_hwids": {}}
+        result: Dict[str, Any] = {
+            "status": "unknown",
+            "nicknames": [],
+            "raw_html_snippet": [],
+            "suspected_vpn": False,
+            "ban_counts": 0,
+            "ban_reasons": [],
+            "shared_hwid_nicknames": [],
+            "associated_ips": {},
+            "associated_hwids": {}
+        }
         all_nicknames = set()
         all_ips = {}
         all_hwids = {}
@@ -335,7 +367,7 @@ class AdminPanel:
         info_result = {"ban_counts": 0, "ban_reasons": []}
         info_url = self.PLAYER_INFO_URL_PATTERN.format(user_id)
         try:
-            resp = self.session.get(info_url, timeout=10)
+            resp = self.session.get(info_url, timeout=TIMEOUT)
             resp.raise_for_status()
             logging.debug(f"Fetched player info for user ID: {user_id}")
         except requests.exceptions.RequestException as e:
