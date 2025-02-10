@@ -40,6 +40,7 @@ DEFAULT_BAN_BYPASS_PAGES = 5
 IP_MATCH_TIMEDELTA_MINUTES = 30
 SUSPICIOUS_TIMEDELTA_MINUTES = 60
 
+
 class DiscordBot(discord.Client):
     def __init__(self, admin_panel: AdminPanel, message_limit: Optional[int] = 10, username: Optional[str] = None,
                  check_ban_bypass: bool = False, ban_bypass_pages: int = DEFAULT_BAN_BYPASS_PAGES, *args,
@@ -55,13 +56,22 @@ class DiscordBot(discord.Client):
         self.complaint_message_cache: Dict[int, Dict[str, Any]] = {}
         self.hwid_cache: Dict[str, Dict[str, Any]] = {}
         self.ip_cache: Dict[str, Dict[str, Any]] = {}
-        self.base_admin_connections_url = "https://admin.deadspace14.net/Connections?showSet=true&showAccepted=true&showBanned=true&showWhitelist=true&showFull=true&showPanic=true&perPage=2000"
+        self.base_admin_connections_url = (
+            "https://admin.deadspace14.net/Connections?showSet=true&showAccepted=true&showBanned=true"
+            "&showWhitelist=true&showFull=true&showPanic=true&perPage=2000"
+        )
         self.try_check_partial = functools.partial(self._try_check, base_link=self.base_admin_connections_url)
+        self.admin_semaphore = asyncio.Semaphore(5)
+
+    async def fetch_with_rate_limit(self, func, *args, **kwargs):
+        async with self.admin_semaphore:
+            return await asyncio.to_thread(func, *args, **kwargs)
 
     async def on_ready(self) -> None:
         logging.info(f"Logged in as: {self.user} (ID: {self.user.id})")
         if not await self.setup():
             return
+
         report_data: List[Dict[str, Any]] = []
         if self.check_ban_bypass:
             report_data = await self.process_ban_bypass_check()
@@ -71,6 +81,7 @@ class DiscordBot(discord.Client):
             report_data = await self.process_messages()
         else:
             logging.warning("No scan type specified or missing parameters.")
+
         self.write_json_report(report_data, SCAN_REPORT_FILENAME)
         self.save_complaint_cache()
         logging.info("Scan complete. Disconnecting from Discord.")
@@ -81,6 +92,7 @@ class DiscordBot(discord.Client):
         if not await asyncio.to_thread(self.admin_panel.login):
             logging.error("Failed to log in to the admin panel.")
             return False
+
         if self.username is None and self.message_limit is not None and not self.fetch_target_channel():
             return False
         if not self.fetch_complaint_channels():
@@ -168,10 +180,12 @@ class DiscordBot(discord.Client):
             logging.error(f"Error saving complaint cache: {e}")
 
     async def process_nickname_search(self, username: str) -> List[Dict[str, Any]]:
+        await self.update_complaint_message_cache()
         logging.info(f"Searching for nickname: {username}")
         clean_username = quote_plus(unquote_plus(username))
         search_url = f"{self.base_admin_connections_url}&search={clean_username}"
         logging.info(f"Processing nickname search for: {username} with URL: {search_url}")
+
         initial_account_result = await asyncio.to_thread(self.try_check_partial, link=search_url, single_user=True)
         if not initial_account_result:
             logging.info(f"No account info found for nickname: {username}")
@@ -192,7 +206,6 @@ class DiscordBot(discord.Client):
         associated_accounts = [res for res in associated_accounts_results if res and not isinstance(res, Exception)]
 
         all_accounts = [initial_account_result] + associated_accounts
-
         player_result = {
             "initial_account": initial_account_result,
             "ip_nicks": await self._get_associated_nicks(initial_account_result.get("associated_ips", {}), "ip"),
@@ -215,11 +228,10 @@ class DiscordBot(discord.Client):
 
     async def _get_associated_nicks(self, ids: Dict[str, Any], id_type: str) -> Dict[str, List[str]]:
         associated_nicks: Dict[str, List[str]] = {}
-        tasks = {}
-        for id_val in ids.keys():
-            search_url = f"{self.base_admin_connections_url}&search={quote_plus(id_val)}"
-            tasks[id_val] = asyncio.create_task(
-                asyncio.to_thread(self.try_check_partial, link=search_url, single_user=True))
+        tasks = {id_val: asyncio.create_task(asyncio.to_thread(
+            self.try_check_partial, link=f"{self.base_admin_connections_url}&search={quote_plus(id_val)}",
+            single_user=True))
+            for id_val in ids.keys()}
         results = await asyncio.gather(*tasks.values(), return_exceptions=True)
         for id_val, result in zip(tasks.keys(), results):
             if not isinstance(result, Exception) and result and "nicknames" in result:
@@ -234,6 +246,7 @@ class DiscordBot(discord.Client):
             return {}
 
     async def process_messages(self) -> List[Dict[str, Any]]:
+        await self.update_complaint_message_cache()
         if not self.target_channel:
             logging.warning("Target channel is not set. Cannot process messages.")
             return []
@@ -309,7 +322,6 @@ class DiscordBot(discord.Client):
                 groups.append([res])
 
         merged_results = [self._merge_player_results(group) for group in groups]
-
         searched_nickname = None
         for embed in message.embeds:
             for field in embed.fields:
@@ -401,9 +413,8 @@ class DiscordBot(discord.Client):
                     ])
                     channel_cache["messages"].sort(key=lambda x: x["id"], reverse=True)
                     channel_cache["messages"] = channel_cache["messages"][:COMPLAINT_MESSAGE_HISTORY_LIMIT]
-                    channel_cache["last_cached_id"] = (
-                        channel_cache["messages"][0]["id"] if channel_cache["messages"] else last_cached_id
-                    )
+                    channel_cache["last_cached_id"] = (channel_cache["messages"][0]["id"]
+                                                       if channel_cache["messages"] else last_cached_id)
                 else:
                     logging.info(f"No new messages found in channel {channel.name} ({ch_id}).")
             except discord.Forbidden:
@@ -421,48 +432,37 @@ class DiscordBot(discord.Client):
         return await self.check_name_in_channels(nicknames)
 
     async def check_name_in_channels(self, nicknames: List[str]) -> List[Dict[str, Any]]:
-        patterns = {
-            nick: re.compile(r'(?<!\w)' + re.escape(nick) + r'(?!\w)', flags=re.IGNORECASE)
-            for nick in nicknames
-        }
-
+        patterns = {nick: re.compile(r'(?<!\w)' + re.escape(nick) + r'(?!\w)', flags=re.IGNORECASE)
+                    for nick in nicknames}
         found_complaints_info: List[Dict[str, Any]] = []
         for ch_id in COMPLAINT_CHANNEL_IDS:
             channel = self.complaint_channels.get(ch_id)
             if not channel:
                 logging.warning(f"Complaint channel with ID {ch_id} not pre-fetched.")
                 continue
-
             channel_cache = self.complaint_message_cache.get(ch_id, {"messages": [], "last_cached_id": None})
             channel_complaint_info: List[Dict[str, Any]] = []
             for cached_msg in channel_cache["messages"]:
-                found_nicks_in_content = [
-                    nick for nick, pattern in patterns.items()
-                    if pattern.search(cached_msg["content"])
-                ]
+                found_nicks_in_content = [nick for nick, pattern in patterns.items() if
+                                          pattern.search(cached_msg["content"])]
                 if found_nicks_in_content:
                     jump_link = MESSAGE_LINK_FORMAT.format(channel.guild.id, channel.id, cached_msg["id"])
                     channel_complaint_info.append({"link": jump_link, "nicknames": found_nicks_in_content})
                 else:
                     for embed_data in cached_msg.get("embeds", []):
                         embed = discord.Embed.from_dict(embed_data)
-                        matched_nicks = [
-                            nick for nick in nicknames
-                            if embed_contains_nickname(embed, nick)
-                        ]
+                        matched_nicks = [nick for nick in nicknames if embed_contains_nickname(embed, nick)]
                         if matched_nicks:
                             jump_link = MESSAGE_LINK_FORMAT.format(channel.guild.id, channel.id, cached_msg["id"])
                             channel_complaint_info.append({"link": jump_link, "nicknames": matched_nicks})
                             break
             found_complaints_info.extend(channel_complaint_info)
-
         unique_complaints = []
         seen_links: Set[str] = set()
         for comp in found_complaints_info:
             if comp["link"] not in seen_links:
                 unique_complaints.append(comp)
                 seen_links.add(comp["link"])
-
         return unique_complaints
 
     def get_player_verdict(self, result: Dict[str, Any]) -> str:
@@ -484,7 +484,6 @@ class DiscordBot(discord.Client):
     async def process_ban_bypass_check(self) -> List[Dict[str, Any]]:
         logging.info(f"Starting Ban Bypass Check, fetching up to {self.ban_bypass_pages} pages...")
         await self.update_complaint_message_cache()
-
         ban_hit_connections = await asyncio.to_thread(
             self.admin_panel.fetch_ban_hit_connections,
             max_pages=self.ban_bypass_pages
@@ -492,10 +491,15 @@ class DiscordBot(discord.Client):
         if not ban_hit_connections:
             logging.info("No ban hit connections found.")
             return []
+
         report_data: List[Dict[str, Any]] = []
-        tasks = []
-        for ban_hit in ban_hit_connections:
-            tasks.append(asyncio.create_task(self._process_single_ban_hit(ban_hit)))
+        semaphore = asyncio.Semaphore(5)
+
+        async def process_with_semaphore(ban_hit):
+            async with semaphore:
+                return await self._process_single_ban_hit(ban_hit)
+
+        tasks = [asyncio.create_task(process_with_semaphore(ban_hit)) for ban_hit in ban_hit_connections]
         ban_hit_results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in ban_hit_results:
             if res and not isinstance(res, Exception):
@@ -510,17 +514,19 @@ class DiscordBot(discord.Client):
             if not user_id or user_id == N_A:
                 return None
             ban_hits_link = ban_hit.get("ban_hits_link")
-            ban_info = await asyncio.to_thread(self.admin_panel.fetch_ban_info, ban_hits_link)
+            ban_info = await self.fetch_with_rate_limit(self.admin_panel.fetch_ban_info, ban_hits_link)
             banned_user_name = ban_info.get("banned_user_name") or ban_hit.get("user_name", "")
             user_id = ban_info.get("user_id") or user_id
             ip_address = ban_info.get("ip_address") or ban_hit.get("ip_address", "")
             hwid = ban_info.get("hwid") or ban_hit.get("hwid", "")
             ban_time_str = ban_info.get("ban_time", ban_hit["time"])
             ban_expires_str = ban_info.get("expires", ban_hit["time"])
+
             con_tasks = [
-                asyncio.create_task(asyncio.to_thread(self.admin_panel.fetch_connections_for_user, user_id)),
-                asyncio.create_task(asyncio.to_thread(self.admin_panel.fetch_connections_for_user, hwid)),
-                asyncio.create_task(asyncio.to_thread(self.admin_panel.fetch_connections_for_user, ip_address)),
+                asyncio.create_task(self.fetch_with_rate_limit(self.admin_panel.fetch_connections_for_user, user_id)),
+                asyncio.create_task(self.fetch_with_rate_limit(self.admin_panel.fetch_connections_for_user, hwid)),
+                asyncio.create_task(
+                    self.fetch_with_rate_limit(self.admin_panel.fetch_connections_for_user, ip_address)),
             ]
             connections_results = await asyncio.gather(*con_tasks, return_exceptions=True)
             connections = []
@@ -528,6 +534,7 @@ class DiscordBot(discord.Client):
                 if not isinstance(res, Exception):
                     connections.extend(res)
             account_info = self.admin_panel.aggregate_single_user_info(connections)
+
             bypass_reason = NO_MATCH_CONFIDENCE
             bypass_user_names: List[str] = []
             if hwid != N_A and hwid in account_info.get("associated_hwids", {}):
@@ -563,17 +570,11 @@ class DiscordBot(discord.Client):
                 "hwid": hwid,
                 "complaint_links": [],
             })
-
             ban_hit_enriched["initial_account"] = account_info
-
             ban_hit_enriched["complaint_links"] = await self.enrich_player_results(
-                [ban_hit_enriched["banned_user_name"]]
-            )
-            message_data = self._create_message_info(
-                "BanBypassCheck", "N/A",
-                ban_hit_enriched.get("ban_hit_link", "N/A"),
-                [ban_hit_enriched]
-            )
+                [ban_hit_enriched["banned_user_name"]])
+            message_data = self._create_message_info("BanBypassCheck", "N/A",
+                                                     ban_hit_enriched.get("ban_hit_link", "N/A"), [ban_hit_enriched])
             self.log_message_summary(message_data)
             return message_data
         except Exception as e:
@@ -612,16 +613,17 @@ class DiscordBot(discord.Client):
                 shared_info = SHARED_HWID_INFO_FORMAT.format(shared_names)
             ip_nicks = result_data.get("ip_nicks", {})
             ip_summary = (ASSOCIATED_IPS_FORMAT.format("\n".join(
-                [f"      - {ip}: {', '.join(sorted(nicks))}" for ip, nicks in
-                 sorted(ip_nicks.items())])) if ip_nicks else "      No associated IPs found.")
+                [f"      - {ip}: {', '.join(sorted(nicks))}" for ip, nicks in sorted(ip_nicks.items())]))
+                          if ip_nicks else "      No associated IPs found.")
             hwid_nicks = result_data.get("hwid_nicks", {})
             hwid_summary = (ASSOCIATED_HWIDS_FORMAT.format("\n".join(
-                [f"      - {hwid}: {', '.join(sorted(nicks))}" for hwid, nicks in
-                 sorted(hwid_nicks.items())])) if hwid_nicks else "      No associated HWIDs found.")
+                [f"      - {hwid}: {', '.join(sorted(nicks))}" for hwid, nicks in sorted(hwid_nicks.items())]))
+                            if hwid_nicks else "      No associated HWIDs found.")
             complaint_info = result_data.get("complaint_links", [])
             complaint_summary = (COMPLAINT_LINKS_SUMMARY_FORMAT.format("\n".join(
                 [COMPLAINT_LINK_ITEM_FORMAT.format(f"{c['link']} - {', '.join(sorted(c['nicknames']))}") for c in
-                 complaint_info])) if complaint_info else NO_COMPLAINTS_FOUND)
+                 complaint_info]))
+                                 if complaint_info else NO_COMPLAINTS_FOUND)
             ban_reasons = result.get("ban_reasons", [])
             ban_reasons_str = ", ".join(ban_reasons) if ban_reasons else NO_BAN_REASONS
             ban_counts = result.get("ban_counts", 0)

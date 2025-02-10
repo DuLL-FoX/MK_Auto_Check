@@ -10,6 +10,7 @@ from requests.adapters import HTTPAdapter, Retry
 N_A = "N/A"
 TIMEOUT = 20
 
+
 class AdminPanel:
     BASE_ADMIN_URL = "https://admin.deadspace14.net"
     PLAYERS_URL = f"{BASE_ADMIN_URL}/Players"
@@ -17,7 +18,10 @@ class AdminPanel:
     CONNECTIONS_URL = f"{BASE_ADMIN_URL}/Connections"
     BAN_HITS_URL_PATTERN = f"{BASE_ADMIN_URL}/Connections/Hits"
     PLAYER_INFO_URL_PATTERN = f"{BASE_ADMIN_URL}/Players/Info/{{}}"
-    CONNECTIONS_URL_PATTERN = f"{BASE_ADMIN_URL}/Connections?showSet=true&search={{}}&showAccepted={{}}&showBanned={{}}&showWhitelist={{}}&showFull={{}}&showPanic={{}}&perPage=2000"
+    CONNECTIONS_URL_PATTERN = (
+        f"{BASE_ADMIN_URL}/Connections?showSet=true&search={{}}&showAccepted={{}}&showBanned={{}}"
+        f"&showWhitelist={{}}&showFull={{}}&showPanic={{}}&perPage=2000"
+    )
     BANS_URL = f"{BASE_ADMIN_URL}/Bans"
     LOGIN_RETRY_LIMIT = 3
 
@@ -57,14 +61,17 @@ class AdminPanel:
         except requests.exceptions.RequestException as e:
             logging.error(f"Error accessing admin site for login: {e}")
             raise
+
         if self.ACCOUNT_URL not in response.url:
             logging.warning("SSO login page not reached. Check SSO status.")
             return False
+
         soup = BeautifulSoup(response.text, "html.parser")
         token_input = soup.find("input", {"name": "__RequestVerificationToken"})
         if not token_input:
             logging.error("Anti-forgery token not found on login page.")
             return False
+
         token = token_input.get("value")
         payload = {
             "Input.EmailOrUsername": self.username,
@@ -78,6 +85,7 @@ class AdminPanel:
             "Origin": self.ACCOUNT_URL,
             "User-Agent": "Mozilla/5.0 (compatible)"
         }
+
         try:
             response = self.session.post(sso_login_url, data=payload, headers=headers, allow_redirects=True,
                                          timeout=TIMEOUT)
@@ -86,6 +94,7 @@ class AdminPanel:
         except requests.exceptions.RequestException as e:
             logging.error(f"Error during SSO login request: {e}")
             return False
+
         if f"{self.BASE_ADMIN_URL}/signin-oidc" in response.text:
             soup = BeautifulSoup(response.text, "html.parser")
             form = soup.find("form")
@@ -121,32 +130,37 @@ class AdminPanel:
 
     def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, str]]:
         ban_hit_connections: List[Dict[str, str]] = []
-        url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true"
-        current_url = url
+        base_url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true"
+        current_url = base_url
         page_num = 1
         pages_fetched = 0
+
         while current_url:
             if max_pages > 0 and pages_fetched >= max_pages:
                 logging.info(f"Reached max pages limit: {max_pages}.")
                 break
+
             try:
                 response = self.session.get(current_url, timeout=TIMEOUT)
                 response.raise_for_status()
                 soup = BeautifulSoup(response.text, "html.parser")
                 logging.info(f"Fetched ban hit connections page {page_num}: {current_url}")
+
                 table = soup.find("table", class_="table")
                 if not table:
                     logging.warning("No connection table found on ban hit page.")
                     break
+
                 tbody = table.find("tbody")
                 if not tbody:
                     logging.warning("No tbody in ban hit table.")
                     break
+
                 rows = tbody.find_all("tr")
                 for row in rows:
                     cols = row.find_all("td")
                     if len(cols) >= 9:
-                        connection_data = {
+                        ban_hit_connections.append({
                             "user_name": cols[0].strong.text.strip() if cols[0].strong else cols[0].text.strip(),
                             "user_id": cols[1].text.strip(),
                             "time": cols[2].text.strip(),
@@ -157,8 +171,8 @@ class AdminPanel:
                             "trust_score": cols[7].text.strip(),
                             "ban_hits_link": urljoin(self.BASE_ADMIN_URL, cols[8].find("a")["href"]) if cols[8].find(
                                 "a") else None,
-                        }
-                        ban_hit_connections.append(connection_data)
+                        })
+
                 next_page_link = soup.find("a", class_="btn", string=re.compile(r"Next"))
                 if next_page_link and "disabled" not in next_page_link.get("class", []):
                     current_url = urljoin(self.BASE_ADMIN_URL, next_page_link["href"])
@@ -172,6 +186,7 @@ class AdminPanel:
             except Exception as e:
                 logging.error(f"Error parsing ban hit page {page_num}: {e}", exc_info=True)
                 break
+
         logging.info(f"Fetched {len(ban_hit_connections)} ban hits from {pages_fetched} page(s).")
         return ban_hit_connections
 
@@ -181,19 +196,21 @@ class AdminPanel:
             response = self.session.get(ban_hits_link, timeout=TIMEOUT)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
+
             dl = soup.find("dl")
             if dl:
                 dt_tags = dl.find_all("dt")
                 dd_tags = dl.find_all("dd")
-                info = {}
-                for dt, dd in zip(dt_tags, dd_tags):
-                    key = dt.get_text(strip=True).rstrip(":")
-                    info[key] = dd.get_text(strip=True)
-                ban_info["banned_user_name"] = info.get("Name", "")
-                ban_info["user_id"] = info.get("User ID", "")
-                ban_info["ip_address"] = info.get("IP", "")
-                ban_info["hwid"] = info.get("HWID", "")
-                ban_info["time"] = info.get("Time", "")
+                info = {dt.get_text(strip=True).rstrip(":"): dd.get_text(strip=True)
+                        for dt, dd in zip(dt_tags, dd_tags)}
+                ban_info.update({
+                    "banned_user_name": info.get("Name", ""),
+                    "user_id": info.get("User ID", ""),
+                    "ip_address": info.get("IP", ""),
+                    "hwid": info.get("HWID", ""),
+                    "time": info.get("Time", ""),
+                })
+
             table = soup.find("table", class_="table")
             if table:
                 rows = table.find_all("tr")
@@ -208,6 +225,7 @@ class AdminPanel:
                             if m:
                                 ban_info["ban_id"] = m.group(1)
                         break
+
             logging.debug(f"Fetched ban info from: {ban_hits_link}")
         except requests.exceptions.RequestException as e:
             logging.error(f"Error fetching ban info from {ban_hits_link}: {e}")
@@ -221,8 +239,8 @@ class AdminPanel:
         try:
             response = self.session.get(url, timeout=TIMEOUT)
             response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
             logging.debug(f"Fetched connections for user ID {user_id}: {url}")
+            soup = BeautifulSoup(response.text, 'html.parser')
             table = soup.find('table', class_='table')
             if not table:
                 logging.warning(f"No connection table found for user ID {user_id} at {url}.")
@@ -231,11 +249,10 @@ class AdminPanel:
             if not tbody:
                 logging.warning(f"No tbody found in connection table for user ID {user_id} at {url}.")
                 return []
-            rows = tbody.find_all('tr')
-            for row in rows:
+            for row in tbody.find_all('tr'):
                 cols = row.find_all('td')
                 if len(cols) >= 8:
-                    connection_data = {
+                    connections.append({
                         'user_name': cols[0].strong.text.strip() if cols[0].strong else cols[0].text.strip(),
                         'user_id': cols[1].text.strip(),
                         'time': cols[2].text.strip(),
@@ -244,8 +261,7 @@ class AdminPanel:
                         'status': cols[5].strong.text.strip() if cols[5].strong else cols[5].text.strip(),
                         'server': cols[6].text.strip(),
                         'trust_score': cols[7].text.strip(),
-                    }
-                    connections.append(connection_data)
+                    })
         except requests.exceptions.RequestException as e:
             logging.error(f"Error fetching connections for user ID {user_id}: {e} at {url}")
         except Exception as e:
@@ -256,8 +272,9 @@ class AdminPanel:
                             show_banned: str = "true", show_whitelist: str = "true", show_full: str = "true",
                             show_panic: str = "true") -> str:
         search_term = user_id if user_id else quote_plus(search)
-        return self.CONNECTIONS_URL_PATTERN.format(search_term, show_accepted, show_banned, show_whitelist, show_full,
-                                                   show_panic)
+        return self.CONNECTIONS_URL_PATTERN.format(
+            search_term, show_accepted, show_banned, show_whitelist, show_full, show_panic
+        )
 
     def check_account_on_site(self, url: str, single_user: bool = False) -> Union[
         List[Dict[str, str]], Dict[str, Union[str, List[str], bool, int]]]:
@@ -277,11 +294,10 @@ class AdminPanel:
                 if not tbody:
                     logging.warning(f"No tbody found in connection table at {current_url}.")
                     return {} if single_user else []
-                rows = tbody.find_all('tr')
-                for row in rows:
+                for row in tbody.find_all('tr'):
                     cols = row.find_all('td')
                     if len(cols) >= 8:
-                        connection_data = {
+                        connections.append({
                             'user_name': cols[0].strong.text.strip() if cols[0].strong else cols[0].text.strip(),
                             'user_id': cols[1].text.strip(),
                             'time': cols[2].text.strip(),
@@ -290,8 +306,7 @@ class AdminPanel:
                             'status': cols[5].strong.text.strip() if cols[5].strong else cols[5].text.strip(),
                             'server': cols[6].text.strip(),
                             'trust_score': cols[7].text.strip(),
-                        }
-                        connections.append(connection_data)
+                        })
                 next_page_link = soup.find("a", class_="page-link", rel="next")
                 if next_page_link:
                     current_url = f"{self.BASE_ADMIN_URL}{next_page_link['href']}"
@@ -325,10 +340,10 @@ class AdminPanel:
         all_hwids = {}
         banned_found = False
         for connection in connections:
-            nickname = connection["user_name"]
-            ip_address = connection["ip_address"]
-            hwid = connection["hwid"]
-            status = connection["status"]
+            nickname = connection.get("user_name", "")
+            ip_address = connection.get("ip_address", "")
+            hwid = connection.get("hwid", "")
+            status = connection.get("status", "")
             all_nicknames.add(nickname)
             if ip_address and ip_address != N_A:
                 all_ips.setdefault(ip_address, set()).add(nickname)
@@ -343,19 +358,18 @@ class AdminPanel:
         result["nicknames"] = list(all_nicknames)
         result["associated_ips"] = {ip: list(nicks) for ip, nicks in all_ips.items()}
         result["associated_hwids"] = {hwid: list(nicks) for hwid, nicks in all_hwids.items()}
-        user_id = connections[0]["user_id"] if connections else None
-        if user_id:
-            player_info = self.fetch_player_info(user_id)
-            result["ban_counts"] = player_info["ban_counts"]
-            result["ban_reasons"] = player_info["ban_reasons"]
-            result["raw_html_snippet"] = [{"time": conn["time"], "status": conn["status"]} for conn in
-                                          connections[:100]]
-            if result["ban_counts"] > 0:
-                if result["ban_counts"] >= 5:
-                    result["status"] = "suspicious"
-                else:
-                    if result["status"] not in ("suspicious", "banned"):
-                        result["status"] = "banned"
+
+        if connections:
+            user_id = connections[0].get("user_id")
+            if user_id:
+                player_info = self.fetch_player_info(user_id)
+                result["ban_counts"] = player_info.get("ban_counts", 0)
+                result["ban_reasons"] = player_info.get("ban_reasons", [])
+                result["raw_html_snippet"] = [{"time": conn.get("time"), "status": conn.get("status")}
+                                              for conn in connections[:100]]
+                if result["ban_counts"] > 0:
+                    result["status"] = "suspicious" if result["ban_counts"] >= 5 else (
+                        result["status"] if result["status"] in ("suspicious", "banned") else "banned")
         shared_hwid_nicks = set()
         for hwid, nicks in result["associated_hwids"].items():
             if len(nicks) > 1 and hwid != N_A:
@@ -373,6 +387,7 @@ class AdminPanel:
         except requests.exceptions.RequestException as e:
             logging.error(f"Error fetching player info for {user_id}: {e}")
             return info_result
+
         soup = BeautifulSoup(resp.text, "html.parser")
         ban_table = None
         for h2 in soup.find_all("h2"):
@@ -381,15 +396,12 @@ class AdminPanel:
                 break
         if ban_table:
             ban_body = ban_table.find("tbody")
-            if not ban_body:
-                return info_result
-            ban_rows = ban_body.find_all("tr", recursive=False)
-            for row in ban_rows:
-                cols = row.find_all("td", recursive=False)
-                if len(cols) < 2:
-                    continue
-                reason_col = cols[1].get_text(strip=True)
-                info_result["ban_reasons"].append(reason_col)
+            if ban_body:
+                for row in ban_body.find_all("tr", recursive=False):
+                    cols = row.find_all("td", recursive=False)
+                    if len(cols) >= 2:
+                        reason = cols[1].get_text(strip=True)
+                        info_result["ban_reasons"].append(reason)
             info_result["ban_counts"] = len(info_result["ban_reasons"])
             logging.debug(f"Found {info_result['ban_counts']} bans for user ID: {user_id}")
         return info_result
@@ -428,10 +440,12 @@ class AdminPanel:
                     merged_dict["status"] = self._merge_statuses(merged_dict["status"], result_j["status"])
                     for ip, nicks in result_j["associated_ips"].items():
                         merged_dict["associated_ips"].setdefault(ip, []).extend(
-                            [nick for nick in nicks if nick not in merged_dict["associated_ips"].get(ip, [])])
+                            nick for nick in nicks if nick not in merged_dict["associated_ips"].get(ip, [])
+                        )
                     for hwid, nicks in result_j["associated_hwids"].items():
                         merged_dict["associated_hwids"].setdefault(hwid, []).extend(
-                            [nick for nick in nicks if nick not in merged_dict["associated_hwids"].get(hwid, [])])
+                            nick for nick in nicks if nick not in merged_dict["associated_hwids"].get(hwid, [])
+                        )
             merged_dict["nicknames"] = list(merged_dict["nicknames"])
             merged_dict["ban_reasons"] = list(merged_dict["ban_reasons"])
             merged_dict["shared_hwid_nicknames"] = list(merged_dict["shared_hwid_nicknames"])
