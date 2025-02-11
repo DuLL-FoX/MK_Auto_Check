@@ -250,22 +250,35 @@ class DiscordBot(discord.Client):
         if not self.target_channel:
             logging.warning("Target channel is not set. Cannot process messages.")
             return []
-        logging.info(f"Checking last {self.message_limit} messages in '{self.target_channel.name}' ({TARGET_CHANNEL_ID}) for embed links.")
+
         report_data: List[Dict[str, Any]] = []
         processed_message_ids: Set[int] = set()
-        tasks = []
-        async for message in self.target_channel.history(limit=self.message_limit, oldest_first=False):
+
+        logging.info(
+            f"Checking messages in '{self.target_channel.name}' ({TARGET_CHANNEL_ID}) for 'Arrived new player' with limit {self.message_limit}.")
+
+        if self.message_limit is None:
+            logging.error("Message limit is not defined.")
+            return []
+
+        message_count = 0
+        async for message in self.target_channel.history(limit=None, oldest_first=False):
             if message.id in processed_message_ids:
                 continue
             processed_message_ids.add(message.id)
-            if not message.embeds:
-                continue
-            tasks.append(asyncio.create_task(self.process_message(message)))
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for result in results:
-            if result and not isinstance(result, Exception):
-                report_data.append(result)
-                self.log_message_summary(result)
+
+            if message.embeds:
+                for embed in message.embeds:
+                    if embed.title == 'Arrived new player':
+                        result = await self.process_message(message)
+                        if result and not isinstance(result, Exception):
+                            report_data.append(result)
+                            self.log_message_summary(result)
+                            message_count += 1
+                            break
+            if message_count >= self.message_limit:
+                break
+
         return report_data
 
     async def process_message(self, message: discord.Message) -> Optional[Dict[str, Any]]:
