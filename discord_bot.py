@@ -356,8 +356,7 @@ class DiscordBot(discord.Client):
         )
         for player_res in message_info["results"]:
             player_res["complaint_links"] = await self.enrich_player_results(
-                player_res["initial_account"].get("nicknames", [])
-            )
+                player_res["initial_account"].get("nicknames", []))
         return message_info
 
     def _merge_player_results(self, results: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -481,18 +480,21 @@ class DiscordBot(discord.Client):
     def get_player_verdict(self, result: Dict[str, Any]) -> str:
         account = result.get("aggregated_account", result)
         confidence = result.get("ban_bypass_confidence", "")
-        if confidence in (HWID_MATCH_CONFIDENCE, IP_TIME_MATCH_CONFIDENCE, "IP+Time Match (5-10 min)"):
-            return f"{POTENTIAL_BYPASS_VERDICT} - {confidence}"
-        if account.get("ban_counts", 0) >= 5:
-            return f"{SUSPICIOUS_VERDICT} - multiple bans"
-        status = account.get("status", "unknown")
-        if status == "banned":
-            return BANNED_VERDICT
-        if status == "clean":
-            return CLEAN_VERDICT
-        if status == "suspicious":
-            return SUSPICIOUS_VERDICT
-        return UNKNOWN_VERDICT
+        if confidence in {HWID_MATCH_CONFIDENCE, IP_TIME_MATCH_CONFIDENCE, "IP+Time Match (5-10 min, 30-50%)"}:
+            verdict = f"{POTENTIAL_BYPASS_VERDICT} - {confidence}"
+        elif account.get("ban_counts", 0) >= 5:
+            verdict = f"{SUSPICIOUS_VERDICT} - multiple bans"
+        else:
+            status_mapping = {
+                "banned": BANNED_VERDICT,
+                "clean": CLEAN_VERDICT,
+                "suspicious": SUSPICIOUS_VERDICT,
+            }
+            status = account.get("status", "unknown").lower()
+            verdict = status_mapping.get(status, UNKNOWN_VERDICT)
+        if result.get("hwid_erased", False):
+            verdict += " / HWID Erased"
+        return verdict
 
     async def process_ban_bypass_check(self) -> List[Dict[str, Any]]:
         logging.info(f"Starting Ban Bypass Check, fetching up to {self.ban_bypass_pages} pages...")
@@ -532,6 +534,10 @@ class DiscordBot(discord.Client):
             user_id = ban_info.get("user_id") or user_id
             ip_address = ban_info.get("ip_address") or ban_hit.get("ip_address", "")
             hwid = ban_info.get("hwid") or ban_hit.get("hwid", "")
+            hwid_erased = False
+            if not hwid or hwid.strip() == "":
+                hwid_erased = True
+
             ban_time_str = ban_info.get("ban_time", ban_hit["time"])
             ban_expires_str = ban_info.get("expires", ban_hit["time"])
 
@@ -581,6 +587,7 @@ class DiscordBot(discord.Client):
                 "user_id": user_id,
                 "ip_address": ip_address,
                 "hwid": hwid,
+                "hwid_erased": hwid_erased,
                 "complaint_links": [],
             })
             ban_hit_enriched["initial_account"] = account_info
@@ -612,68 +619,72 @@ class DiscordBot(discord.Client):
 
     def log_message_summary(self, message_info: Dict[str, Any]) -> None:
         results = message_info.get("results", [])
-        logging.info("=" * 60)
+        separator = "=" * 60
+        logging.info(separator)
         header = f"Message {message_info.get('message_id', 'N/A')} by {message_info.get('author_name', 'N/A')} has {len(results)} result(s)."
         if message_info.get("message_link", "N/A") != "N/A":
             header += f" Link: {message_info['message_link']}"
         logging.info(header)
         for idx, result_data in enumerate(results, start=1):
-            result = result_data.get("initial_account", {})
-            verdict = self.get_player_verdict(result)
-            shared_info = ""
-            if result.get("shared_hwid_nicknames"):
-                shared_names = ", ".join(sorted(result["shared_hwid_nicknames"]))
-                shared_info = SHARED_HWID_INFO_FORMAT.format(shared_names)
-            ip_nicks = result_data.get("ip_nicks", {})
-            ip_summary = (ASSOCIATED_IPS_FORMAT.format("\n".join(
-                [f"      - {ip}: {', '.join(sorted(nicks))}" for ip, nicks in sorted(ip_nicks.items())]))
-                          if ip_nicks else "      No associated IPs found.")
-            hwid_nicks = result_data.get("hwid_nicks", {})
-            hwid_summary = (ASSOCIATED_HWIDS_FORMAT.format("\n".join(
-                [f"      - {hwid}: {', '.join(sorted(nicks))}" for hwid, nicks in sorted(hwid_nicks.items())]))
-                            if hwid_nicks else "      No associated HWIDs found.")
-            complaint_info = result_data.get("complaint_links", [])
-            complaint_summary = (COMPLAINT_LINKS_SUMMARY_FORMAT.format("\n".join(
-                [COMPLAINT_LINK_ITEM_FORMAT.format(f"{c['link']} - {', '.join(sorted(c['nicknames']))}") for c in
-                 complaint_info]))
-                                 if complaint_info else NO_COMPLAINTS_FOUND)
-            ban_reasons = result.get("ban_reasons", [])
-            ban_reasons_str = ", ".join(ban_reasons) if ban_reasons else NO_BAN_REASONS
-            ban_counts = result.get("ban_counts", 0)
-            connection_link = result.get("connection_link", "N/A")
-            if "ban_hit_link" in result_data:
-                ban_time = result_data.get("ban_time", "N/A")
-                ban_expires = result_data.get("ban_expires", "N/A")
-                banned_user = result_data.get("banned_user_name", N_A)
-                bypass_users = ", ".join(sorted(result_data.get("bypass_user_names", [N_A])))
-                log_output = f"""{idx}) Banned User: {banned_user}
-   Ban Time: {ban_time}   Expires: {ban_expires}
-   Status: {result.get('status', UNKNOWN_STATUS)} (Bans: {ban_counts})
-   Suspected VPN: {result.get('suspected_vpn', False)}
-   Ban reasons: {ban_reasons_str}
-   Verdict: {verdict}
-   Connection Link: {connection_link}
-   Ban Hit Link: {result_data.get('ban_hit_link')}
-   IP: {result_data.get('ip_address', 'N/A')}
-   HWID: {result_data.get('hwid', 'N/A')}
-   Potential Bypassers: {bypass_users}
-   {shared_info}
-   {ip_summary}
-   {hwid_summary}
-   Complaint Links: {complaint_summary}"""
-            else:
-                log_output = f"""{idx}) Searched Nickname: {message_info.get('author_name', 'N/A')}
-   Status: {result.get('status', UNKNOWN_STATUS)} (Bans: {ban_counts})
-   Suspected VPN: {result.get('suspected_vpn', False)}
-   Ban reasons: {ban_reasons_str}
-   Verdict: {verdict}
-   Connection Link: {connection_link}
-   {shared_info}
-   {ip_summary}
-   {hwid_summary}
-   Complaint Links: {complaint_summary}"""
-            logging.info(log_output.strip())
-        logging.info("=" * 60)
+            log_output = self._format_result_summary(result_data, idx, message_info)
+            logging.info(log_output)
+        logging.info(separator)
+
+    def _format_result_summary(self, result_data: Dict[str, Any], idx: int, message_info: Dict[str, Any]) -> str:
+        result = result_data.get("initial_account", {})
+        verdict = self.get_player_verdict(result)
+        shared_info = ""
+        if result.get("shared_hwid_nicknames"):
+            shared_info = SHARED_HWID_INFO_FORMAT.format(", ".join(sorted(result["shared_hwid_nicknames"])))
+        ip_nicks = result_data.get("ip_nicks", {})
+        ip_summary = (ASSOCIATED_IPS_FORMAT.format("\n".join(
+            [f"      - {ip}: {', '.join(sorted(nicks))}" for ip, nicks in sorted(ip_nicks.items())]))
+                      if ip_nicks else "      No associated IPs found.")
+        hwid_nicks = result_data.get("hwid_nicks", {})
+        hwid_summary = (ASSOCIATED_HWIDS_FORMAT.format("\n".join(
+            [f"      - {hwid}: {', '.join(sorted(nicks))}" for hwid, nicks in sorted(hwid_nicks.items())]))
+                        if hwid_nicks else "      No associated HWIDs found.")
+        complaint_info = result_data.get("complaint_links", [])
+        complaint_summary = (COMPLAINT_LINKS_SUMMARY_FORMAT.format("\n".join(
+            [COMPLAINT_LINK_ITEM_FORMAT.format(f"{c['link']} - {', '.join(sorted(c['nicknames']))}") for c in
+             complaint_info]))
+                             if complaint_info else NO_COMPLAINTS_FOUND)
+        ban_reasons = result.get("ban_reasons", [])
+        ban_reasons_str = ", ".join(ban_reasons) if ban_reasons else NO_BAN_REASONS
+        ban_counts = result.get("ban_counts", 0)
+        connection_link = result.get("connection_link", "N/A")
+
+        if "ban_hit_link" in result_data:
+            ban_time = result_data.get("ban_time", "N/A")
+            ban_expires = result_data.get("ban_expires", "N/A")
+            banned_user = result_data.get("banned_user_name", N_A)
+            bypass_users = ", ".join(sorted(result_data.get("bypass_user_names", [N_A])))
+            return (f"{idx}) Banned User: {banned_user}\n"
+                    f"   Ban Time: {ban_time}   Expires: {ban_expires}\n"
+                    f"   Status: {result.get('status', UNKNOWN_STATUS)} (Bans: {ban_counts})\n"
+                    f"   Suspected VPN: {result.get('suspected_vpn', False)}\n"
+                    f"   Ban reasons: {ban_reasons_str}\n"
+                    f"   Verdict: {verdict}\n"
+                    f"   Connection Link: {connection_link}\n"
+                    f"   Ban Hit Link: {result_data.get('ban_hit_link')}\n"
+                    f"   IP: {result_data.get('ip_address', 'N/A')}\n"
+                    f"   HWID: {result_data.get('hwid', 'N/A')}\n"
+                    f"   Potential Bypassers: {bypass_users}\n"
+                    f"   {shared_info}\n"
+                    f"   {ip_summary}\n"
+                    f"   {hwid_summary}\n"
+                    f"   Complaint Links: {complaint_summary}").strip()
+        else:
+            return (f"{idx}) Searched Nickname: {message_info.get('author_name', 'N/A')}\n"
+                    f"   Status: {result.get('status', UNKNOWN_STATUS)} (Bans: {ban_counts})\n"
+                    f"   Suspected VPN: {result.get('suspected_vpn', False)}\n"
+                    f"   Ban reasons: {ban_reasons_str}\n"
+                    f"   Verdict: {verdict}\n"
+                    f"   Connection Link: {connection_link}\n"
+                    f"   {shared_info}\n"
+                    f"   {ip_summary}\n"
+                    f"   {hwid_summary}\n"
+                    f"   Complaint Links: {complaint_summary}").strip()
 
     def write_json_report(self, report_data: List[Dict[str, Any]], file_name: str = SCAN_REPORT_FILENAME) -> None:
         try:
