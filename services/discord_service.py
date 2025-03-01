@@ -1,7 +1,9 @@
 import logging
 import re
 from typing import List, Dict, Any, Optional
+
 import discord
+
 from models.complaint import ComplaintChannel, ComplaintMessage
 from models.message import DiscordMessage
 from utils.embed_utils import collect_unique_links_from_embed
@@ -149,9 +151,9 @@ class DiscordService:
                         "channel": channel_data.name,
                         "content": shortened_content,
                         "message_id": message.id,
-                        "timestamp": message.timestamp,
+                        "message_id_as_timestamp": int(message.id),
                         "author": message.author.name if hasattr(message, 'author') else "Unknown",
                         "mentioned_nicknames": mentioned_nicknames
                     })
-        result.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+        result.sort(key=lambda x: x.get("message_id_as_timestamp", 0), reverse=True)
         return result

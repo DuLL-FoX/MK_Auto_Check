@@ -1,8 +1,9 @@
 import asyncio
 import logging
+import time
 from collections import defaultdict
 from datetime import datetime
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Callable
 
 from config_system import get_config
 from core.analyzer import PlayerAnalyzer
@@ -18,7 +19,41 @@ from services.report_service import ReportService
 from utils.async_utils import gather_with_concurrency
 from utils.url_utils import extract_effective_search_term
 
-logger = logging.getLogger(__name__)
+
+class PerformanceStats:
+    def __init__(self):
+        self.operation_stats = defaultdict(list)
+        self.operation_counts = defaultdict(int)
+        self.last_summary_time = time.time()
+        self.summary_interval = 60
+
+    def record(self, operation: str, duration: float):
+        self.operation_stats[operation].append(duration)
+        self.operation_counts[operation] += 1
+
+    def should_log_summary(self) -> bool:
+        current_time = time.time()
+        return current_time - self.last_summary_time > self.summary_interval
+
+    def get_summary(self) -> List[str]:
+        if not self.operation_stats:
+            return []
+        summary = ["Performance summary:"]
+        for op_name, durations in sorted(self.operation_stats.items()):
+            if not durations:
+                continue
+            count = len(durations)
+            avg_time = sum(durations) / count
+            max_time = max(durations)
+            min_time = min(durations)
+            summary.append(
+                f"  {op_name}: {count} calls, avg {avg_time:.2f}s, "
+                f"min {min_time:.2f}s, max {max_time:.2f}s"
+            )
+        self.operation_stats.clear()
+        self.operation_counts.clear()
+        self.last_summary_time = time.time()
+        return summary
 
 
 class Scanner:
@@ -33,22 +68,17 @@ class Scanner:
         self.complaint_channels: Dict[int, ComplaintChannel] = {}
         self.searched_terms: Set[str] = set()
         self.term_results: Dict[str, Dict[str, Any]] = {}
-
         cfg = get_config()
         self.max_concurrent_requests = cfg.api.max_concurrent_requests
-
         self.connection_cache = {}
         self._create_loggers()
+        self.slow_operation_threshold = 10.0
+        self.perf_stats = PerformanceStats()
 
     def _create_loggers(self):
-        self.logger = logger
-        self.perf_logger = logging.getLogger(f"{__name__}.performance")
-        if not self.perf_logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            self.perf_logger.addHandler(handler)
-            self.perf_logger.setLevel(logging.INFO)
+        from utils.logging_utils import get_logger
+        self.logger = logging.getLogger(__name__)
+        self.perf_logger = get_logger(f"{__name__}.performance")
 
     async def setup(self, target_channel_id: int, complaint_channel_ids: List[int]) -> bool:
         self.logger.info("Setting up scanner...")
@@ -66,8 +96,9 @@ class Scanner:
     async def scan_messages(self, message_limit: int) -> List[Dict[str, Any]]:
         start_time = datetime.now()
         self.logger.info(f"Starting message scan with limit {message_limit}")
-        self.complaint_channels = await self.discord_service.update_complaint_cache(self.complaint_channels,
-                                                                                    history_limit=2000)
+        self.complaint_channels = await self.discord_service.update_complaint_cache(
+            self.complaint_channels, history_limit=2000
+        )
         messages = await self.discord_service.scan_target_channel(
             message_limit,
             lambda m: any(embed.title == 'Arrived new player' for embed in m.embeds)
@@ -83,8 +114,15 @@ class Scanner:
         self.cache_service.save_complaint_cache(self.complaint_channels)
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
+        message_count = len(messages)
+        result_count = len(scan_results)
         self.perf_logger.info(
-            f"Message scan completed in {duration:.2f}s: processed {len(messages)} messages, found {len(scan_results)} results")
+            f"Message scan completed in {duration:.2f}s: processed {message_count} messages, "
+            f"found {result_count} results ({(result_count / message_count) * 100:.1f}% hit rate if > 0)"
+        )
+        if self.perf_stats.should_log_summary():
+            for line in self.perf_stats.get_summary():
+                self.perf_logger.info(line)
         return report_data
 
     async def process_message(self, message: DiscordMessage) -> Optional[ScanResult]:
@@ -110,8 +148,10 @@ class Scanner:
         if not players:
             return None
         grouped_players = self.player_analyzer.group_players_by_nicknames(players)
-        complaint_tasks = [self.discord_service.find_nickname_mentions(player.nicknames, self.complaint_channels)
-                           for player in grouped_players]
+        complaint_tasks = [
+            self.discord_service.find_nickname_mentions(player.nicknames, self.complaint_channels)
+            for player in grouped_players
+        ]
         complaint_results = await asyncio.gather(*complaint_tasks)
         for player, complaint_links in zip(grouped_players, complaint_results):
             player.complaint_links = complaint_links
@@ -119,10 +159,6 @@ class Scanner:
         return ScanResult(message=message, players=grouped_players, scan_time=datetime.now())
 
     async def process_term(self, term: str) -> Optional[Player]:
-        """
-        Process a search term to find player information and associated data.
-        Ensures all first-order data (direct connections) is thoroughly gathered and processed.
-        """
         if term in self.searched_terms:
             if term in self.term_results:
                 return self.admin_service.convert_to_player(self.term_results[term])
@@ -159,8 +195,9 @@ class Scanner:
             max_identifiers = min(10, len(unique_identifiers))
             selected_identifiers = unique_identifiers[:max_identifiers]
             connection_tasks = [
-                self.admin_service.fetch_with_rate_limit(self.admin_panel.fetch_connections_for_user, identifier)
-                for identifier in selected_identifiers]
+                self.admin_service.fetch_with_rate_limit(
+                    self.admin_panel.fetch_connections_for_user, identifier
+                ) for identifier in selected_identifiers]
             connections_results = await asyncio.gather(*connection_tasks)
             for result in connections_results:
                 connections.extend(result)
@@ -199,7 +236,11 @@ class Scanner:
                         if user_name and user_name not in nicknames:
                             nicknames.append(user_name)
         processing_time = (datetime.now() - term_start_time).total_seconds()
-        self.perf_logger.debug(f"Term '{term}' processed in {processing_time:.3f}s, status: {player.status}")
+        if processing_time > self.slow_operation_threshold:
+            self.perf_logger.debug(
+                f"Term '{term}' processed in {processing_time:.2f}s, status: {player.status}"
+            )
+        self.perf_stats.record("process_term", processing_time)
         return player
 
     async def fetch_new_associated_players(self, player_info: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -225,18 +266,22 @@ class Scanner:
     async def scan_nickname(self, nickname: str) -> List[Dict[str, Any]]:
         start_time = datetime.now()
         self.logger.info(f"Starting nickname search for: {nickname}")
-        self.complaint_channels = await self.discord_service.update_complaint_cache(self.complaint_channels,
-                                                                                    history_limit=2000)
+        self.complaint_channels = await self.discord_service.update_complaint_cache(
+            self.complaint_channels, history_limit=2000
+        )
         player = await self.process_term(nickname)
         if not player:
             self.logger.info(f"No player found for nickname: {nickname}")
             return []
-        complaint_links = await self.discord_service.find_nickname_mentions(player.nicknames, self.complaint_channels)
+        complaint_links = await self.discord_service.find_nickname_mentions(
+            player.nicknames, self.complaint_channels
+        )
         player.complaint_links = complaint_links
         report_data = self.report_service.generate_nickname_search_report(nickname, player)
         self.cache_service.save_complaint_cache(self.complaint_channels)
         duration = (datetime.now() - start_time).total_seconds()
         self.perf_logger.info(f"Nickname search for '{nickname}' completed in {duration:.2f}s")
+        self.perf_stats.record("scan_nickname", duration)
         return report_data
 
     async def check_ban_bypasses_raw(self, max_pages: int = 5) -> List[BanBypassCheck]:
@@ -253,8 +298,13 @@ class Scanner:
         }
         semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         complaint_task = asyncio.create_task(
-            self.discord_service.update_complaint_cache(self.complaint_channels, history_limit=2000))
-        ban_hits_task = asyncio.create_task(self.admin_service.fetch_ban_hits(max_pages))
+            self.discord_service.update_complaint_cache(
+                self.complaint_channels, history_limit=2000
+            )
+        )
+        ban_hits_task = asyncio.create_task(
+            self.admin_service.fetch_ban_hits(max_pages)
+        )
         await asyncio.wait([complaint_task, ban_hits_task])
         self.complaint_channels = complaint_task.result()
         ban_hits = ban_hits_task.result()
@@ -268,7 +318,9 @@ class Scanner:
             if hit_key not in unique_ban_hits:
                 unique_ban_hits[hit_key] = hit
         unique_ban_hits_list = list(unique_ban_hits.values())
-        self.logger.info(f"Processing {len(unique_ban_hits_list)} unique ban hits (from {len(ban_hits)} total)")
+        self.logger.info(
+            f"Processing {len(unique_ban_hits_list)} unique ban hits (from {len(ban_hits)} total)"
+        )
         all_user_ids = {hit.user_id for hit in unique_ban_hits_list if hit.user_id != "N/A"}
         all_hwids = {hit.hwid for hit in unique_ban_hits_list if hit.hwid != "N/A" and not hit.hwid_erased}
         all_ips = {hit.ip_address for hit in unique_ban_hits_list if hit.ip_address != "N/A"}
@@ -287,16 +339,19 @@ class Scanner:
                     hit.ip_address = result.get("ip_address") or hit.ip_address
                     hit.hwid = result.get("hwid") or hit.hwid
                     if "ban_time" in result:
-                        hit.ban_time = datetime.strptime(result.get("ban_time"), "%Y-%m-%d %H:%M:%S")
+                        hit.ban_time = datetime.strptime(
+                            result.get("ban_time"), "%Y-%m-%d %H:%M:%S"
+                        )
                     expires_str = result.get("expires", "1970-01-01 00:00:00")
                     try:
                         if "PERMANENT" in expires_str:
                             hit.ban_expires = datetime(2099, 12, 31)
                         else:
-                            hit.ban_expires = datetime.strptime(expires_str, "%Y-%m-%d %H:%M:%S")
+                            hit.ban_expires = datetime.strptime(
+                                expires_str, "%Y-%m-%d %H:%M:%S"
+                            )
                     except ValueError:
                         hit.ban_expires = datetime(2099, 12, 31)
-
         async def fetch_connections_cached(term):
             if term == "N/A" or not term:
                 return []
@@ -305,8 +360,9 @@ class Scanner:
                 return connection_cache[term]
             cache_stats["connection_misses"] += 1
             async with semaphore:
-                result = await self.admin_service.fetch_with_rate_limit(self.admin_panel.fetch_connections_for_user,
-                                                                        term)
+                result = await self.admin_service.fetch_with_rate_limit(
+                    self.admin_panel.fetch_connections_for_user, term
+                )
                 if result:
                     connection_cache[term] = result
                     for conn in result:
@@ -337,7 +393,6 @@ class Scanner:
                 else:
                     connection_cache[term] = []
                 return connection_cache[term]
-
         self.logger.debug(f"Stage 1: Pre-fetching connections for primary identifiers")
         primary_fetch_tasks = []
         for user_id in all_user_ids:
@@ -363,7 +418,9 @@ class Scanner:
                         secondary_user_ids.add(connected_id[4:])
         if secondary_ips or secondary_hwids or secondary_user_ids:
             self.logger.debug(
-                f"Stage 2: Pre-fetching {len(secondary_ips)} secondary IPs, {len(secondary_hwids)} secondary HWIDs, and {len(secondary_user_ids)} secondary user IDs")
+                f"Stage 2: Pre-fetching {len(secondary_ips)} secondary IPs, "
+                f"{len(secondary_hwids)} secondary HWIDs, and {len(secondary_user_ids)} secondary user IDs"
+            )
             limited_ips = list(secondary_ips)[:20]
             limited_hwids = list(secondary_hwids)[:20]
             limited_user_ids = list(secondary_user_ids)[:20]
@@ -377,7 +434,6 @@ class Scanner:
             if secondary_fetch_tasks:
                 await asyncio.gather(*secondary_fetch_tasks)
         global_processed_identifiers = set()
-
         async def process_ban_hit(hit, idx, total) -> Optional[BanBypassCheck]:
             try:
                 if hit.user_id == "N/A":
@@ -425,7 +481,10 @@ class Scanner:
                 banned_user_name = hit.banned_user_name or hit.user_name
                 for identifier in related_identifiers:
                     for conn in connection_cache.get(identifier, []):
-                        conn_id = f"{conn.get('user_id', '')}-{conn.get('time', '')}-{conn.get('ip_address', '')}-{conn.get('hwid', '')}"
+                        conn_id = (
+                            f"{conn.get('user_id', '')}-{conn.get('time', '')}-"
+                            f"{conn.get('ip_address', '')}-{conn.get('hwid', '')}"
+                        )
                         if conn_id not in seen_connection_ids:
                             seen_connection_ids.add(conn_id)
                             initial_connections.append(conn)
@@ -442,14 +501,20 @@ class Scanner:
                 for ip in all_ips:
                     if ip != hit.ip_address:
                         for conn in connection_cache.get(ip, []):
-                            conn_id = f"{conn.get('user_id', '')}-{conn.get('time', '')}-{conn.get('ip_address', '')}-{conn.get('hwid', '')}"
+                            conn_id = (
+                                f"{conn.get('user_id', '')}-{conn.get('time', '')}-"
+                                f"{conn.get('ip_address', '')}-{conn.get('hwid', '')}"
+                            )
                             if conn_id not in seen_connection_ids:
                                 seen_connection_ids.add(conn_id)
                                 initial_connections.append(conn)
                 for hwid in all_hwids:
                     if hwid != hit.hwid:
                         for conn in connection_cache.get(hwid, []):
-                            conn_id = f"{conn.get('user_id', '')}-{conn.get('time', '')}-{conn.get('ip_address', '')}-{conn.get('hwid', '')}"
+                            conn_id = (
+                                f"{conn.get('user_id', '')}-{conn.get('time', '')}-"
+                                f"{conn.get('ip_address', '')}-{conn.get('hwid', '')}"
+                            )
                             if conn_id not in seen_connection_ids:
                                 seen_connection_ids.add(conn_id)
                                 initial_connections.append(conn)
@@ -459,12 +524,13 @@ class Scanner:
                     if hit.user_name in banned_player.nicknames:
                         banned_player.nicknames.remove(hit.user_name)
                     banned_player.nicknames.insert(0, hit.user_name)
-                bypass_confidence, potential_bypassers = self.player_analyzer.find_potential_bypassers(hit,
-                                                                                                       banned_player,
-                                                                                                       initial_connections)
+                bypass_confidence, potential_bypassers = self.player_analyzer.find_potential_bypassers(
+                    hit, banned_player, initial_connections
+                )
                 nickname_to_search = hit.banned_user_name or hit.user_name
-                complaint_links = await self.discord_service.find_nickname_mentions([nickname_to_search],
-                                                                                    self.complaint_channels)
+                complaint_links = await self.discord_service.find_nickname_mentions(
+                    [nickname_to_search], self.complaint_channels
+                )
                 return BanBypassCheck(
                     ban_hit=hit,
                     banned_player=banned_player,
@@ -475,7 +541,6 @@ class Scanner:
             except Exception as e:
                 self.logger.error(f"Error processing ban hit {hit.ban_hit_link}: {str(e)}", exc_info=True)
                 return None
-
         self.logger.info(f"Starting parallel processing of {len(unique_ban_hits_list)} ban hits")
         processing_tasks = []
         for idx, hit in enumerate(unique_ban_hits_list):
@@ -483,7 +548,9 @@ class Scanner:
         results = await gather_with_concurrency(self.max_concurrent_requests, *processing_tasks)
         ban_bypass_checks = [result for result in results if result]
         self.logger.debug(
-            f"Connection cache stats: {cache_stats['connection_hits']} hits, {cache_stats['connection_misses']} misses")
+            f"Connection cache stats: {cache_stats['connection_hits']} hits, "
+            f"{cache_stats['connection_misses']} misses"
+        )
         self.cache_service.save_complaint_cache(self.complaint_channels)
         counts = {
             "no_match": 0,
@@ -505,7 +572,23 @@ class Scanner:
                 counts["hwid_match"] += 1
         duration = (datetime.now() - start_time).total_seconds()
         self.perf_logger.info(
-            f"Ban bypass check completed in {duration:.2f}s with {len(ban_bypass_checks)} potential bypasses found")
+            f"Ban bypass check completed in {duration:.2f}s with {len(ban_bypass_checks)} potential bypasses found"
+        )
         self.logger.info(
-            f"HWID Matches: {counts['hwid_match']} | IP+Close Time: {counts['ip_time_close_match']} | IP+Time: {counts['ip_time_match']} | IP: {counts['ip_match']} | No Match: {counts['no_match']}")
+            f"HWID Matches: {counts['hwid_match']} | IP+Close Time: {counts['ip_time_close_match']} | "
+            f"IP+Time: {counts['ip_time_match']} | IP: {counts['ip_match']} | No Match: {counts['no_match']}"
+        )
+        self.perf_stats.record("check_ban_bypasses", duration)
         return ban_bypass_checks
+
+    async def _monitor_operation(self, name: str, func: Callable, *args, **kwargs):
+        start_time = time.time()
+        result = await func(*args, **kwargs)
+        elapsed = time.time() - start_time
+        self.perf_stats.record(name, elapsed)
+        if elapsed > self.slow_operation_threshold:
+            args_str = str(args)
+            if len(args_str) > 40:
+                args_str = args_str[:37] + "..."
+            self.perf_logger.debug(f"{name} took {elapsed:.2f}s: {args_str}")
+        return result

@@ -14,9 +14,6 @@ from urllib3.util.retry import Retry
 from config_system import get_config
 
 N_A = "N/A"
-logger = logging.getLogger(__name__)
-perf_logger = logging.getLogger(__name__ + ".performance")
-
 
 @dataclass
 class ConnectionData:
@@ -49,23 +46,54 @@ class ConnectionData:
             "connection_id": self.connection_id
         }
 
+
+class PerformanceStats:
+    def __init__(self, logger):
+        self.logger = logger
+        self.operations = {}
+        self.last_summary_time = time.time()
+        self.summary_interval = 60
+
+    def record(self, operation, duration):
+        if operation not in self.operations:
+            self.operations[operation] = {
+                'count': 0,
+                'total_time': 0.0,
+                'min_time': float('inf'),
+                'max_time': 0.0,
+                'slow_count': 0
+            }
+        stats = self.operations[operation]
+        stats['count'] += 1
+        stats['total_time'] += duration
+        stats['min_time'] = min(stats['min_time'], duration)
+        stats['max_time'] = max(stats['max_time'], duration)
+
+    def should_log_summary(self):
+        return time.time() - self.last_summary_time >= self.summary_interval
+
+    def get_summary(self):
+        if not self.operations:
+            return []
+        lines = ["Admin panel performance summary:"]
+        for op_name, stats in sorted(self.operations.items()):
+            count = stats['count']
+            if count == 0:
+                continue
+            avg_time = stats['total_time'] / count
+            lines.append(
+                f"  {op_name}: {count} calls, avg {avg_time:.2f}s, "
+                f"min {stats['min_time']:.2f}s, max {stats['max_time']:.2f}s"
+            )
+        self.operations.clear()
+        self.last_summary_time = time.time()
+        return lines
+
 class AdminPanel:
-    BASE_ADMIN_URL = "https://admin.deadspace14.net"
-    PLAYERS_URL = f"{BASE_ADMIN_URL}/Players"
-    ACCOUNT_URL = "https://account.spacestation14.com"
-    CONNECTIONS_URL = f"{BASE_ADMIN_URL}/Connections"
-    BAN_HITS_URL_PATTERN = f"{BASE_ADMIN_URL}/Connections/Hits"
-    PLAYER_INFO_URL_PATTERN = f"{BASE_ADMIN_URL}/Players/Info/{{}}"
-    BANS_URL = f"{BASE_ADMIN_URL}/Bans"
-
-    LOGIN_RETRY_LIMIT = 3
-
     def __init__(self, username: str, password: str) -> None:
         self.username = username
         self.password = password
-
         cfg = get_config()
-
         self.BASE_ADMIN_URL = cfg.api.base_admin_url
         self.ACCOUNT_URL = cfg.api.account_url
         self.PLAYERS_URL = f"{self.BASE_ADMIN_URL}/Players"
@@ -73,23 +101,20 @@ class AdminPanel:
         self.BAN_HITS_URL_PATTERN = f"{self.BASE_ADMIN_URL}/Connections/Hits"
         self.PLAYER_INFO_URL_PATTERN = f"{self.BASE_ADMIN_URL}/Players/Info/{{}}"
         self.BANS_URL = f"{self.BASE_ADMIN_URL}/Bans"
-
         self.LOGIN_RETRY_LIMIT = cfg.api.login_retry_limit
         self.TIMEOUT = cfg.api.request_timeout
-
+        self.SLOW_REQUEST_THRESHOLD = 5.0
         self.session = self._create_session()
         self.login_attempts = 0
         self._is_authenticated = False
         self._request_metrics = {"total": 0, "slow_requests": 0, "errors": 0}
         self._setup_loggers()
+        self.perf_stats = PerformanceStats(self.perf_logger)
 
     def _setup_loggers(self):
-        if not perf_logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            handler.setFormatter(formatter)
-            perf_logger.addHandler(handler)
-            perf_logger.setLevel(logging.INFO)
+        from utils.logging_utils import get_logger
+        self.logger = logging.getLogger(__name__)
+        self.perf_logger = get_logger(f"{__name__}.performance")
 
     def _create_session(self) -> requests.Session:
         session = requests.Session()
@@ -112,15 +137,20 @@ class AdminPanel:
             return True
         while self.login_attempts < self.LOGIN_RETRY_LIMIT:
             self.login_attempts += 1
-            logger.info(f"Login attempt {self.login_attempts}/{self.LOGIN_RETRY_LIMIT}")
+            self.logger.info(f"Login attempt {self.login_attempts}/{self.LOGIN_RETRY_LIMIT}")
             try:
-                if self._attempt_login():
+                start_time = time.time()
+                result = self._attempt_login()
+                elapsed = time.time() - start_time
+                self.perf_stats.record("login", elapsed)
+                if result:
                     self._is_authenticated = True
+                    self.login_attempts = 0
                     return True
             except Exception as e:
-                logger.error(f"Login error: {str(e)}")
-            logger.warning(f"Login attempt {self.login_attempts} failed")
-        logger.error(f"Login failed after {self.LOGIN_RETRY_LIMIT} attempts")
+                self.logger.error(f"Login error: {str(e)}")
+            self.logger.warning(f"Login attempt {self.login_attempts} failed")
+        self.logger.error(f"Login failed after {self.LOGIN_RETRY_LIMIT} attempts")
         return False
 
     def _attempt_login(self) -> bool:
@@ -134,7 +164,7 @@ class AdminPanel:
             soup = BeautifulSoup(response.text, "html.parser")
             token_input = soup.select_one("input[name='__RequestVerificationToken']")
             if not token_input:
-                logger.error("Anti-forgery token not found")
+                self.logger.error("Anti-forgery token not found")
                 return False
             token = token_input.get("value")
             payload = {
@@ -148,14 +178,19 @@ class AdminPanel:
                 "Referer": sso_login_url,
                 "Origin": self.ACCOUNT_URL,
             }
-            response = self.session.post(sso_login_url, data=payload, headers=headers,
-                                         allow_redirects=True, timeout=self.TIMEOUT)
+            response = self.session.post(
+                sso_login_url,
+                data=payload,
+                headers=headers,
+                allow_redirects=True,
+                timeout=self.TIMEOUT
+            )
             response.raise_for_status()
             if f"{self.BASE_ADMIN_URL}/signin-oidc" in response.text:
                 soup = BeautifulSoup(response.text, "html.parser")
                 form = soup.select_one("form")
                 if not form:
-                    logger.error("Redirect form not found")
+                    self.logger.error("Redirect form not found")
                     return False
                 redirect_action_url = form.get("action")
                 inputs = form.select("input")
@@ -169,15 +204,14 @@ class AdminPanel:
                 )
                 response.raise_for_status()
                 if "Logout" in response.text or "Players" in response.text:
-                    logger.info("Successfully authenticated")
-                    self.login_attempts = 0
+                    self.logger.info("Successfully authenticated")
                     return True
                 else:
                     return False
             else:
                 return False
         except requests.exceptions.RequestException as e:
-            logger.error(f"Network error: {str(e)}")
+            self.logger.error(f"Network error: {str(e)}")
             return False
 
     def _ensure_authenticated(self) -> bool:
@@ -214,7 +248,7 @@ class AdminPanel:
                 is_denied_banned=("Denied: Banned" in status)
             )
         except Exception as e:
-            logger.error(f"Error parsing connection row: {str(e)}")
+            self.logger.error(f"Error parsing connection row: {str(e)}")
             return None
 
     def _parse_connections_table(self, soup: BeautifulSoup) -> List[ConnectionData]:
@@ -242,7 +276,7 @@ class AdminPanel:
 
     def fetch_paginated_data(self, url: str, max_pages: int = 0) -> List[ConnectionData]:
         if not self._ensure_authenticated():
-            logger.error("Not authenticated, cannot fetch data")
+            self.logger.error("Not authenticated, cannot fetch data")
             return []
         all_connections = []
         current_url = url
@@ -257,9 +291,12 @@ class AdminPanel:
                 req_start = time.time()
                 response = self.session.get(current_url, timeout=self.TIMEOUT)
                 req_time = time.time() - req_start
-                if req_time > 1.0:
+                if req_time > self.SLOW_REQUEST_THRESHOLD:
                     self._request_metrics["slow_requests"] += 1
-                    perf_logger.info(f"Slow request ({req_time:.2f}s): {current_url}")
+                    log_url = current_url
+                    if len(log_url) > 60:
+                        log_url = log_url[:57] + "..."
+                    self.perf_logger.debug(f"Slow request ({req_time:.2f}s): {log_url}")
                 response.raise_for_status()
                 soup = BeautifulSoup(response.text, "html.parser")
                 connections = self._parse_connections_table(soup)
@@ -273,14 +310,20 @@ class AdminPanel:
                     current_url = None
             except requests.exceptions.RequestException as e:
                 self._request_metrics["errors"] += 1
-                logger.error(f"Error on page {page_num}: {str(e)}")
+                self.logger.error(f"Error on page {page_num}: {str(e)}")
                 break
             except Exception as e:
                 self._request_metrics["errors"] += 1
-                logger.error(f"Error parsing page {page_num}: {str(e)}")
+                self.logger.error(f"Error parsing page {page_num}: {str(e)}")
                 break
         total_time = time.time() - start_time
-        logger.info(f"Fetched {len(all_connections)} connections from {pages_fetched + 1} page(s) in {total_time:.2f}s")
+        self.perf_stats.record("fetch_paginated_data", total_time)
+        self.logger.info(
+            f"Fetched {len(all_connections)} connections from {pages_fetched + 1} page(s) in {total_time:.2f}s"
+        )
+        if self.perf_stats.should_log_summary():
+            for line in self.perf_stats.get_summary():
+                self.perf_logger.info(line)
         return all_connections
 
     def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, Any]]:
@@ -328,13 +371,15 @@ class AdminPanel:
                                 ban_info["ban_id"] = m.group(1)
                         break
             elapsed = time.time() - start_time
-            if elapsed > 1.0:
-                perf_logger.info(f"Slow ban info fetch: {elapsed:.2f}s for {ban_hits_link}")
+            self.perf_stats.record("fetch_ban_info", elapsed)
+            if elapsed > self.SLOW_REQUEST_THRESHOLD:
+                short_link = ban_hits_link.split('/')[-1]
+                self.perf_logger.debug(f"Slow ban info fetch: {elapsed:.2f}s for {short_link}")
         except requests.exceptions.RequestException as e:
             self._request_metrics["errors"] += 1
-            logger.error(f"Error fetching ban info: {str(e)}")
+            self.logger.error(f"Error fetching ban info: {str(e)}")
         except Exception as e:
-            logger.error(f"Error parsing ban info: {str(e)}")
+            self.logger.error(f"Error parsing ban info: {str(e)}")
         return ban_info
 
     def get_connections_url(self, user_id: str = "", search: str = "", show_accepted: str = "true",
@@ -348,12 +393,18 @@ class AdminPanel:
 
     def fetch_connections_for_user(self, user_id: str) -> List[Dict[str, Any]]:
         url = self.get_connections_url(user_id=user_id)
+        start_time = time.time()
         connections = self.fetch_paginated_data(url)
+        elapsed = time.time() - start_time
+        self.perf_stats.record(f"fetch_connections", elapsed)
         return [conn.to_dict() for conn in connections]
 
     def check_account_on_site(self, url: str, single_user: bool = False) -> Union[
         List[Dict[str, Any]], Dict[str, Union[str, List[str], bool, int]]]:
+        start_time = time.time()
         connections = self.fetch_paginated_data(url)
+        elapsed = time.time() - start_time
+        self.perf_stats.record("check_account", elapsed)
         if single_user:
             return self.aggregate_single_user_info(connections)
         return [conn.to_dict() for conn in connections]
@@ -382,17 +433,18 @@ class AdminPanel:
                                 info_result["ban_reasons"].append(reason)
                     info_result["ban_counts"] = len(info_result["ban_reasons"])
             elapsed = time.time() - start_time
-            if elapsed > 1.0:
-                perf_logger.info(f"Slow player info fetch: {elapsed:.2f}s for user {user_id}")
+            self.perf_stats.record("fetch_player_info", elapsed)
+            if elapsed > self.SLOW_REQUEST_THRESHOLD:
+                self.perf_logger.debug(f"Slow player info fetch: {elapsed:.2f}s for user {user_id}")
         except requests.exceptions.HTTPError as e:
             if e.response.status_code == 404:
-                logger.debug(f"Player profile not found: {user_id}")
+                self.logger.debug(f"Player profile not found: {user_id}")
             else:
                 self._request_metrics["errors"] += 1
-                logger.error(f"HTTP error for {user_id}: {str(e)}")
+                self.logger.error(f"HTTP error for {user_id}: {str(e)}")
         except requests.exceptions.RequestException as e:
             self._request_metrics["errors"] += 1
-            logger.error(f"Request error for {user_id}: {str(e)}")
+            self.logger.error(f"Request error for {user_id}: {str(e)}")
         return info_result
 
     def aggregate_single_user_info(self, connections: List[Union[ConnectionData, Dict[str, Any]]]) -> Dict[
@@ -437,7 +489,7 @@ class AdminPanel:
                 hwid = connection.hwid
                 status = connection.status
                 user_id = connection.user_id
-                time = connection.time
+                time_val = connection.time
                 server = connection.server
                 is_denied_banned = connection.is_denied_banned
                 connection_id = connection_id or connection.connection_id
@@ -447,7 +499,7 @@ class AdminPanel:
                 hwid = connection.get("hwid", "")
                 status = connection.get("status", "")
                 user_id = connection.get("user_id", "")
-                time = connection.get("time", "")
+                time_val = connection.get("time", "")
                 server = connection.get("server", "")
                 is_denied_banned = "Denied: Banned" in status
                 connection_id = connection_id or connection.get("connection_id", "")
@@ -464,7 +516,7 @@ class AdminPanel:
                 denied_banned_found = True
                 result["denied_banned_connections"].append({
                     "user_name": nickname,
-                    "time": time,
+                    "time": time_val,
                     "ip_address": ip_address,
                     "hwid": hwid,
                     "server": server,
@@ -572,4 +624,7 @@ class AdminPanel:
         return status_a if priority.get(status_a, 2) > priority.get(status_b, 2) else status_b
 
     def get_request_metrics(self) -> Dict[str, int]:
+        if self.perf_stats.should_log_summary():
+            for line in self.perf_stats.get_summary():
+                self.perf_logger.info(line)
         return dict(self._request_metrics)
