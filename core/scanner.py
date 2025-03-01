@@ -1,9 +1,10 @@
 import asyncio
 import logging
+from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
-from collections import defaultdict
 
+from config_system import get_config
 from core.analyzer import PlayerAnalyzer
 from models.ban_hit import BanBypassCheck
 from models.complaint import ComplaintChannel
@@ -32,7 +33,10 @@ class Scanner:
         self.complaint_channels: Dict[int, ComplaintChannel] = {}
         self.searched_terms: Set[str] = set()
         self.term_results: Dict[str, Dict[str, Any]] = {}
-        self.max_concurrent_requests = 15
+
+        cfg = get_config()
+        self.max_concurrent_requests = cfg.api.max_concurrent_requests
+
         self.connection_cache = {}
         self._create_loggers()
 
@@ -376,7 +380,6 @@ class Scanner:
 
         async def process_ban_hit(hit, idx, total) -> Optional[BanBypassCheck]:
             try:
-                log_prefix = f"Ban hit {idx + 1}/{total}"
                 if hit.user_id == "N/A":
                     return None
                 hit_identifiers = set()

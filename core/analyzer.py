@@ -1,23 +1,26 @@
-import logging
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Tuple, Set
 from collections import defaultdict
+from datetime import datetime
+from typing import List, Dict, Any, Tuple, Set
 
+from config_system import get_config
 from models.ban_hit import BanHit
 from models.player import Player
-from models.verdict import Verdict, VerdictCategory, ConfidenceLevel
+from models.verdict import ConfidenceLevel
 
 
 class PlayerAnalyzer:
     def __init__(self) -> None:
+        cfg = get_config()
+
         self.hwid_match_confidence = ConfidenceLevel.HWID_MATCH.value
         self.ip_time_close_match_confidence = ConfidenceLevel.IP_TIME_CLOSE_MATCH.value
         self.ip_time_match_confidence = ConfidenceLevel.IP_TIME_MATCH.value
         self.ip_match_confidence = ConfidenceLevel.IP_MATCH.value
         self.no_match_confidence = ConfidenceLevel.NO_MATCH.value
-        self.close_time_threshold_minutes = 10
-        self.time_threshold_minutes = 30
-        self.suspicious_time_threshold_minutes = 60
+
+        self.close_time_threshold_minutes = cfg.time_thresholds.close_time_threshold_minutes
+        self.time_threshold_minutes = cfg.time_thresholds.time_threshold_minutes
+        self.suspicious_time_threshold_minutes = cfg.time_thresholds.suspicious_time_threshold_minutes
 
     def group_players_by_nicknames(self, players: List[Player]) -> List[Player]:
         if not players:

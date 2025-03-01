@@ -1,19 +1,19 @@
+import logging
 import re
 import time
-import logging
-from typing import Dict, Union, List, Any, Optional, Tuple, Set
-from urllib.parse import urljoin, quote_plus
-from functools import lru_cache
 from dataclasses import dataclass
+from functools import lru_cache
+from typing import Dict, Union, List, Any, Optional
+from urllib.parse import urljoin, quote_plus
 
 import requests
 from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-N_A = "N/A"
-TIMEOUT = 60
+from config_system import get_config
 
+N_A = "N/A"
 logger = logging.getLogger(__name__)
 perf_logger = logging.getLogger(__name__ + ".performance")
 
@@ -63,6 +63,20 @@ class AdminPanel:
     def __init__(self, username: str, password: str) -> None:
         self.username = username
         self.password = password
+
+        cfg = get_config()
+
+        self.BASE_ADMIN_URL = cfg.api.base_admin_url
+        self.ACCOUNT_URL = cfg.api.account_url
+        self.PLAYERS_URL = f"{self.BASE_ADMIN_URL}/Players"
+        self.CONNECTIONS_URL = f"{self.BASE_ADMIN_URL}/Connections"
+        self.BAN_HITS_URL_PATTERN = f"{self.BASE_ADMIN_URL}/Connections/Hits"
+        self.PLAYER_INFO_URL_PATTERN = f"{self.BASE_ADMIN_URL}/Players/Info/{{}}"
+        self.BANS_URL = f"{self.BASE_ADMIN_URL}/Bans"
+
+        self.LOGIN_RETRY_LIMIT = cfg.api.login_retry_limit
+        self.TIMEOUT = cfg.api.request_timeout
+
         self.session = self._create_session()
         self.login_attempts = 0
         self._is_authenticated = False
@@ -111,7 +125,7 @@ class AdminPanel:
 
     def _attempt_login(self) -> bool:
         try:
-            response = self.session.get(self.PLAYERS_URL, allow_redirects=True, timeout=TIMEOUT)
+            response = self.session.get(self.PLAYERS_URL, allow_redirects=True, timeout=self.TIMEOUT)
             response.raise_for_status()
             if response.url == self.PLAYERS_URL:
                 return True
@@ -135,7 +149,7 @@ class AdminPanel:
                 "Origin": self.ACCOUNT_URL,
             }
             response = self.session.post(sso_login_url, data=payload, headers=headers,
-                                         allow_redirects=True, timeout=TIMEOUT)
+                                         allow_redirects=True, timeout=self.TIMEOUT)
             response.raise_for_status()
             if f"{self.BASE_ADMIN_URL}/signin-oidc" in response.text:
                 soup = BeautifulSoup(response.text, "html.parser")
@@ -151,7 +165,7 @@ class AdminPanel:
                     data=form_data,
                     headers={"Referer": response.url},
                     allow_redirects=True,
-                    timeout=TIMEOUT
+                    timeout=self.TIMEOUT
                 )
                 response.raise_for_status()
                 if "Logout" in response.text or "Players" in response.text:
@@ -241,7 +255,7 @@ class AdminPanel:
             try:
                 self._request_metrics["total"] += 1
                 req_start = time.time()
-                response = self.session.get(current_url, timeout=TIMEOUT)
+                response = self.session.get(current_url, timeout=self.TIMEOUT)
                 req_time = time.time() - req_start
                 if req_time > 1.0:
                     self._request_metrics["slow_requests"] += 1
@@ -283,7 +297,7 @@ class AdminPanel:
                 ban_hit_id = ban_hits_link.split("connection=")[-1].split("&")[0]
                 ban_info["ban_hit_id"] = ban_hit_id
             start_time = time.time()
-            response = self.session.get(ban_hits_link, timeout=TIMEOUT)
+            response = self.session.get(ban_hits_link, timeout=self.TIMEOUT)
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             dl = soup.select_one("dl")
@@ -352,7 +366,7 @@ class AdminPanel:
         info_url = self.PLAYER_INFO_URL_PATTERN.format(user_id)
         try:
             start_time = time.time()
-            resp = self.session.get(info_url, timeout=TIMEOUT)
+            resp = self.session.get(info_url, timeout=self.TIMEOUT)
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
             ban_section = soup.select_one("h2:contains('Bans')")
