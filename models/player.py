@@ -1,21 +1,11 @@
 from dataclasses import dataclass, field
-from datetime import datetime
-from typing import List, Dict
-
-
-@dataclass
-class PlayerConnection:
-    time: datetime
-    ip_address: str
-    hwid: str
-    user_name: str
-    user_id: str
+from typing import List, Dict, Any, Optional
 
 
 @dataclass
 class Player:
     user_id: str
-    nicknames: List[str] = field(default_factory=list)
+    nicknames: List[str]
     status: str = "unknown"
     ban_counts: int = 0
     ban_reasons: List[str] = field(default_factory=list)
@@ -24,14 +14,27 @@ class Player:
     associated_ips: Dict[str, List[str]] = field(default_factory=dict)
     associated_hwids: Dict[str, List[str]] = field(default_factory=dict)
     shared_hwid_nicknames: List[str] = field(default_factory=list)
+    denied_logins: List[Dict[str, str]] = field(default_factory=list)
     hwid_erased: bool = False
-    complaint_count: int = 0
-    complaint_links: str = "N/A"
+    complaint_links: List[Dict[str, Any]] = field(default_factory=list)
+    login_priorities: Dict[str, int] = field(default_factory=dict)
+    login_timestamps: Dict[str, str] = field(default_factory=dict)
+    raw_message: Optional[str] = None
 
     @property
     def primary_nickname(self) -> str:
-        return self.nicknames[0] if self.nicknames else "Unknown"
+        if not self.nicknames:
+            return "Unknown"
 
-    @property
-    def has_complaints(self) -> bool:
-        return self.complaint_count > 0
+        login_nicks = [nick for nick, priority in self.login_priorities.items()
+                       if priority == 1 and nick in self.nicknames]
+        if login_nicks:
+            if len(login_nicks) > 1 and self.login_timestamps:
+                login_nicks.sort(key=lambda n: self.login_timestamps.get(n, ""), reverse=True)
+            return login_nicks[0]
+
+        if self.login_timestamps and set(self.nicknames) & set(self.login_timestamps.keys()):
+            valid_nicks = [n for n in self.nicknames if n in self.login_timestamps]
+            return sorted(valid_nicks, key=lambda n: self.login_timestamps.get(n, ""), reverse=True)[0]
+
+        return self.nicknames[0]

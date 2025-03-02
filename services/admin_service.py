@@ -3,7 +3,7 @@ import logging
 import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from urllib.parse import quote_plus, unquote_plus
+from urllib.parse import quote_plus
 
 from models.ban_hit import BanHit
 from models.player import Player
@@ -72,8 +72,20 @@ class AdminService:
 
     async def fetch_with_rate_limit(self, func, *args, **kwargs):
         func_name = func.__name__
+
         args_str = ','.join(str(a) for a in args if len(str(a)) < 100)
-        cache_key = f"{func_name}:{args_str}"
+
+        if func_name == "check_account_on_site" and args and isinstance(args[0], str) and "search=" in args[0]:
+            from urllib.parse import urlparse, parse_qs
+            parsed_url = urlparse(args[0])
+            query_params = parse_qs(parsed_url.query)
+            search_term = query_params.get('search', [''])[0]
+
+            single_user = args[1] if len(args) > 1 else kwargs.get('single_user', False)
+            cache_key = f"{func_name}:search={search_term}:single_user={single_user}"
+        else:
+            cache_key = f"{func_name}:{args_str}"
+
         self._request_stats["total"] += 1
 
         async def fetch_factory():
@@ -99,7 +111,7 @@ class AdminService:
         return result
 
     async def search_player(self, term: str, single_user: bool = True) -> Optional[Dict[str, Any]]:
-        clean_term = quote_plus(unquote_plus(term))
+        clean_term = quote_plus(term)
         search_url = f"{self.base_admin_connections_url}&search={clean_term}"
         try:
             start_time = time.time()
@@ -151,6 +163,7 @@ class AdminService:
         if not raw_ban_hits:
             self.logger.info("No raw ban hits found")
             return []
+
         async def process_ban_hit(hit):
             try:
                 return BanHit(
@@ -166,6 +179,7 @@ class AdminService:
             except (ValueError, KeyError) as e:
                 self.logger.error(f"Error creating BanHit: {str(e)}")
                 return None
+
         ban_hits_results = await gather_with_concurrency(
             100,
             *[process_ban_hit(hit) for hit in raw_ban_hits]
@@ -182,6 +196,7 @@ class AdminService:
         if ban_hit.ban_hit_link == "N/A":
             return {}
         cache_key = f"ban_info:{ban_hit.ban_hit_link}"
+
         async def fetch_factory():
             async with self.semaphore:
                 await self.rate_limiter.acquire()
@@ -196,6 +211,7 @@ class AdminService:
                     short_link = ban_hit.ban_hit_link.split('/')[-1]
                     self.perf_logger.debug(f"Slow ban info fetch: {elapsed:.2f}s for {short_link}")
                 return result
+
         return await self.cache.get(cache_key, fetch_factory)
 
     async def batch_fetch_connections(self, identifiers: List[str]) -> Dict[str, List[Dict[str, Any]]]:
@@ -205,12 +221,14 @@ class AdminService:
             return results
         start_time = time.time()
         self.perf_logger.debug(f"Batch fetching connections for {len(valid_identifiers)} identifiers")
+
         async def fetch_for_identifier(identifier):
             connections = await self.fetch_with_rate_limit(
                 self.admin_panel.fetch_connections_for_user,
                 identifier
             )
             return identifier, connections
+
         fetch_results = await gather_with_concurrency(
             100,
             *[fetch_for_identifier(identifier) for identifier in valid_identifiers]
