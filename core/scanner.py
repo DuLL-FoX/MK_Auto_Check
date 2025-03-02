@@ -243,6 +243,7 @@ class Scanner:
                     if term in shared_cache:
                         return None
                     shared_cache.add(term)
+
             if term in self.player_cache:
                 player = self.player_cache[term]
                 if is_login_event and player:
@@ -257,43 +258,17 @@ class Scanner:
                         current_time = datetime.now().isoformat()
                         player.login_timestamps[primary_nick] = current_time
                 return player
+
+            self.logger.info(f"Performing comprehensive search for term: '{term}'")
             account_info = await self.admin_service.search_player(term)
+
             if not account_info:
+                self.logger.info(f"No account information found for term: '{term}'")
                 return None
-            associated_accounts = []
-            unique_search_terms = set()
-            for ip in account_info.get("associated_ips", {}):
-                if ip != "N/A":
-                    unique_search_terms.add(ip)
-            for hwid in account_info.get("associated_hwids", {}):
-                if hwid != "N/A":
-                    unique_search_terms.add(hwid)
-            if unique_search_terms:
-                limited_terms = list(unique_search_terms)[:10]
-                terms_to_process = []
-                if use_cache and shared_cache is not None and cache_lock is not None:
-                    async with cache_lock:
-                        for search_term in limited_terms:
-                            if search_term not in shared_cache:
-                                shared_cache.add(search_term)
-                                terms_to_process.append(search_term)
-                else:
-                    terms_to_process = limited_terms
-                if terms_to_process:
-                    search_tasks = [
-                        self.admin_service.search_player(search_term)
-                        for search_term in terms_to_process
-                    ]
-                    results = await gather_with_concurrency(
-                        self.max_concurrent_requests,
-                        *search_tasks
-                    )
-                    associated_accounts = [result for result in results if result]
-            all_accounts = [account_info] + associated_accounts
-            aggregated = self.admin_panel.aggregate_player_info(all_accounts)
-            if not aggregated:
-                return None
-            player = self.admin_service.convert_to_player(aggregated[0])
+
+            self.logger.info(f"Converting account info to player object")
+            player = self.admin_service.convert_to_player(account_info)
+
             if is_login_event:
                 player.raw_message = "Arrived new player"
                 if player.nicknames:
@@ -305,10 +280,17 @@ class Scanner:
                         player.login_timestamps = {}
                     current_time = datetime.now().isoformat()
                     player.login_timestamps[primary_nick] = current_time
+
+            batch_fetch_start = datetime.now()
             await self._batch_fetch_connections(player)
+            batch_fetch_duration = (datetime.now() - batch_fetch_start).total_seconds()
+            self.perf_logger.debug(f"Batch fetch connections took {batch_fetch_duration:.2f}s for term: '{term}'")
+
             processing_duration = (datetime.now() - term_start).total_seconds()
             self.perf_stats.record("process_term", processing_duration)
             self.player_cache[term] = player
+
+            self.logger.info(f"Processed term '{term}' successfully in {processing_duration:.2f}s")
             return player
         except Exception as e:
             self.logger.error(f"Error in process_term for '{term}': {str(e)}", exc_info=True)

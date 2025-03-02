@@ -3,7 +3,7 @@ import logging
 import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from urllib.parse import quote_plus
+from urllib.parse import urlparse, parse_qs, quote_plus
 
 from models.ban_hit import BanHit
 from models.player import Player
@@ -45,6 +45,23 @@ class PerformanceTracker:
         return lines
 
 
+def monitor_performance(func):
+    async def wrapper(self, *args, **kwargs):
+        start_time = time.time()
+        try:
+            return await func(self, *args, **kwargs)
+        finally:
+            elapsed = time.time() - start_time
+            self.perf_tracker.record(func.__name__, elapsed)
+            if elapsed > self.slow_operation_threshold:
+                args_repr = str(args[0]) if args else ""
+                if len(args_repr) > 40:
+                    args_repr = args_repr[:37] + "..."
+                self.perf_logger.debug(f"Slow operation: {func.__name__} took {elapsed:.2f}s with args: {args_repr}")
+
+    return wrapper
+
+
 class AdminService:
     def __init__(self, admin_panel, max_concurrent_requests: int = 100) -> None:
         self.admin_panel = admin_panel
@@ -61,7 +78,9 @@ class AdminService:
         self.perf_logger = get_logger(f"{__name__}.performance")
         self.slow_operation_threshold = 10.0
         self.perf_tracker = PerformanceTracker(self.perf_logger)
+        self.logger.info("AdminService initialized")
 
+    @monitor_performance
     async def login(self) -> bool:
         start_time = time.time()
         result = await asyncio.to_thread(self.admin_panel.login)
@@ -70,22 +89,18 @@ class AdminService:
         self.logger.info(f"Login completed in {elapsed:.2f}s with result: {result}")
         return result
 
+    @monitor_performance
     async def fetch_with_rate_limit(self, func, *args, **kwargs):
         func_name = func.__name__
-
-        args_str = ','.join(str(a) for a in args if len(str(a)) < 100)
-
         if func_name == "check_account_on_site" and args and isinstance(args[0], str) and "search=" in args[0]:
-            from urllib.parse import urlparse, parse_qs
             parsed_url = urlparse(args[0])
             query_params = parse_qs(parsed_url.query)
             search_term = query_params.get('search', [''])[0]
-
             single_user = args[1] if len(args) > 1 else kwargs.get('single_user', False)
             cache_key = f"{func_name}:search={search_term}:single_user={single_user}"
         else:
+            args_str = ','.join(str(a) for a in args if len(str(a)) < 100)
             cache_key = f"{func_name}:{args_str}"
-
         self._request_stats["total"] += 1
 
         async def fetch_factory():
@@ -97,7 +112,7 @@ class AdminService:
             elapsed = time.time() - start_time
             self.perf_tracker.record(func_name, elapsed)
             if elapsed > self.slow_operation_threshold:
-                log_args = args_str
+                log_args = str(args[0]) if args else ""
                 if len(log_args) > 40:
                     log_args = log_args[:37] + "..."
                 self.perf_logger.debug(f"Slow operation: {func_name} took {elapsed:.2f}s with args: {log_args}")
@@ -105,28 +120,144 @@ class AdminService:
 
         result = await self.cache.get(cache_key, fetch_factory)
         self._request_stats["cache_hits"] += 1
+        if func_name == "check_account_on_site" and isinstance(result, dict):
+            required_keys = ['status', 'nicknames', 'associated_ips', 'associated_hwids', 'user_id']
+            missing_keys = [k for k in required_keys if k not in result]
+            if missing_keys:
+                self.logger.warning(f"Missing keys in check_account_on_site result: {missing_keys}")
         if self.perf_tracker.should_log_summary():
             for line in self.perf_tracker.get_summary():
                 self.perf_logger.info(line)
         return result
 
-    async def search_player(self, term: str, single_user: bool = True) -> Optional[Dict[str, Any]]:
+    @monitor_performance
+    async def search_player(self, term: str, single_user: bool = True, depth: int = 0) -> Optional[Dict[str, Any]]:
+        if depth > 2:
+            return None
         clean_term = quote_plus(term)
         search_url = f"{self.base_admin_connections_url}&search={clean_term}"
         try:
-            start_time = time.time()
-            result = await self.fetch_with_rate_limit(
+            self.logger.info(f"Searching for player with term: '{term}' (depth: {depth})")
+            initial_result = await self.fetch_with_rate_limit(
                 self.admin_panel.check_account_on_site,
                 search_url,
                 single_user
             )
-            elapsed = time.time() - start_time
-            self.perf_tracker.record("search_player", elapsed)
-            return result
+            if not initial_result:
+                self.logger.info(f"No results found for term: '{term}'")
+                return None
+            if depth > 0:
+                return initial_result
+            identifiers = set()
+            user_id = initial_result.get("user_id")
+            if user_id and user_id != "N/A" and user_id != term:
+                identifiers.add(user_id)
+            for ip in initial_result.get("associated_ips", {}):
+                if ip != "N/A" and ip != term:
+                    identifiers.add(ip)
+            for hwid in initial_result.get("associated_hwids", {}):
+                if hwid != "N/A" and hwid != term:
+                    identifiers.add(hwid)
+            nicknames = initial_result.get("nicknames", [])
+            for nickname in nicknames:
+                if nickname and nickname != term:
+                    identifiers.add(nickname)
+            if identifiers:
+                self.logger.info(f"Found {len(identifiers)} additional identifiers to search")
+                prioritized_identifiers = []
+                if user_id and user_id != "N/A" and user_id != term and user_id in identifiers:
+                    prioritized_identifiers.append(user_id)
+                    identifiers.remove(user_id)
+                hwid_identifiers = []
+                for hwid in initial_result.get("associated_hwids", {}):
+                    if hwid != "N/A" and hwid != term and hwid in identifiers:
+                        hwid_identifiers.append(hwid)
+                        identifiers.remove(hwid)
+                prioritized_identifiers.extend(hwid_identifiers)
+                ip_identifiers = []
+                for ip in initial_result.get("associated_ips", {}):
+                    if ip != "N/A" and ip != term and ip in identifiers:
+                        ip_identifiers.append(ip)
+                        identifiers.remove(ip)
+                prioritized_identifiers.extend(ip_identifiers)
+                nickname_identifiers = [nick for nick in identifiers if nick in nicknames]
+                prioritized_identifiers.extend(nickname_identifiers)
+                limited_identifiers = prioritized_identifiers
+                self.logger.info(f"Searching {len(limited_identifiers)} prioritized identifiers")
+                search_tasks = [
+                    self.search_player(identifier, single_user, depth + 1)
+                    for identifier in limited_identifiers
+                ]
+                identifier_results = await gather_with_concurrency(10, *search_tasks)
+                valid_results = [result for result in identifier_results if result]
+                self.logger.info(f"Found {len(valid_results)} valid results from identifier searches")
+                for result in valid_results:
+                    self._merge_search_results(initial_result, result)
+            return initial_result
         except Exception as e:
             self.logger.error(f"Error searching for '{term}': {str(e)}")
             return None
 
+    def _merge_search_results(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        if not target or not source:
+            return
+        for key in ['associated_ips', 'associated_hwids', 'nicknames', 'shared_hwid_nicknames', 'ban_reasons']:
+            if key not in target:
+                target[key] = source.get(key, {} if key in ['associated_ips', 'associated_hwids'] else [])
+        for ip, nicks in source.get('associated_ips', {}).items():
+            if ip not in target['associated_ips']:
+                target['associated_ips'][ip] = nicks
+            else:
+                existing_nicks = set(target['associated_ips'][ip])
+                existing_nicks.update(nicks)
+                target['associated_ips'][ip] = list(existing_nicks)
+        for hwid, nicks in source.get('associated_hwids', {}).items():
+            if hwid not in target['associated_hwids']:
+                target['associated_hwids'][hwid] = nicks
+            else:
+                existing_nicks = set(target['associated_hwids'][hwid])
+                existing_nicks.update(nicks)
+                target['associated_hwids'][hwid] = list(existing_nicks)
+        target_nicks = set(target.get('nicknames', []))
+        target_nicks.update(source.get('nicknames', []))
+        target['nicknames'] = list(target_nicks)
+        if 'shared_hwid_nicknames' in source:
+            target_shared = set(target.get('shared_hwid_nicknames', []))
+            target_shared.update(source.get('shared_hwid_nicknames', []))
+            target['shared_hwid_nicknames'] = list(target_shared)
+        if 'ban_reasons' in source:
+            target_reasons = set(target.get('ban_reasons', []))
+            target_reasons.update(source.get('ban_reasons', []))
+            target['ban_reasons'] = list(target_reasons)
+        target['ban_counts'] = max(
+            target.get('ban_counts', 0),
+            source.get('ban_counts', 0)
+        )
+        status_priority = {
+            'banned': 3,
+            'suspicious': 2,
+            'clean': 1,
+            'unknown': 0
+        }
+        target_status = target.get('status', 'unknown').lower()
+        source_status = source.get('status', 'unknown').lower()
+        if status_priority.get(source_status, 0) > status_priority.get(target_status, 0):
+            target['status'] = source.get('status')
+        if 'denied_banned_connections' in source:
+            target_denied = target.get('denied_banned_connections', [])
+            source_denied = source.get('denied_banned_connections', [])
+            denied_set = {
+                (conn.get('user_name', ''), conn.get('time', ''), conn.get('ip_address', ''))
+                for conn in target_denied
+            }
+            for conn in source_denied:
+                conn_key = (conn.get('user_name', ''), conn.get('time', ''), conn.get('ip_address', ''))
+                if conn_key not in denied_set:
+                    target_denied.append(conn)
+                    denied_set.add(conn_key)
+            target['denied_banned_connections'] = target_denied
+
+    @monitor_performance
     async def fetch_associated_players(self, player_info: Dict[str, Any]) -> List[Dict[str, Any]]:
         search_terms = set()
         processed_terms = set()
@@ -153,6 +284,7 @@ class AdminService:
             self.logger.debug(f"Found {len(valid_results)} associated players from {len(limited_terms)} search terms")
         return valid_results
 
+    @monitor_performance
     async def fetch_ban_hits(self, max_pages: int = 5) -> List[BanHit]:
         start_time = time.time()
         self.logger.info(f"Fetching ban hits (max pages: {max_pages})")
@@ -192,6 +324,7 @@ class AdminService:
         )
         return valid_hits
 
+    @monitor_performance
     async def fetch_ban_info(self, ban_hit: BanHit) -> Dict[str, Any]:
         if ban_hit.ban_hit_link == "N/A":
             return {}
@@ -214,6 +347,7 @@ class AdminService:
 
         return await self.cache.get(cache_key, fetch_factory)
 
+    @monitor_performance
     async def batch_fetch_connections(self, identifiers: List[str]) -> Dict[str, List[Dict[str, Any]]]:
         results = {}
         valid_identifiers = [id for id in identifiers if id != "N/A"]
@@ -246,7 +380,12 @@ class AdminService:
 
     def convert_to_player(self, account_info: Dict[str, Any]) -> Player:
         if not account_info:
+            self.logger.warning("Empty account_info provided to convert_to_player")
             return Player(user_id="N/A", nicknames=[], status="unknown")
+        required_fields = ['user_id', 'nicknames', 'status']
+        missing_fields = [field for field in required_fields if field not in account_info]
+        if missing_fields:
+            self.logger.warning(f"Missing required fields in account_info: {missing_fields}")
         player = Player(
             user_id=account_info.get("user_id", "N/A"),
             nicknames=account_info.get("nicknames", []),
@@ -264,6 +403,7 @@ class AdminService:
             player.denied_logins = account_info["denied_banned_connections"]
         return player
 
+    @monitor_performance
     async def get_cache_stats(self) -> Dict[str, Any]:
         cache_stats = self.cache.get_stats()
         total_requests = self._request_stats["total"]

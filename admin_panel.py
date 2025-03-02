@@ -2,6 +2,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from functools import lru_cache
 from typing import Dict, Union, List, Any, Optional
 from urllib.parse import urljoin, quote_plus
@@ -45,7 +46,6 @@ class ConnectionData:
             "ban_hits_link": self.ban_hits_link,
             "connection_id": self.connection_id
         }
-
 
 class PerformanceStats:
     def __init__(self, logger):
@@ -91,6 +91,7 @@ class PerformanceStats:
 
 class AdminPanel:
     def __init__(self, username: str, password: str) -> None:
+        self.logger = logging.getLogger(__name__)
         self.username = username
         self.password = password
         cfg = get_config()
@@ -110,10 +111,11 @@ class AdminPanel:
         self._request_metrics = {"total": 0, "slow_requests": 0, "errors": 0}
         self._setup_loggers()
         self.perf_stats = PerformanceStats(self.perf_logger)
+        self.logger.info(
+            f"AdminPanel initialized with URLs: BASE={self.BASE_ADMIN_URL}, CONNECTIONS={self.CONNECTIONS_URL}")
 
     def _setup_loggers(self):
         from utils.logging_utils import get_logger
-        self.logger = logging.getLogger(__name__)
         self.perf_logger = get_logger(f"{__name__}.performance")
 
     def _create_session(self) -> requests.Session:
@@ -158,8 +160,10 @@ class AdminPanel:
             response = self.session.get(self.PLAYERS_URL, allow_redirects=True, timeout=self.TIMEOUT)
             response.raise_for_status()
             if response.url == self.PLAYERS_URL:
+                self.logger.debug("Already logged in (direct access to PLAYERS_URL)")
                 return True
             if self.ACCOUNT_URL not in response.url:
+                self.logger.warning(f"Unexpected redirect URL: {response.url}")
                 return False
             soup = BeautifulSoup(response.text, "html.parser")
             token_input = soup.select_one("input[name='__RequestVerificationToken']")
@@ -207,11 +211,13 @@ class AdminPanel:
                     self.logger.info("Successfully authenticated")
                     return True
                 else:
+                    self.logger.warning("Authentication failed - no logout or players links in response")
                     return False
             else:
+                self.logger.warning("No signin-oidc found in response")
                 return False
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Network error: {str(e)}")
+            self.logger.error(f"Network error during login: {str(e)}")
             return False
 
     def _ensure_authenticated(self) -> bool:
@@ -223,6 +229,7 @@ class AdminPanel:
         try:
             cols = row.select("td")
             if len(cols) < 8:
+                self.logger.warning(f"Too few columns in connection row: {len(cols)}")
                 return None
             ban_hits_link = None
             connection_id = None
@@ -232,17 +239,23 @@ class AdminPanel:
                     connection_id = ban_hits_link.split("connection=")[-1].split("&")[0]
             user_name_el = cols[0].select_one("strong")
             user_name = user_name_el.text.strip() if user_name_el else cols[0].text.strip()
+            user_id = cols[1].text.strip()
+            time_val = cols[2].text.strip()
+            ip_address = cols[3].text.strip()
+            hwid = cols[4].text.strip()
             status_el = cols[5].select_one("strong")
             status = status_el.text.strip() if status_el else cols[5].text.strip()
+            server = cols[6].text.strip()
+            trust_score = cols[7].text.strip()
             return ConnectionData(
                 user_name=user_name,
-                user_id=cols[1].text.strip(),
-                time=cols[2].text.strip(),
-                ip_address=cols[3].text.strip(),
-                hwid=cols[4].text.strip(),
+                user_id=user_id,
+                time=time_val,
+                ip_address=ip_address,
+                hwid=hwid,
                 status=status,
-                server=cols[6].text.strip(),
-                trust_score=cols[7].text.strip(),
+                server=server,
+                trust_score=trust_score,
                 ban_hits_link=ban_hits_link,
                 connection_id=connection_id,
                 is_denied_banned=("Denied: Banned" in status)
@@ -255,26 +268,35 @@ class AdminPanel:
         connections = []
         table = soup.select_one("table.table")
         if not table:
+            self.logger.warning("No table.table found in the HTML")
             return connections
         tbody = table.select_one("tbody")
         if not tbody:
+            self.logger.warning("No tbody found in the table")
             return connections
-        for row in tbody.select("tr"):
+        rows = tbody.select("tr")
+        self.logger.debug(f"Found {len(rows)} rows in the connections table")
+        for i, row in enumerate(rows):
             connection = self._parse_connection_row(row)
             if connection:
                 connections.append(connection)
+            else:
+                self.logger.warning(f"Failed to parse row {i}")
         return connections
 
     def _get_next_page_link(self, soup: BeautifulSoup) -> Optional[str]:
         next_page_link = soup.select_one("a.btn[href*='page=']")
         if next_page_link and "Next" in next_page_link.text and "disabled" not in next_page_link.get("class", []):
-            return urljoin(self.BASE_ADMIN_URL, next_page_link["href"])
+            link = urljoin(self.BASE_ADMIN_URL, next_page_link["href"])
+            return link
         next_page_link = soup.select_one("a.page-link[rel='next']")
         if next_page_link:
-            return urljoin(self.BASE_ADMIN_URL, next_page_link["href"])
+            link = urljoin(self.BASE_ADMIN_URL, next_page_link["href"])
+            return link
         return None
 
     def fetch_paginated_data(self, url: str, max_pages: int = 0) -> List[ConnectionData]:
+        self.logger.info(f"Fetching paginated data from URL: {url}")
         if not self._ensure_authenticated():
             self.logger.error("Not authenticated, cannot fetch data")
             return []
@@ -285,10 +307,12 @@ class AdminPanel:
         start_time = time.time()
         while current_url:
             if max_pages > 0 and pages_fetched >= max_pages:
+                self.logger.info(f"Reached max pages limit ({max_pages})")
                 break
             try:
                 self._request_metrics["total"] += 1
                 req_start = time.time()
+                self.logger.debug(f"Fetching page {page_num} from URL: {current_url}")
                 response = self.session.get(current_url, timeout=self.TIMEOUT)
                 req_time = time.time() - req_start
                 if req_time > self.SLOW_REQUEST_THRESHOLD:
@@ -298,8 +322,16 @@ class AdminPanel:
                         log_url = log_url[:57] + "..."
                     self.perf_logger.debug(f"Slow request ({req_time:.2f}s): {log_url}")
                 response.raise_for_status()
+                self.logger.debug(
+                    f"Page {page_num} response status: {response.status_code}, length: {len(response.text)}")
+                if response.status_code != 200:
+                    html_filename = f"error_page_{page_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+                    with open(html_filename, 'w', encoding='utf-8') as f:
+                        f.write(response.text)
+                    self.logger.warning(f"Saved error HTML to {html_filename}")
                 soup = BeautifulSoup(response.text, "html.parser")
                 connections = self._parse_connections_table(soup)
+                self.logger.debug(f"Found {len(connections)} connections on page {page_num}")
                 all_connections.extend(connections)
                 next_page_url = self._get_next_page_link(soup)
                 if next_page_url:
@@ -307,10 +339,11 @@ class AdminPanel:
                     page_num += 1
                     pages_fetched += 1
                 else:
+                    self.logger.debug(f"No more pages after page {page_num}")
                     current_url = None
             except requests.exceptions.RequestException as e:
                 self._request_metrics["errors"] += 1
-                self.logger.error(f"Error on page {page_num}: {str(e)}")
+                self.logger.error(f"HTTP error on page {page_num}: {str(e)}")
                 break
             except Exception as e:
                 self._request_metrics["errors"] += 1
@@ -319,8 +352,7 @@ class AdminPanel:
         total_time = time.time() - start_time
         self.perf_stats.record("fetch_paginated_data", total_time)
         self.logger.info(
-            f"Fetched {len(all_connections)} connections from {pages_fetched + 1} page(s) in {total_time:.2f}s"
-        )
+            f"Fetched {len(all_connections)} connections from {pages_fetched + 1} page(s) in {total_time:.2f}s")
         if self.perf_stats.should_log_summary():
             for line in self.perf_stats.get_summary():
                 self.perf_logger.info(line)
@@ -328,6 +360,7 @@ class AdminPanel:
 
     def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, Any]]:
         url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true"
+        self.logger.info(f"Fetching ban hit connections from URL: {url}")
         connections = self.fetch_paginated_data(url, max_pages)
         return [conn.to_dict() for conn in connections]
 
@@ -375,7 +408,7 @@ class AdminPanel:
             if elapsed > self.SLOW_REQUEST_THRESHOLD:
                 short_link = ban_hits_link.split('/')[-1]
                 self.perf_logger.debug(f"Slow ban info fetch: {elapsed:.2f}s for {short_link}")
-        except requests.exceptions.RequestException as e:
+        except requests.exceptions.HTTPError as e:
             self._request_metrics["errors"] += 1
             self.logger.error(f"Error fetching ban info: {str(e)}")
         except Exception as e:
@@ -393,21 +426,35 @@ class AdminPanel:
 
     def fetch_connections_for_user(self, user_id: str) -> List[Dict[str, Any]]:
         url = self.get_connections_url(user_id=user_id)
+        self.logger.info(f"Fetching connections for user_id: {user_id}")
         start_time = time.time()
         connections = self.fetch_paginated_data(url)
         elapsed = time.time() - start_time
         self.perf_stats.record(f"fetch_connections", elapsed)
-        return [conn.to_dict() for conn in connections]
+        connection_dicts = [conn.to_dict() for conn in connections]
+        self.logger.debug(f"Found {len(connection_dicts)} connections for user_id: {user_id}")
+        return connection_dicts
 
     def check_account_on_site(self, url: str, single_user: bool = False) -> Union[
         List[Dict[str, Any]], Dict[str, Union[str, List[str], bool, int]]]:
+        self.logger.info(f"Checking account on site: url={url}, single_user={single_user}")
         start_time = time.time()
         connections = self.fetch_paginated_data(url)
         elapsed = time.time() - start_time
         self.perf_stats.record("check_account", elapsed)
+        self.logger.info(f"Found {len(connections)} connections for URL: {url}")
         if single_user:
-            return self.aggregate_single_user_info(connections)
-        return [conn.to_dict() for conn in connections]
+            self.logger.debug("Aggregating single user info")
+            result = self.aggregate_single_user_info(connections)
+            self.logger.info(f"Aggregated result for single user, status: {result.get('status', 'unknown')}")
+            essential_keys = ['status', 'nicknames', 'associated_ips', 'associated_hwids', 'user_id']
+            missing_keys = [k for k in essential_keys if k not in result]
+            if missing_keys:
+                self.logger.warning(f"Missing essential keys in aggregated result: {missing_keys}")
+            return result
+        connection_dicts = [conn.to_dict() for conn in connections]
+        self.logger.debug(f"Returning {len(connection_dicts)} connection dicts")
+        return connection_dicts
 
     @lru_cache(maxsize=200)
     def fetch_player_info(self, user_id: str) -> Dict[str, Union[int, List[str]]]:
@@ -449,8 +496,10 @@ class AdminPanel:
 
     def aggregate_single_user_info(self, connections: List[Union[ConnectionData, Dict[str, Any]]]) -> Dict[
         str, Union[str, List[str], bool, int]]:
+        self.logger.info(f"Aggregating user info from {len(connections)} connections")
         if not connections:
-            return {
+            self.logger.warning("No connections provided to aggregate_single_user_info")
+            empty_result = {
                 "status": "unknown",
                 "nicknames": [],
                 "raw_html_snippet": [],
@@ -464,6 +513,7 @@ class AdminPanel:
                 "connection_link": "N/A",
                 "denied_banned_connections": []
             }
+            return empty_result
         result: Dict[str, Any] = {
             "status": "unknown",
             "nicknames": set(),
@@ -482,6 +532,9 @@ class AdminPanel:
         banned_found = False
         denied_banned_found = False
         connection_id = None
+        all_user_ids = set()
+        all_nicknames = set()
+        all_statuses = set()
         for connection in connections:
             if isinstance(connection, ConnectionData):
                 nickname = connection.user_name
@@ -503,41 +556,60 @@ class AdminPanel:
                 server = connection.get("server", "")
                 is_denied_banned = "Denied: Banned" in status
                 connection_id = connection_id or connection.get("connection_id", "")
-            if user_id and result["user_id"] == "N/A":
+            if user_id:
+                all_user_ids.add(user_id)
+            if nickname:
+                all_nicknames.add(nickname)
+            if status:
+                all_statuses.add(status)
+            if user_id and user_id != "N/A" and result["user_id"] == "N/A":
                 result["user_id"] = user_id
-            result["nicknames"].add(nickname)
+            if nickname:
+                result["nicknames"].add(nickname)
             if ip_address and ip_address != N_A:
-                all_ips.setdefault(ip_address, set()).add(nickname)
+                if ip_address not in all_ips:
+                    all_ips[ip_address] = set()
+                if nickname:
+                    all_ips[ip_address].add(nickname)
             if hwid and hwid != N_A:
-                all_hwids.setdefault(hwid, set()).add(nickname)
-            if "Accepted" in status:
-                result["status"] = "clean"
-            if is_denied_banned:
-                denied_banned_found = True
-                result["denied_banned_connections"].append({
-                    "user_name": nickname,
-                    "time": time_val,
-                    "ip_address": ip_address,
-                    "hwid": hwid,
-                    "server": server,
-                    "status": status
-                })
-            if "Banned" in status:
-                banned_found = True
+                if hwid not in all_hwids:
+                    all_hwids[hwid] = set()
+                if nickname:
+                    all_hwids[hwid].add(nickname)
+            if status:
+                if "Accepted" in status:
+                    result["status"] = "clean"
+                if is_denied_banned:
+                    denied_banned_found = True
+                    result["denied_banned_connections"].append({
+                        "user_name": nickname,
+                        "time": time_val,
+                        "ip_address": ip_address,
+                        "hwid": hwid,
+                        "server": server,
+                        "status": status
+                    })
+                if "Banned" in status:
+                    banned_found = True
         if denied_banned_found:
             result["status"] = "banned"
             result["ban_counts"] = max(result["ban_counts"], 1)
+            self.logger.debug("Set status to 'banned' due to denied_banned connections")
         elif banned_found:
             result["status"] = "banned"
+            self.logger.debug("Set status to 'banned' due to banned connections")
         if connection_id:
             result["connection_link"] = f"{self.BASE_ADMIN_URL}/Connections/Info/{connection_id}"
         user_id = result["user_id"]
         if user_id and user_id != "N/A" and not denied_banned_found:
-            player_info = self.fetch_player_info(user_id)
-            result["ban_counts"] = player_info.get("ban_counts", 0)
-            result["ban_reasons"].update(player_info.get("ban_reasons", []))
-        result["associated_ips"] = {ip: list(nicks) for ip, nicks in all_ips.items()}
-        result["associated_hwids"] = {hwid: list(nicks) for hwid, nicks in all_hwids.items()}
+            try:
+                player_info = self.fetch_player_info(user_id)
+                result["ban_counts"] = player_info.get("ban_counts", 0)
+                result["ban_reasons"].update(player_info.get("ban_reasons", []))
+            except Exception as e:
+                self.logger.error(f"Error fetching player info for {user_id}: {str(e)}")
+        result["associated_ips"] = {ip: list(nicks) for ip, nicks in all_ips.items()} if all_ips else {}
+        result["associated_hwids"] = {hwid: list(nicks) for hwid, nicks in all_hwids.items()} if all_hwids else {}
         for hwid, nicks in all_hwids.items():
             if len(nicks) > 1 and hwid != N_A:
                 result["shared_hwid_nicknames"].update(nicks)
@@ -552,9 +624,21 @@ class AdminPanel:
                 result["raw_html_snippet"].append({"time": conn.time, "status": conn.status})
             else:
                 result["raw_html_snippet"].append({"time": conn.get("time", ""), "status": conn.get("status", "")})
-        result["nicknames"] = list(result["nicknames"])
-        result["ban_reasons"] = list(result["ban_reasons"])
-        result["shared_hwid_nicknames"] = list(result["shared_hwid_nicknames"])
+        result["nicknames"] = list(result["nicknames"]) if result["nicknames"] else []
+        result["ban_reasons"] = list(result["ban_reasons"]) if result["ban_reasons"] else []
+        result["shared_hwid_nicknames"] = list(result["shared_hwid_nicknames"]) if result[
+            "shared_hwid_nicknames"] else []
+        for key in ['associated_ips', 'associated_hwids']:
+            if key not in result or result[key] is None:
+                result[key] = {}
+        if 'nicknames' not in result or result['nicknames'] is None:
+            result['nicknames'] = []
+        if 'ban_reasons' not in result or result['ban_reasons'] is None:
+            result['ban_reasons'] = []
+        if 'shared_hwid_nicknames' not in result or result['shared_hwid_nicknames'] is None:
+            result['shared_hwid_nicknames'] = []
+        self.logger.info(
+            f"Aggregation complete: status={result['status']}, user_id={result['user_id']}, nicknames count={len(result['nicknames'])}")
         return result
 
     def aggregate_player_info(self, partial_results_list: List[Dict[str, Any]]) -> List[
