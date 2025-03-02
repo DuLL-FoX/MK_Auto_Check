@@ -91,7 +91,7 @@ class CacheService:
                 except Exception as e:
                     logging.warning(f"Failed to create backup file: {e}")
 
-            fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(self.cache_filename)))
+            fd, temp_path = tempfile.mkstemp()
             try:
                 with os.fdopen(fd, 'w', encoding='utf-8') as temp_file:
                     json.dump(cache_data, temp_file, ensure_ascii=False, indent=4)
@@ -101,15 +101,21 @@ class CacheService:
                         os.remove(self.cache_filename)
                     except Exception as e:
                         logging.error(f"Failed to remove existing cache file: {e}")
+                        os.unlink(temp_path)
                         return False
 
-                os.rename(temp_path, self.cache_filename)
+                with open(temp_path, 'r', encoding='utf-8') as src:
+                    with open(self.cache_filename, 'w', encoding='utf-8') as dst:
+                        dst.write(src.read())
+
+                os.unlink(temp_path)
+
                 logging.info(f"Complaint message cache saved to '{self.cache_filename}'.")
                 return True
             except Exception as e:
                 if os.path.exists(temp_path):
                     try:
-                        os.remove(temp_path)
+                        os.unlink(temp_path)
                     except:
                         pass
                 raise e
