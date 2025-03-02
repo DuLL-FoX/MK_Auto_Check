@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import tempfile
 from typing import Dict
+
 from models.complaint import ComplaintChannel, ComplaintMessage
 
 COMPLAINT_CACHE_FILENAME = "complaint_message_cache.json"
@@ -45,6 +47,18 @@ class CacheService:
             logging.info(f"Loaded cache for {len(complaint_channels)} channel(s).")
         except json.JSONDecodeError as e:
             logging.error(f"JSON decode error loading complaint cache: {e}. Cache file might be corrupted.")
+            backup_file = f"{self.cache_filename}.bak"
+            if os.path.exists(backup_file):
+                logging.info(f"Attempting to restore from backup file: {backup_file}")
+                try:
+                    with open(backup_file, "r", encoding="utf-8") as f:
+                        raw_data = json.load(f)
+                    with open(self.cache_filename, "w", encoding="utf-8") as f:
+                        json.dump(raw_data, f, ensure_ascii=False, indent=4)
+                    logging.info(f"Successfully restored cache from backup file.")
+                    return self.load_complaint_cache()
+                except Exception as e:
+                    logging.error(f"Failed to restore from backup: {e}")
         except Exception as e:
             logging.error(f"Error loading complaint cache: {e}", exc_info=True)
         return complaint_channels
@@ -66,11 +80,39 @@ class CacheService:
                 ],
                 "last_cached_id": channel.last_cached_id
             }
+
         try:
-            with open(self.cache_filename, "w", encoding="utf-8") as f:
-                json.dump(cache_data, f, ensure_ascii=False, indent=4)
-            logging.info(f"Complaint message cache saved to '{self.cache_filename}'.")
-            return True
-        except IOError as e:
-            logging.error(f"Error saving complaint cache: {e}")
+            if os.path.exists(self.cache_filename):
+                backup_file = f"{self.cache_filename}.bak"
+                try:
+                    with open(self.cache_filename, 'r', encoding='utf-8') as src:
+                        with open(backup_file, 'w', encoding='utf-8') as dst:
+                            dst.write(src.read())
+                except Exception as e:
+                    logging.warning(f"Failed to create backup file: {e}")
+
+            fd, temp_path = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(self.cache_filename)))
+            try:
+                with os.fdopen(fd, 'w', encoding='utf-8') as temp_file:
+                    json.dump(cache_data, temp_file, ensure_ascii=False, indent=4)
+
+                if os.name == 'nt' and os.path.exists(self.cache_filename):
+                    try:
+                        os.remove(self.cache_filename)
+                    except Exception as e:
+                        logging.error(f"Failed to remove existing cache file: {e}")
+                        return False
+
+                os.rename(temp_path, self.cache_filename)
+                logging.info(f"Complaint message cache saved to '{self.cache_filename}'.")
+                return True
+            except Exception as e:
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+                raise e
+        except Exception as e:
+            logging.error(f"Error saving complaint cache: {e}", exc_info=True)
             return False

@@ -429,9 +429,12 @@ class Scanner:
         return denied_logins
 
     @monitor_performance
-    async def scan_nickname(self, nickname: str) -> List[Dict[str, Any]]:
+    async def scan_nickname(self, nickname: str, complaint_search_term: Optional[str] = None) -> List[Dict[str, Any]]:
         start_time = datetime.now()
         self.logger.info(f"Starting nickname search for: {nickname}")
+        if complaint_search_term:
+            self.logger.info(f"With complaint filter: '{complaint_search_term}'")
+
         try:
             self.complaint_channels = await self.discord_service.update_complaint_cache(
                 self.complaint_channels, history_limit=self.cfg.discord.message_history_limit
@@ -440,10 +443,17 @@ class Scanner:
             if not player:
                 self.logger.info(f"No player found for nickname: {nickname}")
                 return []
+
             complaint_links = await self.discord_service.find_nickname_mentions(
-                player.nicknames, self.complaint_channels
+                player.nicknames,
+                self.complaint_channels,
+                search_term=complaint_search_term
             )
             player.complaint_links = complaint_links
+
+            if complaint_search_term:
+                self.logger.info(f"Found {len(complaint_links)} complaints containing '{complaint_search_term}'")
+
             report_data = self.report_service.generate_nickname_search_report(nickname, player)
             duration = (datetime.now() - start_time).total_seconds()
             self.perf_logger.info(f"Nickname search for '{nickname}' completed in {duration:.2f}s")

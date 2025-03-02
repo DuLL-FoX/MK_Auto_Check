@@ -1,5 +1,4 @@
 import json
-import logging
 import sys
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -11,9 +10,108 @@ from utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+
 class ReportService:
     def __init__(self) -> None:
         self.report_filename = "scan_report.json"
+        self.fmt = self._setup_terminal_formatting()
+        self.box = self._setup_box_chars()
+
+    def _setup_terminal_formatting(self):
+        if sys.stdout.isatty():
+            return {
+                'HEADER': '\033[95m',
+                'BLUE': '\033[94m',
+                'CYAN': '\033[96m',
+                'GREEN': '\033[92m',
+                'YELLOW': '\033[93m',
+                'RED': '\033[91m',
+                'BOLD': '\033[1m',
+                'UNDERLINE': '\033[4m',
+                'END': '\033[0m'
+            }
+        else:
+            return {
+                'HEADER': '', 'BLUE': '', 'CYAN': '', 'GREEN': '',
+                'YELLOW': '', 'RED': '', 'BOLD': '', 'UNDERLINE': '', 'END': ''
+            }
+
+    def _setup_box_chars(self):
+        return {
+            'H': '─',
+            'V': '│',
+            'TL': '┌',
+            'TR': '┐',
+            'BL': '└',
+            'BR': '┘',
+            'VL': '┤',
+            'VR': '├',
+            'HU': '┴',
+            'HD': '┬',
+            'CROSS': '┼'
+        }
+
+    def _print_box(self, title, width=100, style='header'):
+        is_header = style == 'header'
+        color_prefix = self.fmt['HEADER'] if is_header else ''
+        color_prefix += self.fmt['BOLD']
+        print(f"\n{color_prefix}{self.box['TL']}{self.box['H'] * (width - 2)}{self.box['TR']}{self.fmt['END']}")
+        padding = (width - len(title) - 4) // 2
+        right_padding = width - padding - len(title) - 4
+        print(
+            f"{color_prefix}{self.box['V']}{' ' * padding} {title} {' ' * right_padding}{self.box['V']}{self.fmt['END']}")
+        print(f"{color_prefix}{self.box['BL']}{self.box['H'] * (width - 2)}{self.box['BR']}{self.fmt['END']}")
+
+    def _print_header(self, title, width=100):
+        self._print_box(title, width, 'header')
+
+    def _print_section(self, title, width=100):
+        self._print_box(title, width, 'section')
+
+    def _format_status(self, status, hwid_erased=False):
+        status = status.upper()
+        if status.lower() == "banned":
+            status_str = f"{self.fmt['RED']}{self.fmt['BOLD']}{status}{self.fmt['END']}"
+        elif status.lower() == "suspicious":
+            status_str = f"{self.fmt['YELLOW']}{self.fmt['BOLD']}{status}{self.fmt['END']}"
+        elif status.lower() == "clean":
+            status_str = f"{self.fmt['GREEN']}{status}{self.fmt['END']}"
+        else:
+            status_str = status
+        if hwid_erased:
+            status_str += f" {self.fmt['YELLOW']}(HWID ERASED){self.fmt['END']}"
+        return status_str
+
+    def _format_hwid(self, hwid):
+        fmt = self.fmt
+        if hwid.startswith("V2-"):
+            prefix = f"{fmt['BOLD']}{fmt['CYAN']}V2-{fmt['END']}"
+            base = hwid[3:]
+            return f"{prefix}{fmt['CYAN']}{base}{fmt['END']}"
+        return f"{fmt['CYAN']}{hwid}{fmt['END']}"
+
+    def _truncate_list(self, items, limit=5, joiner=", "):
+        if not items:
+            return ""
+        if len(items) <= limit:
+            return joiner.join(items)
+        return joiner.join(items[:limit]) + f", and {len(items) - limit} more"
+
+    def _truncate_text(self, text, max_length=70):
+        if text and len(text) > max_length:
+            return text[:max_length - 3] + "..."
+        return text
+
+    def _print_player_header(self, name, width=76):
+        box = self.box
+        fmt = self.fmt
+        player_header = f"PLAYER: {name}"
+        print(f"\n  {fmt['BOLD']}{fmt['CYAN']}{box['TL']}{box['H'] * (width - 2)}{box['TR']}{fmt['END']}")
+        padding = (width - len(player_header) - 4) // 2
+        right_padding = width - padding - len(player_header) - 4
+        print(
+            f"  {fmt['BOLD']}{fmt['CYAN']}{box['V']}{' ' * padding} {player_header} {' ' * right_padding}{box['V']}{fmt['END']}")
+        print(f"  {fmt['BOLD']}{fmt['CYAN']}{box['VR']}{box['H'] * (width - 2)}{box['VL']}{fmt['END']}")
 
     def write_json_report(self, data: List[Dict[str, Any]], filename: Optional[str] = None) -> bool:
         report_file = filename or self.report_filename
@@ -40,25 +138,23 @@ class ReportService:
                 "results": players_data
             }
             report_data.append(message_data)
-            logger.info(
-                f"Report item: Message {message.id} by {message.author_name}: " +
-                f"Found {len(players_data)} players with " +
-                f"{sum(1 for p in result.players if p.status == 'banned')} banned, " +
-                f"{sum(1 for p in result.players if p.status == 'suspicious')} suspicious"
-            )
-            self.print_message_scan_results(scan_results)
-            return report_data
+            banned_count = sum(1 for p in result.players if p.status == 'banned')
+            suspicious_count = sum(1 for p in result.players if p.status == 'suspicious')
+            logger.info(f"Report item: Message {message.id} by {message.author_name}: " +
+                        f"Found {len(players_data)} players with " +
+                        f"{banned_count} banned, {suspicious_count} suspicious")
+        self.print_message_scan_results(scan_results)
+        return report_data
 
     def generate_nickname_search_report(self, nickname: str, player: Player) -> List[Dict[str, Any]]:
         report_data = []
-        player_dict = self._player_to_dict(player)
         player_info = {
             "type": "player_info",
             "nickname": nickname,
             "status": player.status,
             "ban_counts": player.ban_counts,
-            "ban_reasons": player.ban_reasons if hasattr(player, 'ban_reasons') else [],
-            "hwid_erased": player.hwid_erased if hasattr(player, 'hwid_erased') else False
+            "ban_reasons": getattr(player, 'ban_reasons', []),
+            "hwid_erased": getattr(player, 'hwid_erased', False)
         }
         report_data.append(player_info)
         if player.nicknames and len(player.nicknames) > 1:
@@ -74,74 +170,10 @@ class ReportService:
             }
             report_data.append(denied_logins_data)
         if hasattr(player, 'associated_ips') and player.associated_ips:
-            ip_data = {
-                "type": "associated_ips",
-                "ips": []
-            }
-            for ip, shared_with in player.associated_ips.items():
-                denied_logins_for_ip = []
-                if hasattr(player, 'denied_logins'):
-                    denied_logins_for_ip = [
-                        login for login in player.denied_logins
-                        if login.get("ip_address") == ip
-                    ]
-                owner = ""
-                if nickname in shared_with:
-                    owner = nickname
-                elif any(nick in player.nicknames for nick in shared_with):
-                    for nick in player.nicknames:
-                        if nick in shared_with:
-                            owner = nick
-                            break
-                else:
-                    owner = shared_with[0] if shared_with else "Unknown"
-                others = [nick for nick in shared_with if nick != owner]
-                ip_entry = {
-                    "ip": ip,
-                    "owner": owner,
-                    "owned_by_primary": owner == nickname,
-                    "owned_by_alt": owner in player.nicknames and owner != nickname,
-                    "shared_with": others,
-                    "raw_users": shared_with
-                }
-                if denied_logins_for_ip:
-                    ip_entry["denied_logins"] = denied_logins_for_ip
-                ip_data["ips"].append(ip_entry)
+            ip_data = self._generate_ip_data(nickname, player)
             report_data.append(ip_data)
         if hasattr(player, 'associated_hwids') and player.associated_hwids:
-            hwid_data = {
-                "type": "associated_hwids",
-                "hwids": []
-            }
-            for hwid, shared_with in player.associated_hwids.items():
-                denied_logins_for_hwid = []
-                if hasattr(player, 'denied_logins'):
-                    denied_logins_for_hwid = [
-                        login for login in player.denied_logins
-                        if login.get("hwid") == hwid
-                    ]
-                owner = ""
-                if nickname in shared_with:
-                    owner = nickname
-                elif any(nick in player.nicknames for nick in shared_with):
-                    for nick in player.nicknames:
-                        if nick in shared_with:
-                            owner = nick
-                            break
-                else:
-                    owner = shared_with[0] if shared_with else "Unknown"
-                others = [nick for nick in shared_with if nick != owner]
-                hwid_entry = {
-                    "hwid": hwid,
-                    "owner": owner,
-                    "owned_by_primary": owner == nickname,
-                    "owned_by_alt": owner in player.nicknames and owner != nickname,
-                    "shared_with": others,
-                    "raw_users": shared_with
-                }
-                if denied_logins_for_hwid:
-                    hwid_entry["denied_logins"] = denied_logins_for_hwid
-                hwid_data["hwids"].append(hwid_entry)
+            hwid_data = self._generate_hwid_data(nickname, player)
             report_data.append(hwid_data)
         if hasattr(player, 'complaint_links') and player.complaint_links:
             complaints_data = {
@@ -152,134 +184,241 @@ class ReportService:
         self.print_nickname_search_results(nickname, player)
         return report_data
 
-    def print_nickname_search_results(self, nickname: str, player: Player) -> None:
-        status_str = player.status.upper()
-        if hasattr(player, 'hwid_erased') and player.hwid_erased:
-            status_str += " (HWID ERASED)"
-        logger.info(f"\n{'=' * 80}")
-        logger.info(f"SCAN RESULTS FOR: {nickname}")
-        logger.info(f"\n{'=' * 80}")
-        logger.info(f"STATUS: {status_str} | BANS: {player.ban_counts}")
-        if hasattr(player, 'ban_reasons') and player.ban_reasons:
-            logger.info(f"BAN REASONS: {', '.join(player.ban_reasons)}")
-        if len(player.nicknames) > 1:
-            logger.info(f"\n{'-' * 40}")
-            logger.info("ASSOCIATED NICKNAMES:")
-            for other_nick in player.nicknames:
-                if other_nick != nickname:
-                    logger.info(f"  • {other_nick}")
-        if hasattr(player, 'complaint_links') and player.complaint_links:
-            logger.info(f"\n{'-' * 40}")
-            logger.info(f"COMPLAINT LINKS ({len(player.complaint_links)}):")
-            for i, complaint in enumerate(player.complaint_links, 1):
-                link = complaint.get("link", "No link")
-                channel = complaint.get("channel", "Unknown channel")
-                content = complaint.get("content", "No content available")
-                if content and len(content) > 60:
-                    content = content[:57] + "..."
-                logger.info(f"  {i}. {link}")
-                logger.info(f"     Channel: {channel}")
-                logger.info(f"     Content: {content}")
-                mentioned_nicks = complaint.get("mentioned_nicknames", player.nicknames)
-                logger.info(f"     Associated with nicknames: {', '.join(mentioned_nicks)}")
-        if hasattr(player, 'associated_ips') and player.associated_ips:
-            logger.info(f"\n{'-' * 40}")
-            logger.info(f"ASSOCIATED IPs ({len(player.associated_ips)}):")
-            for ip, shared_with in player.associated_ips.items():
-                if nickname in shared_with:
-                    logger.info(f"  • {ip} - Owner: {nickname}")
-                    others = [nick for nick in shared_with if nick != nickname]
-                    if others:
-                        if len(others) > 10:
-                            shared_str = ", ".join(others[:9]) + f", and {len(others) - 9} more"
-                        else:
-                            shared_str = ", ".join(others)
-                        if len(shared_str) > 60:
-                            shared_str = shared_str[:57] + "..."
-                        logger.info(f"    Shared with: {shared_str}")
-                else:
-                    if len(shared_with) > 10:
-                        users_str = ", ".join(shared_with[:9]) + f", and {len(shared_with) - 9} more"
-                    else:
-                        users_str = ", ".join(shared_with)
-                    if len(users_str) > 60:
-                        users_str = users_str[:57] + "..."
-                    logger.info(f"  • {ip} - Owner/Users: {users_str}")
-                    player_alts = [nick for nick in shared_with if nick in player.nicknames]
-                    if player_alts:
-                        logger.info(f"    Note: Used by alt account(s): {', '.join(player_alts)}")
-        if hasattr(player, 'associated_hwids') and player.associated_hwids:
-            logger.info(f"\n{'-' * 40}")
-            logger.info(f"ASSOCIATED HWIDs ({len(player.associated_hwids)}):")
-            for hwid, shared_with in player.associated_hwids.items():
-                if nickname in shared_with:
-                    logger.info(f"  • {hwid} - Owner: {nickname}")
-                    others = [nick for nick in shared_with if nick != nickname]
-                    if others:
-                        if len(others) > 10:
-                            shared_str = ", ".join(others[:9]) + f", and {len(others) - 9} more"
-                        else:
-                            shared_str = ", ".join(others)
-                        if len(shared_str) > 60:
-                            shared_str = shared_str[:57] + "..."
-                        logger.info(f"    Shared with: {shared_str}")
-                else:
-                    if len(shared_with) > 10:
-                        users_str = ", ".join(shared_with[:9]) + f", and {len(shared_with) - 9} more"
-                    else:
-                        users_str = ", ".join(shared_with)
-                    if len(users_str) > 60:
-                        users_str = users_str[:57] + "..."
-                    logger.info(f"  • {hwid} - Owner/Users: {users_str}")
-                    player_alts = [nick for nick in shared_with if nick in player.nicknames]
-                    if player_alts:
-                        logger.info(f"    Note: Used by alt account(s): {', '.join(player_alts)}")
-        if hasattr(player, 'denied_logins') and player.denied_logins:
-            logger.info(f"\n{'-' * 40}")
-            logger.info(f"DENIED LOGIN ATTEMPTS ({len(player.denied_logins)}):")
-            for i, login in enumerate(player.denied_logins[:5], 1):
-                time_str = login.get("time", "N/A")
-                ip = login.get("ip_address", "N/A")
-                hwid = login.get("hwid", "N/A")
-                server = login.get("server", "N/A")
-                user_name = login.get("user_name", nickname)
-                logger.info(f"  {i}. Time: {time_str} | IP: {ip} | HWID: {hwid} | Server: {server}")
-                if user_name != nickname:
-                    logger.info(f"     Attempted with nickname: {user_name}")
-            if len(player.denied_logins) > 5:
-                logger.info(f"  ... and {len(player.denied_logins) - 5} more")
-        logger.info(f"\n{'=' * 80}")
+    def _generate_ip_data(self, nickname: str, player: Player) -> Dict[str, Any]:
+        ip_data = {
+            "type": "associated_ips",
+            "ips": []
+        }
+        for ip, shared_with in player.associated_ips.items():
+            denied_logins_for_ip = []
+            if hasattr(player, 'denied_logins'):
+                denied_logins_for_ip = [
+                    login for login in player.denied_logins
+                    if login.get("ip_address") == ip
+                ]
+            owner = self._determine_owner(nickname, player.nicknames, shared_with)
+            others = [nick for nick in shared_with if nick != owner]
+            ip_entry = {
+                "ip": ip,
+                "owner": owner,
+                "owned_by_primary": owner == nickname,
+                "owned_by_alt": owner in player.nicknames and owner != nickname,
+                "shared_with": others,
+                "raw_users": shared_with
+            }
+            if denied_logins_for_ip:
+                ip_entry["denied_logins"] = denied_logins_for_ip
+            ip_data["ips"].append(ip_entry)
+        return ip_data
 
-    def _log_player_details_debug(self, player: Player) -> None:
-        if not logger.isEnabledFor(logging.DEBUG):
+    def _generate_hwid_data(self, nickname: str, player: Player) -> Dict[str, Any]:
+        hwid_data = {
+            "type": "associated_hwids",
+            "hwids": []
+        }
+        for hwid, shared_with in player.associated_hwids.items():
+            denied_logins_for_hwid = []
+            if hasattr(player, 'denied_logins'):
+                denied_logins_for_hwid = [
+                    login for login in player.denied_logins
+                    if login.get("hwid") == hwid
+                ]
+            owner = self._determine_owner(nickname, player.nicknames, shared_with)
+            others = [nick for nick in shared_with if nick != owner]
+            hwid_entry = {
+                "hwid": hwid,
+                "owner": owner,
+                "owned_by_primary": owner == nickname,
+                "owned_by_alt": owner in player.nicknames and owner != nickname,
+                "shared_with": others,
+                "raw_users": shared_with
+            }
+            if denied_logins_for_hwid:
+                hwid_entry["denied_logins"] = denied_logins_for_hwid
+            hwid_data["hwids"].append(hwid_entry)
+        return hwid_data
+
+    def _determine_owner(self, primary_nickname: str, nicknames: List[str], shared_with: List[str]) -> str:
+        if primary_nickname in shared_with:
+            return primary_nickname
+        for nick in nicknames:
+            if nick in shared_with:
+                return nick
+        return shared_with[0] if shared_with else "Unknown"
+
+    def print_nickname_search_results(self, nickname: str, player: Player) -> None:
+        box = self.box
+        fmt = self.fmt
+        status_str = self._format_status(player.status, getattr(player, 'hwid_erased', False))
+        self._print_header(f"SCAN RESULTS FOR: {nickname}", 100)
+        print(f"  {fmt['BOLD']}STATUS:{fmt['END']} {status_str} | {fmt['BOLD']}BANS:{fmt['END']} {player.ban_counts}")
+        if hasattr(player, 'ban_reasons') and player.ban_reasons:
+            print(f"  {fmt['BOLD']}BAN REASONS:{fmt['END']} {', '.join(player.ban_reasons)}")
+        if len(player.nicknames) > 1:
+            print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
+            print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED NICKNAMES:{fmt['END']}")
+            other_nicks = [nick for nick in player.nicknames if nick != nickname]
+            if other_nicks:
+                print(f"  {box['V']}   {', '.join(other_nicks)}")
+            print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
+        self._print_complaints_section(player, nickname)
+        self._print_ip_section(player, nickname)
+        self._print_hwid_section(player, nickname)
+        self._print_denied_logins_section(player, nickname)
+        print(f"\n{'=' * 100}")
+
+    def _print_complaints_section(self, player: Player, nickname: str) -> None:
+        box = self.box
+        fmt = self.fmt
+        if not hasattr(player, 'complaint_links') or not player.complaint_links:
             return
-        if hasattr(player, 'denied_logins') and player.denied_logins:
-            logger.debug("DENIED LOGINS:")
-            for login in player.denied_logins[:5]:
-                time_str = login.get("time", "N/A")
-                ip = login.get("ip_address", "N/A")
-                hwid = login.get("hwid", "N/A")
-                logger.debug(f"  • {time_str} | IP: {ip} | HWID: {hwid}")
-            if len(player.denied_logins) > 5:
-                logger.debug(f"  • ... and {len(player.denied_logins) - 5} more")
-        if hasattr(player, 'associated_ips') and player.associated_ips:
-            logger.debug(f"ASSOCIATED IPs ({len(player.associated_ips)}):")
-            for ip, shared_with in list(player.associated_ips.items())[:5]:
-                if len(shared_with) > 1:
-                    logger.debug(f"  • {ip} - Shared with: {len(shared_with) - 1} others")
+        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['V']} {fmt['YELLOW']}COMPLAINTS ({len(player.complaint_links)}):{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * 96}{box['VL']}{fmt['END']}")
+        for i, complaint in enumerate(player.complaint_links, 1):
+            link = complaint.get("link", "No link")
+            channel = complaint.get("channel", "Unknown channel")
+            content = complaint.get("content", "No content available")
+            author = complaint.get("author", "Unknown")
+            print(f"  {box['V']}   {box['TL']}{box['H'] * 92}{box['TR']}")
+            print(f"  {box['V']}   {box['V']} {i}. {fmt['BLUE']}{fmt['UNDERLINE']}{link}{fmt['END']}")
+            print(
+                f"  {box['V']}   {box['V']} {fmt['BOLD']}Channel:{fmt['END']} {channel} | {fmt['BOLD']}Author:{fmt['END']} {author}")
+            if content:
+                print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Content:{fmt['END']}")
+                self._print_wrapped_content(content, box, indent="          ")
+            else:
+                print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Content:{fmt['END']} No content available")
+            mentioned_nicks = complaint.get("mentioned_nicknames", [nickname])
+            if len(mentioned_nicks) > 1:
+                print(
+                    f"  {box['V']}   {box['V']} {fmt['BOLD']}Associated with:{fmt['END']} {', '.join(mentioned_nicks)}")
+            print(f"  {box['V']}   {box['BL']}{box['H'] * 92}{box['BR']}")
+        print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
+
+    def _print_wrapped_content(self, content, box, indent="", line_width=85):
+        content_lines = content.split('\n')
+        for line in content_lines:
+            if len(line) > line_width:
+                chunks = [line[i:i + line_width] for i in range(0, len(line), line_width)]
+                for j, chunk in enumerate(chunks):
+                    print(f"  {box['V']}   {box['V']}{indent}{chunk}")
+            else:
+                print(f"  {box['V']}   {box['V']}{indent}{line}")
+
+    def _print_ip_section(self, player: Player, nickname: str) -> None:
+        box = self.box
+        fmt = self.fmt
+        if not hasattr(player, 'associated_ips') or not player.associated_ips:
+            return
+        ip_count = len(player.associated_ips)
+        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED IPs ({ip_count}):{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * 96}{box['VL']}{fmt['END']}")
+        for ip, shared_with in player.associated_ips.items():
+            if nickname in shared_with:
+                print(f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['GREEN']}Owner:{fmt['END']} {nickname}")
+                others = [nick for nick in shared_with if nick != nickname]
+                if others:
+                    shared_str = self._truncate_list(others, 10)
+                    shared_str = self._truncate_text(shared_str, 70)
+                    print(f"  {box['V']}     {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+            else:
+                users_str = self._truncate_list(shared_with, 10)
+                users_str = self._truncate_text(users_str, 70)
+                print(
+                    f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['YELLOW']}Owner/Users:{fmt['END']} {users_str}")
+                player_alts = [nick for nick in shared_with if nick in player.nicknames]
+                if player_alts:
+                    print(
+                        f"  {box['V']}     {fmt['BOLD']}Note:{fmt['END']} Used by alt account(s): {', '.join(player_alts)}")
+        print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
+
+    def _print_hwid_section(self, player: Player, nickname: str) -> None:
+        box = self.box
+        fmt = self.fmt
+        if not hasattr(player, 'associated_hwids') or not player.associated_hwids:
+            return
+        hwid_count = len(player.associated_hwids)
+        width = 96
+        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * width}{box['TR']}{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED HWIDs ({hwid_count}):{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * width}{box['VL']}{fmt['END']}")
+        owned_hwids = []
+        alt_hwids = []
+        other_hwids = []
+        for hwid, shared_with in player.associated_hwids.items():
+            if nickname in shared_with:
+                owned_hwids.append((hwid, shared_with))
+            elif any(nick in player.nicknames for nick in shared_with):
+                alt_hwids.append((hwid, shared_with))
+            else:
+                other_hwids.append((hwid, shared_with))
+        if owned_hwids:
+            print(f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ HWIDs owned by {nickname}:{fmt['END']}")
+            for i, (hwid, shared_with) in enumerate(owned_hwids):
+                formatted_hwid = self._format_hwid(hwid)
+                others = [nick for nick in shared_with if nick != nickname]
+                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {formatted_hwid}")
+                if others:
+                    shared_str = self._truncate_list(others, 10)
+                    shared_str = self._truncate_text(shared_str, 70)
+                    print(f"  {box['V']}      {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
                 else:
-                    logger.debug(f"  • {ip}")
-            if len(player.associated_ips) > 5:
-                logger.debug(f"  • ... and {len(player.associated_ips) - 5} more")
-        if hasattr(player, 'associated_hwids') and player.associated_hwids:
-            logger.debug(f"ASSOCIATED HWIDs ({len(player.associated_hwids)}):")
-            for hwid, shared_with in list(player.associated_hwids.items())[:5]:
-                if len(shared_with) > 1:
-                    logger.debug(f"  • {hwid} - Shared with: {len(shared_with) - 1} others")
-                else:
-                    logger.debug(f"  • {hwid}")
-            if len(player.associated_hwids) > 5:
-                logger.debug(f"  • ... and {len(player.associated_hwids) - 5} more")
+                    print(f"  {box['V']}      {fmt['GREEN']}Only user{fmt['END']}")
+                if i < len(owned_hwids) - 1:
+                    print(f"  {box['V']}")
+            if alt_hwids or other_hwids:
+                print(f"  {box['V']}{box['H'] * width}")
+        if alt_hwids:
+            print(f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ HWIDs owned by alt accounts:{fmt['END']}")
+            for i, (hwid, shared_with) in enumerate(alt_hwids):
+                formatted_hwid = self._format_hwid(hwid)
+                alt_owners = [nick for nick in shared_with if nick in player.nicknames]
+                others = [nick for nick in shared_with if nick not in player.nicknames]
+                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {formatted_hwid}")
+                print(f"  {box['V']}      {fmt['YELLOW']}Owner(s):{fmt['END']} {', '.join(alt_owners)}")
+                if others:
+                    shared_str = self._truncate_list(others, 10)
+                    shared_str = self._truncate_text(shared_str, 70)
+                    print(f"  {box['V']}      {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                if i < len(alt_hwids) - 1:
+                    print(f"  {box['V']}")
+            if other_hwids:
+                print(f"  {box['V']}{box['H'] * width}")
+        if other_hwids:
+            print(f"  {box['V']} {fmt['BOLD']}■ Other associated HWIDs:{fmt['END']}")
+            for i, (hwid, shared_with) in enumerate(other_hwids):
+                formatted_hwid = self._format_hwid(hwid)
+                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {formatted_hwid}")
+                users_str = self._truncate_list(shared_with, 10)
+                users_str = self._truncate_text(users_str, 70)
+                print(f"  {box['V']}      {fmt['BOLD']}Users:{fmt['END']} {users_str}")
+                if i < len(other_hwids) - 1:
+                    print(f"  {box['V']}")
+        print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * width}{box['BR']}{fmt['END']}")
+
+    def _print_denied_logins_section(self, player: Player, nickname: str) -> None:
+        box = self.box
+        fmt = self.fmt
+        if not hasattr(player, 'denied_logins') or not player.denied_logins:
+            return
+        login_count = len(player.denied_logins)
+        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['V']} {fmt['RED']}DENIED LOGIN ATTEMPTS ({login_count}):{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * 96}{box['VL']}{fmt['END']}")
+        for i, login in enumerate(player.denied_logins[:5], 1):
+            time_str = login.get("time", "N/A")
+            ip = login.get("ip_address", "N/A")
+            server = login.get("server", "N/A")
+            user_name = login.get("user_name", nickname)
+            print(
+                f"  {box['V']}   {i}. {fmt['BOLD']}Time:{fmt['END']} {time_str} {fmt['BOLD']}IP:{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']} {fmt['BOLD']}Server:{fmt['END']} {server}")
+            if user_name != nickname:
+                print(f"  {box['V']}      {fmt['BOLD']}Attempted with name:{fmt['END']} {user_name}")
+        if len(player.denied_logins) > 5:
+            print(f"  {box['V']}   ... and {len(player.denied_logins) - 5} more")
+        print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
 
     def generate_ban_bypass_report(self, ban_bypass_checks: List[BanBypassCheck]) -> List[Dict[str, Any]]:
         report_data = []
@@ -296,18 +435,9 @@ class ReportService:
             potential_bypassers_data = []
             for bypasser in check.potential_bypassers:
                 bypasser_data = self._player_to_dict(bypasser)
-                shared_hwids = []
-                for hwid, nicks in bypasser.associated_hwids.items():
-                    shared_hwids.append({
-                        "hwid": hwid,
-                        "shared_with": nicks
-                    })
-                shared_ips = []
-                for ip, nicks in bypasser.associated_ips.items():
-                    shared_ips.append({
-                        "ip": ip,
-                        "shared_with": nicks
-                    })
+                shared_hwids = [{"hwid": hwid, "shared_with": nicks} for hwid, nicks in
+                                bypasser.associated_hwids.items()]
+                shared_ips = [{"ip": ip, "shared_with": nicks} for ip, nicks in bypasser.associated_ips.items()]
                 bypasser_data["evidence"] = {
                     "shared_hwids": shared_hwids,
                     "shared_ips": shared_ips
@@ -354,35 +484,24 @@ class ReportService:
                 "results": [bypass_data]
             }
             report_data.append(message_data)
-            logger.info(
-                f"Ban bypass: {banned_player.primary_nickname} | " +
-                f"Confidence: {check.bypass_confidence} | " +
-                f"Potential bypassers: {len(potential_bypassers_data)}"
-            )
+            logger.info(f"Ban bypass: {banned_player.primary_nickname} | " +
+                        f"Confidence: {check.bypass_confidence} | " +
+                        f"Potential bypassers: {len(potential_bypassers_data)}")
         if ban_bypass_checks:
-            logger.info(
-                f"Ban bypass check complete: {len(ban_bypass_checks)} checks | " +
-                f"HWID Matches: {confidence_counts['HWID_MATCH']} | " +
-                f"IP+Time Close Matches: {confidence_counts['IP_TIME_CLOSE_MATCH']} | " +
-                f"IP+Time Matches: {confidence_counts['IP_TIME_MATCH']} | " +
-                f"IP Matches: {confidence_counts['IP_MATCH']} | " +
-                f"No Matches: {confidence_counts['NO_MATCH']}"
-            )
+            logger.info(f"Ban bypass check complete: {len(ban_bypass_checks)} checks | " +
+                        f"HWID Matches: {confidence_counts['HWID_MATCH']} | " +
+                        f"IP+Time Close Matches: {confidence_counts['IP_TIME_CLOSE_MATCH']} | " +
+                        f"IP+Time Matches: {confidence_counts['IP_TIME_MATCH']} | " +
+                        f"IP Matches: {confidence_counts['IP_MATCH']} | " +
+                        f"No Matches: {confidence_counts['NO_MATCH']}")
         return report_data
 
     def _player_to_dict(self, player: Player) -> Dict[str, Any]:
         enhanced_ips = {}
         for ip, shared_with in player.associated_ips.items():
-            owner = ""
-            if player.primary_nickname in shared_with:
-                owner = player.primary_nickname
-            elif any(nick in player.nicknames for nick in shared_with):
-                for nick in player.nicknames:
-                    if nick in shared_with:
-                        owner = nick
-                        break
-            else:
-                owner = shared_with[0] if shared_with else "Unknown"
+            owner = self._determine_owner(
+                getattr(player, 'primary_nickname', player.nicknames[0] if player.nicknames else "Unknown"),
+                player.nicknames, shared_with)
             enhanced_ips[ip] = {
                 "owner": owner,
                 "shared_with": [nick for nick in shared_with if nick != owner],
@@ -390,52 +509,42 @@ class ReportService:
             }
         enhanced_hwids = {}
         for hwid, shared_with in player.associated_hwids.items():
-            owner = ""
-            if player.primary_nickname in shared_with:
-                owner = player.primary_nickname
-            elif any(nick in player.nicknames for nick in shared_with):
-                for nick in player.nicknames:
-                    if nick in shared_with:
-                        owner = nick
-                        break
-            else:
-                owner = shared_with[0] if shared_with else "Unknown"
+            owner = self._determine_owner(
+                getattr(player, 'primary_nickname', player.nicknames[0] if player.nicknames else "Unknown"),
+                player.nicknames, shared_with)
             enhanced_hwids[hwid] = {
                 "owner": owner,
                 "shared_with": [nick for nick in shared_with if nick != owner],
                 "raw_users": shared_with
             }
+        primary_nickname = (getattr(player, 'primary_nickname', None) or (
+            player.nicknames[0] if player.nicknames else "Unknown"))
         return {
             "initial_account": {
                 "user_id": player.user_id,
                 "nicknames": player.nicknames,
-                "primary_nickname": player.primary_nickname if hasattr(player, 'primary_nickname') else (
-                    player.nicknames[0] if player.nicknames else "Unknown"),
+                "primary_nickname": primary_nickname,
                 "status": player.status,
                 "ban_counts": player.ban_counts,
-                "ban_reasons": player.ban_reasons,
-                "suspected_vpn": player.suspected_vpn,
-                "connection_link": player.connection_link,
+                "ban_reasons": getattr(player, 'ban_reasons', []),
+                "suspected_vpn": getattr(player, 'suspected_vpn', False),
+                "connection_link": getattr(player, 'connection_link', ""),
                 "associated_ips": player.associated_ips,
                 "associated_hwids": player.associated_hwids,
-                "shared_hwid_nicknames": player.shared_hwid_nicknames
+                "shared_hwid_nicknames": getattr(player, 'shared_hwid_nicknames', [])
             },
             "ip_data": enhanced_ips,
             "hwid_data": enhanced_hwids,
             "raw_ip_nicks": player.associated_ips,
             "raw_hwid_nicks": player.associated_hwids,
             "nicknames": player.nicknames,
-            "hwid_erased": player.hwid_erased,
-            "complaint_links": player.complaint_links
+            "hwid_erased": getattr(player, 'hwid_erased', False),
+            "complaint_links": getattr(player, 'complaint_links', [])
         }
 
     def _get_verdict_string(self, account: Dict[str, Any], hwid_erased: bool = False,
                             bypass_confidence: Optional[str] = None) -> str:
-        if bypass_confidence in {
-            "100% (HWID Match)",
-            "20-30% (IP + Time Match)",
-            "IP+Time Match (5-10 min, 30-50%)"
-        }:
+        if bypass_confidence in {"100% (HWID Match)", "20-30% (IP + Time Match)", "IP+Time Match (5-10 min, 30-50%)"}:
             verdict = f"POTENTIAL BYPASS - {bypass_confidence}"
         elif account.get("ban_counts", 0) >= 5:
             verdict = "SUSPICIOUS - multiple bans"
@@ -452,29 +561,8 @@ class ReportService:
         return verdict
 
     def print_message_scan_results(self, scan_results: List[ScanResult]) -> None:
-        if sys.stdout.isatty():
-            HEADER = '\033[95m'
-            BLUE = '\033[94m'
-            CYAN = '\033[96m'
-            GREEN = '\033[92m'
-            YELLOW = '\033[93m'
-            RED = '\033[91m'
-            BOLD = '\033[1m'
-            UNDERLINE = '\033[4m'
-            END = '\033[0m'
-        else:
-            HEADER = BLUE = CYAN = GREEN = YELLOW = RED = BOLD = UNDERLINE = END = ''
-        BOX_H = '─'
-        BOX_V = '│'
-        BOX_TL = '┌'
-        BOX_TR = '┐'
-        BOX_BL = '└'
-        BOX_BR = '┘'
-        BOX_VL = '┤'
-        BOX_VR = '├'
-        BOX_HU = '┴'
-        BOX_HD = '┬'
-        BOX_CROSS = '┼'
+        fmt = self.fmt
+        box = self.box
         total_players = 0
         total_banned = 0
         total_suspicious = 0
@@ -486,188 +574,149 @@ class ReportService:
         unique_hwids = set()
         unique_ips = set()
         problematic_players = []
-
-        def print_header(title, width=80):
-            print(f"\n{HEADER}{BOLD}{BOX_TL}{BOX_H * (width - 2)}{BOX_TR}{END}")
-            padding = (width - len(title) - 4) // 2
-            print(
-                f"{HEADER}{BOLD}{BOX_V}{' ' * padding} {title} {' ' * (width - padding - len(title) - 4)}{BOX_V}{END}")
-            print(f"{HEADER}{BOLD}{BOX_BL}{BOX_H * (width - 2)}{BOX_BR}{END}")
-
-        def print_section(title, width=80):
-            print(f"\n{BOLD}{BOX_TL}{BOX_H * (width - 2)}{BOX_TR}{END}")
-            padding = (width - len(title) - 4) // 2
-            print(f"{BOLD}{BOX_V}{' ' * padding} {title} {' ' * (width - padding - len(title) - 4)}{BOX_V}{END}")
-            print(f"{BOLD}{BOX_BL}{BOX_H * (width - 2)}{BOX_BR}{END}")
-
-        def print_player_header(name, width=76):
-            player_header = f"PLAYER: {name}"
-            print(f"\n  {BOLD}{CYAN}{BOX_TL}{BOX_H * (width - 2)}{BOX_TR}{END}")
-            padding = (width - len(player_header) - 4) // 2
-            print(
-                f"  {BOLD}{CYAN}{BOX_V}{' ' * padding} {player_header} {' ' * (width - padding - len(player_header) - 4)}{BOX_V}{END}")
-            print(f"  {BOLD}{CYAN}{BOX_VR}{BOX_H * (width - 2)}{BOX_VL}{END}")
-
-        def format_hwid(hwid):
-            if len(hwid) <= 12:
-                return hwid
-            prefix = hwid[:5]
-            middle = hwid[5:-5]
-            suffix = hwid[-5:]
-            return f"{CYAN}{prefix}{END}{middle}{CYAN}{suffix}{END}"
-
-        print_header(f"SCAN RESULTS - {len(scan_results)} messages processed", 100)
-
+        self._print_header(f"SCAN RESULTS - {len(scan_results)} messages processed", 100)
         for result in scan_results:
             message = result.message
             players = result.players
-            real_players = [p for p in players if p.primary_nickname != "Unknown"]
+            real_players = [p for p in players if getattr(p, 'primary_nickname', '') != "Unknown"]
             total_players += len(real_players)
-            print_section(f"MESSAGE: {BLUE}{message.link}{END}", 100)
-            print(f"  {BOLD}AUTHOR:{END} {message.author_name}")
+            self._print_section(f"MESSAGE: {fmt['BLUE']}{message.link}{fmt['END']}", 100)
+            print(f"  {fmt['BOLD']}AUTHOR:{fmt['END']} {message.author_name}")
             for player in real_players:
                 if player.status.lower() == "banned":
-                    status_str = f"{RED}{BOLD}BANNED{END}"
+                    status_str = f"{fmt['RED']}{fmt['BOLD']}BANNED{fmt['END']}"
                     total_banned += 1
                     problematic_players.append((player.primary_nickname, "BANNED", player.ban_counts))
                 elif player.status.lower() == "suspicious":
-                    status_str = f"{YELLOW}{BOLD}SUSPICIOUS{END}"
+                    status_str = f"{fmt['YELLOW']}{fmt['BOLD']}SUSPICIOUS{fmt['END']}"
                     total_suspicious += 1
                     problematic_players.append((player.primary_nickname, "SUSPICIOUS", player.ban_counts))
                 elif player.status.lower() == "clean":
-                    status_str = f"{GREEN}CLEAN{END}"
+                    status_str = f"{fmt['GREEN']}CLEAN{fmt['END']}"
                     total_clean += 1
                 else:
                     status_str = "UNKNOWN"
                     total_unknown += 1
                 hwid_erased = ""
                 if hasattr(player, 'hwid_erased') and player.hwid_erased:
-                    hwid_erased = f" {YELLOW}(HWID ERASED){END}"
-                print_player_header(player.primary_nickname)
+                    hwid_erased = f" {fmt['YELLOW']}(HWID ERASED){fmt['END']}"
+                self._print_player_header(player.primary_nickname)
                 print(
-                    f"  {BOX_V} {BOLD}STATUS:{END} {status_str}{hwid_erased} {BOX_V} {BOLD}BANS:{END} {player.ban_counts}")
+                    f"  {box['V']} {fmt['BOLD']}STATUS:{fmt['END']} {status_str}{hwid_erased} {box['V']} {fmt['BOLD']}BANS:{fmt['END']} {player.ban_counts}")
                 if hasattr(player, 'ban_reasons') and player.ban_reasons:
-                    reason_text = f"{BOLD}BAN REASONS:{END} {', '.join(player.ban_reasons)}"
-                    print(f"  {BOX_V} {reason_text}")
+                    reason_text = f"{fmt['BOLD']}BAN REASONS:{fmt['END']} {', '.join(player.ban_reasons)}"
+                    print(f"  {box['V']} {reason_text}")
                 if len(player.nicknames) > 1:
                     alt_nicks = [n for n in player.nicknames if n != player.primary_nickname]
                     if alt_nicks:
-                        alt_names_text = f"{BOLD}ALT NAMES:{END} {', '.join(alt_nicks)}"
-                        print(f"  {BOX_V} {alt_names_text}")
-                print(f"  {BOX_VR}{BOX_H * 74}{BOX_VL}")
+                        alt_names_text = f"{fmt['BOLD']}ALT NAMES:{fmt['END']} {', '.join(alt_nicks)}"
+                        print(f"  {box['V']} {alt_names_text}")
+                print(f"  {box['VR']}{box['H'] * 74}{box['VL']}")
                 if hasattr(player, 'complaint_links') and player.complaint_links:
                     total_complaints += len(player.complaint_links)
-                    print(f"  {BOX_V} {BOLD}{YELLOW}COMPLAINTS ({len(player.complaint_links)}):{END}")
+                    print(
+                        f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}COMPLAINTS ({len(player.complaint_links)}):{fmt['END']}")
                     for i, complaint in enumerate(player.complaint_links, 1):
                         link = complaint.get("link", "No link")
                         channel = complaint.get("channel", "Unknown channel")
                         content = complaint.get("content", "No content available")
-                        print(f"  {BOX_V}   {BOX_TL}{BOX_H * 70}{BOX_TR}")
-                        print(f"  {BOX_V}   {BOX_V} {i}. {BLUE}{UNDERLINE}{link}{END}")
-                        print(f"  {BOX_V}   {BOX_V} {BOLD}Channel:{END} {channel}")
+                        print(f"  {box['V']}   {box['TL']}{box['H'] * 70}{box['TR']}")
+                        print(f"  {box['V']}   {box['V']} {i}. {fmt['BLUE']}{fmt['UNDERLINE']}{link}{fmt['END']}")
+                        print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Channel:{fmt['END']} {channel}")
                         if content:
-                            print(f"  {BOX_V}   {BOX_V} {BOLD}Content:{END}")
+                            print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Content:{fmt['END']}")
                             content_lines = content.split('\n')
                             for line_idx, line in enumerate(content_lines):
                                 if len(line) > 65:
-                                    print(f"  {BOX_V}   {BOX_V}          {line[:65]}")
+                                    print(f"  {box['V']}   {box['V']}          {line[:65]}")
                                     remaining = line[65:]
                                     chunks = [remaining[i:i + 65] for i in range(0, len(remaining), 65)]
                                     for chunk in chunks:
-                                        print(f"  {BOX_V}   {BOX_V}          {chunk}")
+                                        print(f"  {box['V']}   {box['V']}          {chunk}")
                                 else:
-                                    print(f"  {BOX_V}   {BOX_V}          {line}")
+                                    print(f"  {box['V']}   {box['V']}          {line}")
                         else:
-                            print(f"  {BOX_V}   {BOX_V} {BOLD}Content:{END} No content available")
+                            print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Content:{fmt['END']} No content available")
                         mentioned_nicks = complaint.get("mentioned_nicknames", [player.primary_nickname])
                         if len(mentioned_nicks) > 1:
-                            print(f"  {BOX_V}   {BOX_V} {BOLD}Associated with:{END} {', '.join(mentioned_nicks)}")
-                        print(f"  {BOX_V}   {BOX_BL}{BOX_H * 70}{BOX_BR}")
-                    print(f"  {BOX_VR}{BOX_H * 74}{BOX_VL}")
+                            print(
+                                f"  {box['V']}   {box['V']} {fmt['BOLD']}Associated with:{fmt['END']} {', '.join(mentioned_nicks)}")
+                        print(f"  {box['V']}   {box['BL']}{box['H'] * 70}{box['BR']}")
+                    print(f"  {box['VR']}{box['H'] * 74}{box['VL']}")
                 has_details = False
                 if hasattr(player, 'associated_ips') and player.associated_ips:
                     ip_count = len(player.associated_ips)
                     total_ips += ip_count
                     has_details = True
-                    print(f"  {BOX_V} {BOLD}IPs ({ip_count}):{END}")
+                    print(f"  {box['V']} {fmt['BOLD']}IPs ({ip_count}):{fmt['END']}")
                     for ip, shared_with in player.associated_ips.items():
                         unique_ips.add(ip)
                         if player.primary_nickname in shared_with:
                             if len(shared_with) <= 1:
                                 print(
-                                    f"  {BOX_V}   • {CYAN}{ip}{END} - {GREEN}Owner/Only user:{END} {player.primary_nickname}")
+                                    f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['GREEN']}Owner/Only user:{fmt['END']} {player.primary_nickname}")
                             else:
                                 others = [nick for nick in shared_with if nick != player.primary_nickname]
                                 if others:
-                                    if len(others) > 5:
-                                        shared_str = ", ".join(others[:5]) + f", and {len(others) - 5} more"
-                                    else:
-                                        shared_str = ", ".join(others)
+                                    shared_str = self._truncate_list(others, 5)
                                     print(
-                                        f"  {BOX_V}   • {CYAN}{ip}{END} - {GREEN}Owner:{END} {player.primary_nickname} | {YELLOW}Shared with:{END} {shared_str}")
+                                        f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['GREEN']}Owner:{fmt['END']} {player.primary_nickname} | {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
                         else:
                             player_alts = [nick for nick in shared_with if nick in player.nicknames]
                             other_users = [nick for nick in shared_with if nick not in player.nicknames]
                             all_users = player_alts + other_users
-                            if len(all_users) > 5:
-                                users_str = ", ".join(all_users[:5]) + f", and {len(all_users) - 5} more"
-                            else:
-                                users_str = ", ".join(all_users)
-                            print(f"  {BOX_V}   • {CYAN}{ip}{END} - {YELLOW}Owner/Users:{END} {users_str}")
+                            users_str = self._truncate_list(all_users, 5)
+                            print(
+                                f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['YELLOW']}Owner/Users:{fmt['END']} {users_str}")
                 if hasattr(player, 'associated_hwids') and player.associated_hwids:
                     hwid_count = len(player.associated_hwids)
                     total_hwids += hwid_count
+                    if has_details:
+                        print(f"  {box['VR']}{box['H'] * 74}{box['VL']}")
                     has_details = True
-                    if hasattr(player, 'associated_ips') and player.associated_ips:
-                        print(f"  {BOX_VR}{BOX_H * 74}{BOX_VL}")
-                    print(f"  {BOX_V} {BOLD}HWIDs ({hwid_count}):{END}")
+                    print(f"  {box['V']} {fmt['BOLD']}HWIDs ({hwid_count}):{fmt['END']}")
                     for hwid, shared_with in player.associated_hwids.items():
                         unique_hwids.add(hwid)
-                        formatted_hwid = format_hwid(hwid)
+                        formatted_hwid = self._format_hwid(hwid)
                         if player.primary_nickname in shared_with:
                             if len(shared_with) <= 1:
                                 print(
-                                    f"  {BOX_V}   • {formatted_hwid} - {GREEN}Owner/Only user:{END} {player.primary_nickname}")
+                                    f"  {box['V']}   • {formatted_hwid} - {fmt['GREEN']}Owner/Only user:{fmt['END']} {player.primary_nickname}")
                             else:
                                 others = [nick for nick in shared_with if nick != player.primary_nickname]
                                 if others:
-                                    if len(others) > 5:
-                                        shared_str = ", ".join(others[:5]) + f", and {len(others) - 5} more"
-                                    else:
-                                        shared_str = ", ".join(others)
+                                    shared_str = self._truncate_list(others, 5)
                                     print(
-                                        f"  {BOX_V}   • {formatted_hwid} - {GREEN}Owner:{END} {player.primary_nickname} | {YELLOW}Shared with:{END} {shared_str}")
+                                        f"  {box['V']}   • {formatted_hwid} - {fmt['GREEN']}Owner:{fmt['END']} {player.primary_nickname} | {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
                         else:
                             player_alts = [nick for nick in shared_with if nick in player.nicknames]
                             other_users = [nick for nick in shared_with if nick not in player.nicknames]
                             all_users = player_alts + other_users
-                            if len(all_users) > 5:
-                                users_str = ", ".join(all_users[:5]) + f", and {len(all_users) - 5} more"
-                            else:
-                                users_str = ", ".join(all_users)
-                            print(f"  {BOX_V}   • {formatted_hwid} - {YELLOW}Owner/Users:{END} {users_str}")
-                    if hasattr(player, 'denied_logins') and player.denied_logins:
-                        login_count = len(player.denied_logins)
-                        if has_details:
-                            print(f"  {BOX_VR}{BOX_H * 74}{BOX_VL}")
-                        print(f"  {BOX_V} {BOLD}{RED}DENIED LOGINS ({login_count}):{END}")
-                        for i, login in enumerate(player.denied_logins[:3], 1):
-                            time_str = login.get("time", "N/A")
-                            ip = login.get("ip_address", "N/A")
-                            hwid = login.get("hwid", "N/A")
-                            server = login.get("server", "N/A")
-                            user_name = login.get("user_name", player.primary_nickname)
+                            users_str = self._truncate_list(all_users, 5)
                             print(
-                                f"  {BOX_V}   {i}. {BOLD}Time:{END} {time_str} {BOLD}IP:{END} {CYAN}{ip}{END} {BOLD}Server:{END} {server}")
-                            if user_name != player.primary_nickname:
-                                print(f"  {BOX_V}      {BOLD}Used name:{END} {user_name}")
-                        if len(player.denied_logins) > 3:
-                            print(f"  {BOX_V}   ... and {len(player.denied_logins) - 3} more")
-                print(f"  {BOX_BL}{BOX_H * 74}{BOX_BR}")
-        print_header(" SCAN SUMMARY ", 100)
-        print(f"  {BOX_V} {BOLD}Messages processed:{END} {len(scan_results)}")
-        print(f"  {BOX_V} {BOLD}Players found:{END} {total_players}")
-        print(f"  {BOX_V} {BOLD}Status breakdown:{END}")
+                                f"  {box['V']}   • {formatted_hwid} - {fmt['YELLOW']}Owner/Users:{fmt['END']} {users_str}")
+                if hasattr(player, 'denied_logins') and player.denied_logins:
+                    login_count = len(player.denied_logins)
+                    if has_details:
+                        print(f"  {box['VR']}{box['H'] * 74}{box['VL']}")
+                    print(f"  {box['V']} {fmt['BOLD']}{fmt['RED']}DENIED LOGINS ({login_count}):{fmt['END']}")
+                    for i, login in enumerate(player.denied_logins[:3], 1):
+                        time_str = login.get("time", "N/A")
+                        ip = login.get("ip_address", "N/A")
+                        hwid = login.get("hwid", "N/A")
+                        server = login.get("server", "N/A")
+                        user_name = login.get("user_name", player.primary_nickname)
+                        print(
+                            f"  {box['V']}   {i}. {fmt['BOLD']}Time:{fmt['END']} {time_str} {fmt['BOLD']}IP:{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']} {fmt['BOLD']}Server:{fmt['END']} {server}")
+                        if user_name != player.primary_nickname:
+                            print(f"  {box['V']}      {fmt['BOLD']}Used name:{fmt['END']} {user_name}")
+                    if len(player.denied_logins) > 3:
+                        print(f"  {box['V']}   ... and {len(player.denied_logins) - 3} more")
+                print(f"  {box['BL']}{box['H'] * 74}{box['BR']}")
+        self._print_header(" SCAN SUMMARY ", 100)
+        print(f"  {box['V']} {fmt['BOLD']}Messages processed:{fmt['END']} {len(scan_results)}")
+        print(f"  {box['V']} {fmt['BOLD']}Players found:{fmt['END']} {total_players}")
+        print(f"  {box['V']} {fmt['BOLD']}Status breakdown:{fmt['END']}")
         if total_players:
             banned_pct = total_banned / total_players * 100
             suspicious_pct = total_suspicious / total_players * 100
@@ -675,20 +724,21 @@ class ReportService:
             unknown_pct = total_unknown / total_players * 100 if total_unknown else 0
         else:
             banned_pct = suspicious_pct = clean_pct = unknown_pct = 0
-        print(f"  {BOX_V}    • {RED}{BOLD}Banned:{END} {total_banned} ({banned_pct:.1f}% of total)")
-        print(f"  {BOX_V}    • {YELLOW}{BOLD}Suspicious:{END} {total_suspicious} ({suspicious_pct:.1f}% of total)")
-        print(f"  {BOX_V}    • {GREEN}Clean:{END} {total_clean} ({clean_pct:.1f}% of total)")
+        print(
+            f"  {box['V']}    • {fmt['RED']}{fmt['BOLD']}Banned:{fmt['END']} {total_banned} ({banned_pct:.1f}% of total)")
+        print(
+            f"  {box['V']}    • {fmt['YELLOW']}{fmt['BOLD']}Suspicious:{fmt['END']} {total_suspicious} ({suspicious_pct:.1f}% of total)")
+        print(f"  {box['V']}    • {fmt['GREEN']}Clean:{fmt['END']} {total_clean} ({clean_pct:.1f}% of total)")
         if total_unknown:
-            print(f"  {BOX_V}    • Unknown: {total_unknown} ({unknown_pct:.1f}% of total)")
+            print(f"  {box['V']}    • Unknown: {total_unknown} ({unknown_pct:.1f}% of total)")
         else:
-            print(f"  {BOX_V}    • Unknown: 0")
-        print(f"  {BOX_V} {BOLD}Complaints found:{END} {total_complaints}")
-        print(f"  {BOX_V} {BOLD}Unique HWIDs detected:{END} {len(unique_hwids)}")
-        print(f"  {BOX_V} {BOLD}Unique IPs detected:{END} {len(unique_ips)}")
+            print(f"  {box['V']}    • Unknown: 0")
+        print(f"  {box['V']} {fmt['BOLD']}Complaints found:{fmt['END']} {total_complaints}")
+        print(f"  {box['V']} {fmt['BOLD']}Unique HWIDs detected:{fmt['END']} {len(unique_hwids)}")
+        print(f"  {box['V']} {fmt['BOLD']}Unique IPs detected:{fmt['END']} {len(unique_ips)}")
         if problematic_players:
-            print(f"  {BOX_VR}{BOX_H * 96}{BOX_VL}")
-            print(f"  {BOX_V} {BOLD}PROBLEMATIC PLAYERS DETECTED:{END}")
+            print(f"  {box['VR']}{box['H'] * 96}{box['VL']}")
+            print(f"  {box['V']} {fmt['BOLD']}PROBLEMATIC PLAYERS DETECTED:{fmt['END']}")
             for nickname, status, bans in problematic_players:
-                status_color = RED if status == "BANNED" else YELLOW
-                print(f"  {BOX_V}   • {nickname}: {status_color}{status}{END} (Bans: {bans})")
-        print(f"  {BOX_BL}{BOX_H * 96}{BOX_VL}\n")
+                status_color = fmt['RED'] if status == "BANNED" else fmt['YELLOW']
+                print(f"  {box['V']}   • {nickname}: {status_color}{status}{fmt['END']} (Bans: {bans})")
