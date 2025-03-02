@@ -2,6 +2,7 @@ import logging
 import os
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
+
 from models.ban_hit import BanBypassCheck
 from templates.html_template import HTMLTemplateGenerator
 from utils.file_utils import ensure_directory_exists
@@ -16,6 +17,20 @@ class HTMLReportService:
         self.js_file = "report.js"
         self.template_generator = HTMLTemplateGenerator()
         self.logger = logging.getLogger(__name__)
+
+        self.VERDICT_THRESHOLDS = {
+            "HWID Match": ("POTENTIAL BYPASS", "100% (HWID Match)"),
+            "IP + Time Match": ("POTENTIAL BYPASS", "20-30% (IP + Time Match)"),
+            "Close Time Match": ("POTENTIAL BYPASS", "40-50% (IP + Close Time Match)"),
+            "IP Match": ("SUSPICIOUS", "1-10% (IP Match)"),
+        }
+
+        self.STATUS_VERDICTS = {
+            "banned": "BANNED",
+            "clean": "CLEAN",
+            "suspicious": "SUSPICIOUS",
+            "unknown": "UNKNOWN"
+        }
 
     def generate_html_ban_bypass_report(self, ban_bypass_checks: List[BanBypassCheck]) -> str:
         report_data = self.report_service.generate_ban_bypass_report(ban_bypass_checks)
@@ -93,7 +108,10 @@ class HTMLReportService:
     def write_html_report(self, html_content: str, filename: Optional[str] = None) -> bool:
         html_file = filename or self.html_report_filename
         try:
-            ensure_directory_exists(os.path.dirname(html_file))
+            dir_path = os.path.dirname(html_file)
+            if dir_path:
+                ensure_directory_exists(dir_path)
+
             with open(html_file, "w", encoding="utf-8") as f:
                 f.write(html_content)
             self.logger.info(f"HTML report saved to '{html_file}'.")
