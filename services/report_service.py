@@ -312,27 +312,72 @@ class ReportService:
         if not hasattr(player, 'associated_ips') or not player.associated_ips:
             return
         ip_count = len(player.associated_ips)
-        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
+        width = 96
+        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * width}{box['TR']}{fmt['END']}")
         print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED IPs ({ip_count}):{fmt['END']}")
-        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * 96}{box['VL']}{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * width}{box['VL']}{fmt['END']}")
+
+        owned_ips = []
+        alt_ips = []
+        other_ips = []
+
         for ip, shared_with in player.associated_ips.items():
             if nickname in shared_with:
-                print(f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['GREEN']}Owner:{fmt['END']} {nickname}")
+                owned_ips.append((ip, shared_with))
+            elif any(nick in player.nicknames for nick in shared_with):
+                alt_ips.append((ip, shared_with))
+            else:
+                other_ips.append((ip, shared_with))
+
+        if owned_ips:
+            print(f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ IPs owned by {nickname}:{fmt['END']}")
+            for i, (ip, shared_with) in enumerate(owned_ips):
+                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
                 others = [nick for nick in shared_with if nick != nickname]
                 if others:
                     shared_str = self._truncate_list(others, 10)
                     shared_str = self._truncate_text(shared_str, 70)
-                    print(f"  {box['V']}     {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
-            else:
+                    print(f"  {box['V']}      {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                else:
+                    print(f"  {box['V']}      {fmt['GREEN']}Only user{fmt['END']}")
+                if i < len(owned_ips) - 1:
+                    print(f"  {box['V']}")
+
+            if alt_ips or other_ips:
+                print(f"  {box['V']}{box['H'] * width}")
+
+        if alt_ips:
+            print(f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ IPs owned by alt accounts:{fmt['END']}")
+            for i, (ip, shared_with) in enumerate(alt_ips):
+                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
+                alt_owners = [nick for nick in shared_with if nick in player.nicknames]
+                others = [nick for nick in shared_with if nick not in player.nicknames]
+                print(f"  {box['V']}      {fmt['YELLOW']}Owner(s):{fmt['END']} {', '.join(alt_owners)}")
+                if others:
+                    shared_str = self._truncate_list(others, 10)
+                    shared_str = self._truncate_text(shared_str, 70)
+                    print(f"  {box['V']}      {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                if i < len(alt_ips) - 1:
+                    print(f"  {box['V']}")
+
+            if other_ips:
+                print(f"  {box['V']}{box['H'] * width}")
+
+        if other_ips:
+            print(f"  {box['V']} {fmt['BOLD']}■ Other associated IPs:{fmt['END']}")
+            for i, (ip, shared_with) in enumerate(other_ips):
+                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
                 users_str = self._truncate_list(shared_with, 10)
                 users_str = self._truncate_text(users_str, 70)
-                print(
-                    f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['YELLOW']}Owner/Users:{fmt['END']} {users_str}")
+                print(f"  {box['V']}      {fmt['BOLD']}Users:{fmt['END']} {users_str}")
                 player_alts = [nick for nick in shared_with if nick in player.nicknames]
                 if player_alts:
                     print(
-                        f"  {box['V']}     {fmt['BOLD']}Note:{fmt['END']} Used by alt account(s): {', '.join(player_alts)}")
-        print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
+                        f"  {box['V']}      {fmt['BOLD']}Note:{fmt['END']} Used by alt account(s): {', '.join(player_alts)}")
+                if i < len(other_ips) - 1:
+                    print(f"  {box['V']}")
+
+        print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * width}{box['BR']}{fmt['END']}")
 
     def _print_hwid_section(self, player: Player, nickname: str) -> None:
         box = self.box

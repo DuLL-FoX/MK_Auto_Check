@@ -13,9 +13,11 @@ class VerdictCategory(Enum):
 
 class ConfidenceLevel(Enum):
     HWID_MATCH = "100% (HWID Match)"
-    IP_TIME_MATCH = "20-30% (IP + Time Match)"
-    IP_TIME_CLOSE_MATCH = "40-50% (IP + Close Time Match)"
-    IP_MATCH = "1-10% (IP Match)"
+    IP_VERY_CLOSE_TIME = "80-90% (IP + Very Close Time, <5min)"
+    IP_CLOSE_TIME = "60-70% (IP + Close Time, 5-10min)"
+    IP_MODERATE_TIME = "40-50% (IP + Moderate Time, 10-30min)"
+    IP_DISTANT_TIME = "20-30% (IP + Distant Time, 30-60min)"
+    IP_MATCH = "10-20% (IP Match)"
     NO_MATCH = "No Match Found"
 
 

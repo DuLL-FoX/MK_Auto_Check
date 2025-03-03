@@ -91,6 +91,7 @@ def cached_operation(cache_attr_name, key_func=None, ttl=300):
 
     return decorator
 
+
 class Scanner:
     def __init__(self, discord_service: DiscordService, admin_service: AdminService,
                  cache_service: CacheService, report_service: ReportService,
@@ -219,7 +220,6 @@ class Scanner:
                         if message.embed_titles and 'Arrived new player' in message.embed_titles:
                             player.raw_message = "Arrived new player"
 
-                            # Set up player login priorities and timestamps
                             if not hasattr(player, 'login_priorities'):
                                 player.login_priorities = {}
                             if not hasattr(player, 'login_timestamps'):
@@ -508,6 +508,7 @@ class Scanner:
             "ban_info_misses": 0
         }
         semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+
         complaint_task = asyncio.create_task(
             self.discord_service.update_complaint_cache(
                 self.complaint_channels, history_limit=self.cfg.discord.message_history_limit
@@ -519,20 +520,25 @@ class Scanner:
         await asyncio.wait([complaint_task, ban_hits_task])
         self.complaint_channels = complaint_task.result()
         ban_hits = ban_hits_task.result()
+
         if not ban_hits:
             self.logger.info("No ban hits found")
             self.cache_service.save_complaint_cache(self.complaint_channels)
             return []
+
         unique_ban_hits = self._deduplicate_ban_hits(ban_hits)
         unique_ban_hits_list = list(unique_ban_hits.values())
         self.logger.info(
             f"Processing {len(unique_ban_hits_list)} unique ban hits (from {len(ban_hits)} total)"
         )
+
         all_identifiers = self._extract_identifiers_from_ban_hits(unique_ban_hits_list)
         all_user_ids = all_identifiers['user_ids']
         all_hwids = all_identifiers['hwids']
         all_ips = all_identifiers['ips']
+
         await self._prefetch_ban_info(unique_ban_hits_list, ban_info_cache)
+
         async def fetch_connections_cached(term):
             if term == "N/A" or not term:
                 return []
@@ -561,12 +567,14 @@ class Scanner:
             primary_fetch_tasks.append(fetch_connections_cached(ip))
         if primary_fetch_tasks:
             await asyncio.gather(*primary_fetch_tasks)
+
         secondary_identifiers = self._find_secondary_identifiers(
             identity_graph, all_user_ids, all_hwids, all_ips
         )
         secondary_ips = secondary_identifiers['ips']
         secondary_hwids = secondary_identifiers['hwids']
         secondary_user_ids = secondary_identifiers['user_ids']
+
         if secondary_ips or secondary_hwids or secondary_user_ids:
             self.logger.info(
                 f"Stage 2: Pre-fetching {len(secondary_ips)} secondary IPs, "
@@ -584,12 +592,15 @@ class Scanner:
                 secondary_fetch_tasks.append(fetch_connections_cached(user_id))
             if secondary_fetch_tasks:
                 await asyncio.gather(*secondary_fetch_tasks)
+
         processed_identifiers_lock = asyncio.Lock()
         global_processed_identifiers = set()
+
         async def process_ban_hit(hit, idx, total) -> Optional[BanBypassCheck]:
             try:
                 if hit.user_id == "N/A":
                     return None
+
                 hit_identifiers = set()
                 if hit.user_id != "N/A":
                     hit_identifiers.add(f"user_id:{hit.user_id}")
@@ -597,15 +608,20 @@ class Scanner:
                     hit_identifiers.add(f"hwid:{hit.hwid}")
                 if hit.ip_address != "N/A":
                     hit_identifiers.add(f"ip:{hit.ip_address}")
+
                 async with processed_identifiers_lock:
                     if hit_identifiers and hit_identifiers.issubset(global_processed_identifiers):
                         return None
                     global_processed_identifiers.update(hit_identifiers)
+
                 related_identifiers = await self._find_related_identifiers(hit, identity_graph)
+
                 initial_connections, seen_connection_ids = await self._fetch_connections_for_ban_hit(
                     hit, related_identifiers, connection_cache
                 )
+
                 all_ips, all_hwids = self._extract_connection_identifiers(hit, initial_connections)
+
                 for ip in all_ips:
                     if ip != hit.ip_address:
                         for conn in connection_cache.get(ip, []):
@@ -613,6 +629,7 @@ class Scanner:
                             if conn_id not in seen_connection_ids:
                                 seen_connection_ids.add(conn_id)
                                 initial_connections.append(conn)
+
                 for hwid in all_hwids:
                     if hwid != hit.hwid:
                         for conn in connection_cache.get(hwid, []):
@@ -620,19 +637,24 @@ class Scanner:
                             if conn_id not in seen_connection_ids:
                                 seen_connection_ids.add(conn_id)
                                 initial_connections.append(conn)
+
                 account_info = self.admin_panel.aggregate_single_user_info(initial_connections)
                 banned_player = self.admin_service.convert_to_player(account_info)
+
                 if hit.user_name and hit.user_name != "N/A":
                     if hit.user_name in banned_player.nicknames:
                         banned_player.nicknames.remove(hit.user_name)
                     banned_player.nicknames.insert(0, hit.user_name)
+
                 bypass_confidence, potential_bypassers = self.player_analyzer.find_potential_bypassers(
                     hit, banned_player, initial_connections
                 )
+
                 nickname_to_search = hit.banned_user_name or hit.user_name
                 complaint_links = await self.discord_service.find_nickname_mentions(
                     [nickname_to_search], self.complaint_channels
                 )
+
                 return BanBypassCheck(
                     ban_hit=hit,
                     banned_player=banned_player,
@@ -650,6 +672,7 @@ class Scanner:
             processing_tasks.append(process_ban_hit(hit, idx, len(unique_ban_hits_list)))
         results = await gather_with_concurrency(self.max_concurrent_requests, *processing_tasks)
         ban_bypass_checks = [result for result in results if result]
+
         self.logger.info(
             f"Connection cache stats: {cache_stats['connection_hits']} hits, "
             f"{cache_stats['connection_misses']} misses"
@@ -660,13 +683,17 @@ class Scanner:
         self.perf_logger.info(
             f"Ban bypass check completed in {duration:.2f}s with {len(ban_bypass_checks)} potential bypasses found"
         )
+
         self.logger.info(
             f"HWID Matches: {confidence_counts['hwid_match']} | "
-            f"IP+Close Time: {confidence_counts['ip_time_close_match']} | "
-            f"IP+Time: {confidence_counts['ip_time_match']} | "
-            f"IP: {confidence_counts['ip_match']} | "
+            f"IP+Very Close Time (<5min): {confidence_counts['ip_very_close_time']} | "
+            f"IP+Close Time (5-10min): {confidence_counts['ip_close_time']} | "
+            f"IP+Moderate Time (10-30min): {confidence_counts['ip_moderate_time']} | "
+            f"IP+Distant Time (30-60min): {confidence_counts['ip_distant_time']} | "
+            f"IP Match: {confidence_counts['ip_match']} | "
             f"No Match: {confidence_counts['no_match']}"
         )
+
         return ban_bypass_checks
 
     def _deduplicate_ban_hits(self, ban_hits: List[Any]) -> Dict[str, Any]:
@@ -823,8 +850,10 @@ class Scanner:
         counts = {
             "no_match": 0,
             "ip_match": 0,
-            "ip_time_match": 0,
-            "ip_time_close_match": 0,
+            "ip_distant_time": 0,
+            "ip_moderate_time": 0,
+            "ip_close_time": 0,
+            "ip_very_close_time": 0,
             "hwid_match": 0
         }
         for check in ban_bypass_checks:
@@ -832,10 +861,14 @@ class Scanner:
                 counts["no_match"] += 1
             elif check.bypass_confidence == ConfidenceLevel.IP_MATCH.value:
                 counts["ip_match"] += 1
-            elif check.bypass_confidence == ConfidenceLevel.IP_TIME_MATCH.value:
-                counts["ip_time_match"] += 1
-            elif check.bypass_confidence == ConfidenceLevel.IP_TIME_CLOSE_MATCH.value:
-                counts["ip_time_close_match"] += 1
+            elif check.bypass_confidence == ConfidenceLevel.IP_DISTANT_TIME.value:
+                counts["ip_distant_time"] += 1
+            elif check.bypass_confidence == ConfidenceLevel.IP_MODERATE_TIME.value:
+                counts["ip_moderate_time"] += 1
+            elif check.bypass_confidence == ConfidenceLevel.IP_CLOSE_TIME.value:
+                counts["ip_close_time"] += 1
+            elif check.bypass_confidence == ConfidenceLevel.IP_VERY_CLOSE_TIME.value:
+                counts["ip_very_close_time"] += 1
             elif check.bypass_confidence == ConfidenceLevel.HWID_MATCH.value:
                 counts["hwid_match"] += 1
         return counts

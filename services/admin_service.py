@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import time
+from collections import deque
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Set
 from urllib.parse import urlparse, parse_qs, quote_plus
 
+from config_system import get_config
 from models.ban_hit import BanHit
 from models.player import Player
 from utils.async_utils import gather_with_concurrency, RateLimiter, AsyncCache
@@ -131,72 +133,123 @@ class AdminService:
         return result
 
     @monitor_performance
-    async def search_player(self, term: str, single_user: bool = True, depth: int = 0) -> Optional[Dict[str, Any]]:
-        if depth > 2:
-            return None
-        clean_term = quote_plus(term)
-        search_url = f"{self.base_admin_connections_url}&search={clean_term}"
-        try:
-            self.logger.info(f"Searching for player with term: '{term}' (depth: {depth})")
-            initial_result = await self.fetch_with_rate_limit(
-                self.admin_panel.check_account_on_site,
-                search_url,
-                single_user
-            )
-            if not initial_result:
-                self.logger.info(f"No results found for term: '{term}'")
-                return None
-            if depth > 0:
-                return initial_result
-            identifiers = set()
-            user_id = initial_result.get("user_id")
-            if user_id and user_id != "N/A" and user_id != term:
-                identifiers.add(user_id)
-            for ip in initial_result.get("associated_ips", {}):
-                if ip != "N/A" and ip != term:
-                    identifiers.add(ip)
-            for hwid in initial_result.get("associated_hwids", {}):
-                if hwid != "N/A" and hwid != term:
-                    identifiers.add(hwid)
-            nicknames = initial_result.get("nicknames", [])
-            for nickname in nicknames:
-                if nickname and nickname != term:
-                    identifiers.add(nickname)
-            if identifiers:
-                self.logger.info(f"Found {len(identifiers)} additional identifiers to search")
-                prioritized_identifiers = []
-                if user_id and user_id != "N/A" and user_id != term and user_id in identifiers:
-                    prioritized_identifiers.append(user_id)
-                    identifiers.remove(user_id)
-                hwid_identifiers = []
-                for hwid in initial_result.get("associated_hwids", {}):
-                    if hwid != "N/A" and hwid != term and hwid in identifiers:
-                        hwid_identifiers.append(hwid)
-                        identifiers.remove(hwid)
-                prioritized_identifiers.extend(hwid_identifiers)
-                ip_identifiers = []
-                for ip in initial_result.get("associated_ips", {}):
-                    if ip != "N/A" and ip != term and ip in identifiers:
-                        ip_identifiers.append(ip)
-                        identifiers.remove(ip)
-                prioritized_identifiers.extend(ip_identifiers)
-                nickname_identifiers = [nick for nick in identifiers if nick in nicknames]
-                prioritized_identifiers.extend(nickname_identifiers)
-                limited_identifiers = prioritized_identifiers
-                self.logger.info(f"Searching {len(limited_identifiers)} prioritized identifiers")
-                search_tasks = [
-                    self.search_player(identifier, single_user, depth + 1)
-                    for identifier in limited_identifiers
-                ]
-                identifier_results = await gather_with_concurrency(10, *search_tasks)
-                valid_results = [result for result in identifier_results if result]
-                self.logger.info(f"Found {len(valid_results)} valid results from identifier searches")
-                for result in valid_results:
-                    self._merge_search_results(initial_result, result)
-            return initial_result
-        except Exception as e:
-            self.logger.error(f"Error searching for '{term}': {str(e)}")
-            return None
+    async def search_player(self, term: str, single_user: bool = True, max_depth: int = None) -> Optional[
+        Dict[str, Any]]:
+        cfg = get_config()
+        max_depth = max_depth if max_depth is not None else getattr(cfg.scan, 'search_max_depth', 4)
+        start_time = time.time()
+        self.logger.info(f"Searching for player with term: '{term}' (max depth: {max_depth})")
+
+        processed_terms = set()
+        queued_terms = set([term])
+        queue = deque([(term, 0)])
+        merged_result = None
+        stats = {"searches": 0, "depth_counts": {}}
+
+        while queue:
+            current_term, current_depth = queue.popleft()
+
+            if current_term in processed_terms:
+                continue
+
+            processed_terms.add(current_term)
+            stats["searches"] += 1
+            stats["depth_counts"][current_depth] = stats["depth_counts"].get(current_depth, 0) + 1
+
+            try:
+                clean_term = quote_plus(current_term)
+                search_url = f"{self.base_admin_connections_url}&search={clean_term}"
+                self.logger.info(f"Searching for player with term: '{current_term}' (depth: {current_depth})")
+
+                result = await self.fetch_with_rate_limit(
+                    self.admin_panel.check_account_on_site,
+                    search_url,
+                    single_user
+                )
+
+                if not result:
+                    self.logger.info(f"No results found for term: '{current_term}'")
+                    continue
+
+                if merged_result is None:
+                    merged_result = result
+                else:
+                    self._merge_search_results(merged_result, result)
+
+                if current_depth >= max_depth:
+                    continue
+
+                identifiers = self._extract_prioritized_identifiers(
+                    result,
+                    current_term,
+                    processed_terms,
+                    queued_terms
+                )
+
+                limit = self._get_search_limit_for_depth(current_depth)
+                limited_identifiers = identifiers[:limit]
+
+                for identifier in limited_identifiers:
+                    queue.append((identifier, current_depth + 1))
+                    queued_terms.add(identifier)
+
+                self.logger.info(f"Added {len(limited_identifiers)} identifiers to search at depth {current_depth + 1}")
+
+            except Exception as e:
+                self.logger.error(f"Error searching for '{current_term}': {str(e)}")
+                continue
+
+        elapsed = time.time() - start_time
+        self.logger.info(
+            f"Search completed in {elapsed:.2f}s: {stats['searches']} unique searches performed, "
+            f"depth distribution: {stats['depth_counts']}"
+        )
+
+        return merged_result
+
+    def _extract_prioritized_identifiers(
+            self,
+            result: Dict[str, Any],
+            current_term: str,
+            processed_terms: Set[str],
+            queued_terms: Set[str]
+    ) -> List[str]:
+        prioritized = []
+
+        def add_if_new(identifier, priority):
+            if (identifier and
+                    identifier != "N/A" and
+                    identifier != current_term and
+                    identifier not in processed_terms and
+                    identifier not in queued_terms):
+                prioritized.append((priority, identifier))
+
+        user_id = result.get("user_id")
+        add_if_new(user_id, 0)
+
+        for hwid in result.get("associated_hwids", {}):
+            add_if_new(hwid, 1)
+
+        for ip in result.get("associated_ips", {}):
+            add_if_new(ip, 2)
+
+        for nickname in result.get("nicknames", []):
+            add_if_new(nickname, 3)
+
+        prioritized.sort()
+
+        return [identifier for _, identifier in prioritized]
+
+    def _get_search_limit_for_depth(self, depth: int) -> int:
+        cfg = get_config()
+        if depth == 0:
+            return getattr(cfg.scan, 'search_limit_root', 8)
+        elif depth == 1:
+            return getattr(cfg.scan, 'search_limit_level1', 5)
+        elif depth == 2:
+            return getattr(cfg.scan, 'search_limit_level2', 3)
+        else:
+            return getattr(cfg.scan, 'search_limit_default', 2)
 
     def _merge_search_results(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
         if not target or not source:

@@ -13,14 +13,17 @@ class PlayerAnalyzer:
         cfg = get_config()
         self.confidence_levels = {
             'hwid_match': ConfidenceLevel.HWID_MATCH.value,
-            'ip_time_close_match': ConfidenceLevel.IP_TIME_CLOSE_MATCH.value,
-            'ip_time_match': ConfidenceLevel.IP_TIME_MATCH.value,
+            'ip_very_close_time': ConfidenceLevel.IP_VERY_CLOSE_TIME.value,
+            'ip_close_time': ConfidenceLevel.IP_CLOSE_TIME.value,
+            'ip_moderate_time': ConfidenceLevel.IP_MODERATE_TIME.value,
+            'ip_distant_time': ConfidenceLevel.IP_DISTANT_TIME.value,
             'ip_match': ConfidenceLevel.IP_MATCH.value,
             'no_match': ConfidenceLevel.NO_MATCH.value
         }
-        self.close_time_threshold_minutes = cfg.time_thresholds.close_time_threshold_minutes
-        self.time_threshold_minutes = cfg.time_thresholds.time_threshold_minutes
-        self.suspicious_time_threshold_minutes = cfg.time_thresholds.suspicious_time_threshold_minutes
+        self.very_close_time_threshold_minutes = 5
+        self.close_time_threshold_minutes = 10
+        self.moderate_time_threshold_minutes = 30
+        self.distant_time_threshold_minutes = 60
 
     def group_players_by_nicknames(self, players: List[Player]) -> List[Player]:
         if not players:
@@ -123,12 +126,14 @@ class PlayerAnalyzer:
         return base_player
 
     def find_potential_bypassers(self, ban_hit: BanHit, banned_player: Player, connections: List[Dict[str, Any]]) -> \
-    Tuple[str, List[Player]]:
+            Tuple[str, List[Player]]:
         potential_bypassers: List[Player] = []
         bypasser_nicknames: Set[str] = set()
         highest_confidence = self.confidence_levels['no_match']
+
         banned_user_name = ban_hit.user_name
         all_banned_hwids, all_banned_ips = self._extract_banned_identifiers(ban_hit, banned_player)
+
         connection_maps = self._build_connection_maps(connections, banned_user_name)
         hwid_to_users = connection_maps['hwid_to_users']
         ip_to_users = connection_maps['ip_to_users']
@@ -136,53 +141,96 @@ class PlayerAnalyzer:
         user_ips = connection_maps['user_ips']
         user_status = connection_maps['user_status']
         user_connections = connection_maps['user_connections']
+
         hwid_matched_users = self._find_hwid_matched_users(all_banned_hwids, hwid_to_users)
+
+        ban_time = ban_hit.time if ban_hit.time else ban_hit.ban_time
+
+        very_close_time_matches = set()
+        close_time_matches = set()
+        moderate_time_matches = set()
+        distant_time_matches = set()
+
+        if ban_time:
+            user_times = self._build_user_time_map(user_connections)
+
+            very_close_time_matches = self._find_time_based_matches(
+                ban_time, all_banned_ips, ip_to_users, user_times, 0, self.very_close_time_threshold_minutes
+            )
+
+            close_time_matches = self._find_time_based_matches(
+                ban_time, all_banned_ips, ip_to_users, user_times,
+                self.very_close_time_threshold_minutes, self.close_time_threshold_minutes
+            )
+
+            moderate_time_matches = self._find_time_based_matches(
+                ban_time, all_banned_ips, ip_to_users, user_times,
+                self.close_time_threshold_minutes, self.moderate_time_threshold_minutes
+            )
+
+            distant_time_matches = self._find_time_based_matches(
+                ban_time, all_banned_ips, ip_to_users, user_times,
+                self.moderate_time_threshold_minutes, self.distant_time_threshold_minutes
+            )
+
         ip_matched_users = self._find_ip_matched_users(all_banned_ips, ip_to_users)
-        second_order_users = self._find_second_order_users(
-            hwid_matched_users, ip_matched_users, user_hwids, user_ips, hwid_to_users, ip_to_users
-        )
-        all_linked_users = hwid_matched_users | ip_matched_users | second_order_users
-        all_linked_users.discard(banned_user_name)
+
+        # HWID matches (100% confidence)
         for nick in hwid_matched_users:
             if nick not in bypasser_nicknames and nick != banned_user_name:
                 bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
                 potential_bypassers.append(bypasser)
                 bypasser_nicknames.add(nick)
-                highest_confidence = max(highest_confidence, self.confidence_levels['hwid_match'])
-        ban_time = ban_hit.time if ban_hit.time else ban_hit.ban_time
-        if ban_time:
-            user_times = self._build_user_time_map(user_connections)
-            close_time_matches = self._find_time_based_matches(
-                ban_time, all_banned_ips, ip_to_users, user_times, 0, self.close_time_threshold_minutes
-            )
-            normal_time_matches = self._find_time_based_matches(
-                ban_time, all_banned_ips, ip_to_users, user_times, self.close_time_threshold_minutes,
-                self.time_threshold_minutes
-            )
-            for nick in close_time_matches:
-                if nick not in bypasser_nicknames and nick != banned_user_name:
-                    bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
-                    potential_bypassers.append(bypasser)
-                    bypasser_nicknames.add(nick)
-                    if highest_confidence in [self.confidence_levels['no_match'], self.confidence_levels['ip_match'],
-                                              self.confidence_levels['ip_time_match']]:
-                        highest_confidence = self.confidence_levels['ip_time_close_match']
-            for nick in normal_time_matches:
-                if nick not in bypasser_nicknames and nick != banned_user_name:
-                    bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
-                    potential_bypassers.append(bypasser)
-                    bypasser_nicknames.add(nick)
-                    if highest_confidence in [self.confidence_levels['no_match'], self.confidence_levels['ip_match']]:
-                        highest_confidence = self.confidence_levels['ip_time_match']
-        for nick in all_linked_users:
+                highest_confidence = self.confidence_levels['hwid_match']
+
+        # Very close time IP matches (80-90% confidence)
+        for nick in very_close_time_matches:
+            if nick not in bypasser_nicknames and nick != banned_user_name:
+                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                potential_bypassers.append(bypasser)
+                bypasser_nicknames.add(nick)
+                if highest_confidence == self.confidence_levels['no_match']:
+                    highest_confidence = self.confidence_levels['ip_very_close_time']
+
+        # Close time IP matches (60-70% confidence)
+        for nick in close_time_matches:
+            if nick not in bypasser_nicknames and nick != banned_user_name:
+                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                potential_bypassers.append(bypasser)
+                bypasser_nicknames.add(nick)
+                if highest_confidence in [self.confidence_levels['no_match'], self.confidence_levels['ip_match']]:
+                    highest_confidence = self.confidence_levels['ip_close_time']
+
+        # Moderate time IP matches (40-50% confidence)
+        for nick in moderate_time_matches:
+            if nick not in bypasser_nicknames and nick != banned_user_name:
+                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                potential_bypassers.append(bypasser)
+                bypasser_nicknames.add(nick)
+                if highest_confidence in [self.confidence_levels['no_match'], self.confidence_levels['ip_match']]:
+                    highest_confidence = self.confidence_levels['ip_moderate_time']
+
+        # Distant time IP matches (20-30% confidence)
+        for nick in distant_time_matches:
+            if nick not in bypasser_nicknames and nick != banned_user_name:
+                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                potential_bypassers.append(bypasser)
+                bypasser_nicknames.add(nick)
+                if highest_confidence in [self.confidence_levels['no_match'], self.confidence_levels['ip_match']]:
+                    highest_confidence = self.confidence_levels['ip_distant_time']
+
+        # Simple IP matches (10-20% confidence)
+        for nick in ip_matched_users:
             if nick not in bypasser_nicknames and nick != banned_user_name:
                 bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
                 potential_bypassers.append(bypasser)
                 bypasser_nicknames.add(nick)
                 if highest_confidence == self.confidence_levels['no_match']:
                     highest_confidence = self.confidence_levels['ip_match']
+
         for bypasser in potential_bypassers:
             self._enrich_bypasser_player(bypasser, user_connections, hwid_to_users, ip_to_users)
+
         return highest_confidence, potential_bypassers
 
     def _extract_banned_identifiers(self, ban_hit: BanHit, banned_player: Player) -> Tuple[Set[str], Set[str]]:
@@ -201,22 +249,29 @@ class PlayerAnalyzer:
         user_ips = defaultdict(set)
         user_status = {}
         user_connections = defaultdict(list)
+
         for conn in connections:
             user_name = conn.get("user_name", "")
             conn_hwid = conn.get("hwid", "N/A")
             conn_ip = conn.get("ip_address", "N/A")
             conn_status = conn.get("status", "")
+
             if not user_name or user_name == banned_user_name:
                 continue
+
             user_connections[user_name].append(conn)
+
             if conn_hwid != "N/A":
                 hwid_to_users[conn_hwid].add(user_name)
                 user_hwids[user_name].add(conn_hwid)
+
             if conn_ip != "N/A":
                 ip_to_users[conn_ip].add(user_name)
                 user_ips[user_name].add(conn_ip)
+
             if "Denied: Banned" in conn_status:
                 user_status[user_name] = "banned"
+
         return {
             'hwid_to_users': hwid_to_users,
             'ip_to_users': ip_to_users,
@@ -237,19 +292,6 @@ class PlayerAnalyzer:
         for ip in all_banned_ips:
             ip_matched_users.update(ip_to_users.get(ip, set()))
         return ip_matched_users
-
-    def _find_second_order_users(self, hwid_matched_users: Set[str], ip_matched_users: Set[str],
-                                 user_hwids: Dict[str, Set[str]], user_ips: Dict[str, Set[str]],
-                                 hwid_to_users: Dict[str, Set[str]], ip_to_users: Dict[str, Set[str]]) -> Set[str]:
-        second_order_hwid_users = set()
-        second_order_ip_users = set()
-        for user in hwid_matched_users:
-            for hwid in user_hwids.get(user, set()):
-                second_order_hwid_users.update(hwid_to_users.get(hwid, set()))
-        for user in ip_matched_users:
-            for ip in user_ips.get(user, set()):
-                second_order_ip_users.update(ip_to_users.get(ip, set()))
-        return second_order_hwid_users | second_order_ip_users
 
     def _build_user_time_map(self, user_connections: Dict[str, List[Dict[str, Any]]]) -> Dict[str, List[datetime]]:
         user_times = {}
@@ -273,17 +315,21 @@ class PlayerAnalyzer:
         time_matches = set()
         min_seconds = min_minutes * 60
         max_seconds = max_minutes * 60
+
         for ip in all_ips:
             if ip == "N/A" or ip not in ip_to_users:
                 continue
+
             for username in ip_to_users[ip]:
                 if username not in time_cache:
                     continue
+
                 for conn_time in time_cache[username]:
                     diff_seconds = abs((conn_time - ban_time).total_seconds())
                     if min_seconds <= diff_seconds <= max_seconds:
                         time_matches.add(username)
                         break
+
         return time_matches
 
     def _create_bypasser_player(self, nickname: str, is_denied_banned: bool) -> Player:
@@ -300,6 +346,7 @@ class PlayerAnalyzer:
         bypasser_hwids = {}
         bypasser_ips = {}
         denied_logins = []
+
         for conn in user_connections.get(nick, []):
             if "Denied: Banned" in conn.get("status", ""):
                 denied_logins.append({
@@ -309,19 +356,23 @@ class PlayerAnalyzer:
                     "hwid": conn.get("hwid", ""),
                     "server": conn.get("server", "")
                 })
+
             hwid = conn.get("hwid")
             if hwid and hwid != "N/A" and hwid in hwid_to_users:
                 shared_users = list(hwid_to_users[hwid] - {nick})
                 if shared_users:
                     bypasser_hwids[hwid] = shared_users
+
             ip = conn.get("ip_address")
             if ip and ip != "N/A" and ip in ip_to_users:
                 shared_users = list(ip_to_users[ip] - {nick})
                 if shared_users:
                     bypasser_ips[ip] = shared_users
+
         bypasser.associated_hwids = bypasser_hwids
         bypasser.associated_ips = bypasser_ips
         bypasser.denied_logins = denied_logins
+
         shared_hwid_users = set()
         for users in bypasser_hwids.values():
             shared_hwid_users.update(users)
