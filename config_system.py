@@ -42,6 +42,11 @@ class ScanConfig:
     username: Optional[str] = None
     check_ban_bypass: bool = False
     ban_bypass_pages: int = 5
+    search_max_depth: int = 4
+    search_limit_root: int = 8
+    search_limit_level1: int = 5
+    search_limit_level2: int = 3
+    search_limit_default: int = 2
 
 
 @dataclass
@@ -138,6 +143,17 @@ def load_from_file(file_path: str):
             config.scan.check_ban_bypass = config_module.CHECK_BAN_BYPASS
         if hasattr(config_module, "BAN_BYPASS_PAGES"):
             config.scan.ban_bypass_pages = config_module.BAN_BYPASS_PAGES
+
+        if hasattr(config_module, "SEARCH_MAX_DEPTH"):
+            config.scan.search_max_depth = config_module.SEARCH_MAX_DEPTH
+        if hasattr(config_module, "SEARCH_LIMIT_ROOT"):
+            config.scan.search_limit_root = config_module.SEARCH_LIMIT_ROOT
+        if hasattr(config_module, "SEARCH_LIMIT_LEVEL1"):
+            config.scan.search_limit_level1 = config_module.SEARCH_LIMIT_LEVEL1
+        if hasattr(config_module, "SEARCH_LIMIT_LEVEL2"):
+            config.scan.search_limit_level2 = config_module.SEARCH_LIMIT_LEVEL2
+        if hasattr(config_module, "SEARCH_LIMIT_DEFAULT"):
+            config.scan.search_limit_default = config_module.SEARCH_LIMIT_DEFAULT
 
         if hasattr(config_module, "CLOSE_TIME_THRESHOLD_MINUTES"):
             config.time_thresholds.close_time_threshold_minutes = config_module.CLOSE_TIME_THRESHOLD_MINUTES

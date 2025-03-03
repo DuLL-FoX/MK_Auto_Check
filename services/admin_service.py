@@ -136,7 +136,7 @@ class AdminService:
     async def search_player(self, term: str, single_user: bool = True, max_depth: int = None) -> Optional[
         Dict[str, Any]]:
         cfg = get_config()
-        max_depth = max_depth if max_depth is not None else getattr(cfg.scan, 'search_max_depth', 4)
+        max_depth = max_depth if max_depth is not None else cfg.scan.search_max_depth
         start_time = time.time()
         self.logger.info(f"Searching for player with term: '{term}' (max depth: {max_depth})")
 
@@ -243,13 +243,13 @@ class AdminService:
     def _get_search_limit_for_depth(self, depth: int) -> int:
         cfg = get_config()
         if depth == 0:
-            return getattr(cfg.scan, 'search_limit_root', 8)
+            return cfg.scan.search_limit_root
         elif depth == 1:
-            return getattr(cfg.scan, 'search_limit_level1', 5)
+            return cfg.scan.search_limit_level1
         elif depth == 2:
-            return getattr(cfg.scan, 'search_limit_level2', 3)
+            return cfg.scan.search_limit_level2
         else:
-            return getattr(cfg.scan, 'search_limit_default', 2)
+            return cfg.scan.search_limit_default
 
     def _merge_search_results(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
         if not target or not source:

@@ -15,7 +15,13 @@ def parse_arguments():
     parser.add_argument("--username", help="Username to scan")
     parser.add_argument("--check-ban-bypass", action="store_true", help="Check for ban bypasses")
     parser.add_argument("--ban-bypass-pages", type=int, help="Number of ban bypass pages to check")
+
     parser.add_argument("--search-depth", type=int, help="Maximum search depth for player searches")
+    parser.add_argument("--search-limit-root", type=int, help="Number of searches at root level")
+    parser.add_argument("--search-limit-level1", type=int, help="Number of searches at level 1")
+    parser.add_argument("--search-limit-level2", type=int, help="Number of searches at level 2")
+    parser.add_argument("--search-limit-default", type=int, help="Number of searches at deeper levels")
+
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
                         help="Logging level")
     parser.add_argument("--config", help="Path to configuration file")
@@ -42,8 +48,18 @@ def main():
         cfg.scan.check_ban_bypass = True
     if args.ban_bypass_pages is not None:
         cfg.scan.ban_bypass_pages = args.ban_bypass_pages
+
     if args.search_depth is not None:
         cfg.scan.search_max_depth = args.search_depth
+    if args.search_limit_root is not None:
+        cfg.scan.search_limit_root = args.search_limit_root
+    if args.search_limit_level1 is not None:
+        cfg.scan.search_limit_level1 = args.search_limit_level1
+    if args.search_limit_level2 is not None:
+        cfg.scan.search_limit_level2 = args.search_limit_level2
+    if args.search_limit_default is not None:
+        cfg.scan.search_limit_default = args.search_limit_default
+
     if args.log_level is not None:
         cfg.logging.log_level = args.log_level
 
