@@ -2,6 +2,7 @@ import asyncio
 import functools
 import hashlib
 import logging
+import re
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -149,19 +150,34 @@ class Scanner:
             all_terms = set()
             message_terms = {}
             term_is_login_event = {}
+            message_user_id_terms = {}
+
             for message in messages:
                 if 'Arrived new player' not in message.embed_titles:
                     continue
+
                 unique_terms = {
                     extract_effective_search_term(url)
                     for url in message.embed_links.values()
                     if extract_effective_search_term(url)
                 }
+
                 if unique_terms:
                     message_terms[message.id] = unique_terms
                     all_terms.update(unique_terms)
+
                     for term in unique_terms:
                         term_is_login_event[term] = True
+
+                    for key, url in message.embed_links.items():
+                        term = extract_effective_search_term(url)
+                        if term and re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', term,
+                                             re.I):
+                            user_id_term = term
+                            self.logger.debug(f"Found user_id term: {user_id_term}")
+                            message_user_id_terms[message.id] = user_id_term
+                            break
+
             self.logger.info(f"Processing {len(all_terms)} unique terms across all messages")
             term_processing_tasks = [
                 self.process_term(
@@ -169,50 +185,76 @@ class Scanner:
                     use_cache=True,
                     shared_cache=message_scan_cache,
                     cache_lock=cache_lock,
-                    is_login_event=term_is_login_event.get(term, False)
+                    is_login_event=term_is_login_event.get(term, False),
+                    is_user_id=(any(term == uid_term for uid_term in message_user_id_terms.values()))
                 )
                 for term in all_terms
             ]
+
             term_results = await gather_with_concurrency(
                 self.max_concurrent_requests,
                 *term_processing_tasks
             )
+
             term_to_player = {
                 term: player for term, player in zip(all_terms, term_results) if player
             }
+
             scan_results = []
             for message in messages:
                 if message.id not in message_terms:
                     continue
+
                 players = [term_to_player[term] for term in message_terms[message.id]
                            if term in term_to_player]
+
                 if players:
+                    user_id_term = message_user_id_terms.get(message.id)
+                    user_id_player = None
+
+                    if user_id_term and user_id_term in term_to_player:
+                        user_id_player = term_to_player[user_id_term]
+
                     for player in players:
                         if message.embed_titles and 'Arrived new player' in message.embed_titles:
                             player.raw_message = "Arrived new player"
-                            if player.nicknames:
+
+                            # Set up player login priorities and timestamps
+                            if not hasattr(player, 'login_priorities'):
+                                player.login_priorities = {}
+                            if not hasattr(player, 'login_timestamps'):
+                                player.login_timestamps = {}
+
+                            timestamp = message.created_at if hasattr(message,
+                                                                      'created_at') else datetime.now().isoformat()
+
+                            if user_id_player and player is user_id_player and player.nicknames:
+                                player.is_primary = True
                                 primary_nick = player.nicknames[0]
-                                if not hasattr(player, 'login_priorities'):
-                                    player.login_priorities = {}
                                 player.login_priorities[primary_nick] = 1
-                                if not hasattr(player, 'login_timestamps'):
-                                    player.login_timestamps = {}
-                                timestamp = message.created_at if hasattr(message,
-                                                                          'created_at') else datetime.now().isoformat()
                                 player.login_timestamps[primary_nick] = str(timestamp)
+                            elif player.nicknames:
+                                player.is_primary = False
+                                primary_nick = player.nicknames[0]
+                                player.login_priorities[primary_nick] = 2
+                                player.login_timestamps[primary_nick] = str(timestamp)
+
                     grouped_players = self.player_analyzer.group_players_by_nicknames(players)
                     all_nicknames = {nickname for player in grouped_players for nickname in player.nicknames}
                     complaint_links = await self.discord_service.find_nickname_mentions(
                         list(all_nicknames), self.complaint_channels
                     )
+
                     for player in grouped_players:
                         player.complaint_links = [
                             link for link in complaint_links
                             if any(nickname in link.get('content', '') for nickname in player.nicknames)
                         ]
+
                     scan_results.append(
                         ScanResult(message=message, players=grouped_players, scan_time=datetime.now())
                     )
+
             consolidated = self.consolidate_players_across_messages(scan_results)
             report_data = self.report_service.generate_message_scan_report(consolidated)
             duration = (datetime.now() - start_time).total_seconds()
@@ -235,7 +277,8 @@ class Scanner:
     async def process_term(self, term: str, use_cache: bool = False,
                            shared_cache: Optional[Set[str]] = None,
                            cache_lock: Optional[asyncio.Lock] = None,
-                           is_login_event: bool = False) -> Optional[Player]:
+                           is_login_event: bool = False,
+                           is_user_id: bool = False) -> Optional[Player]:
         term_start = datetime.now()
         try:
             if use_cache and shared_cache is not None and cache_lock is not None:
@@ -252,11 +295,13 @@ class Scanner:
                         primary_nick = player.nicknames[0]
                         if not hasattr(player, 'login_priorities'):
                             player.login_priorities = {}
-                        player.login_priorities[primary_nick] = 1
+                        priority = 1 if is_user_id else 2
+                        player.login_priorities[primary_nick] = priority
                         if not hasattr(player, 'login_timestamps'):
                             player.login_timestamps = {}
                         current_time = datetime.now().isoformat()
                         player.login_timestamps[primary_nick] = current_time
+                        player.is_from_user_id = is_user_id
                 return player
 
             self.logger.info(f"Performing comprehensive search for term: '{term}'")
@@ -269,13 +314,16 @@ class Scanner:
             self.logger.info(f"Converting account info to player object")
             player = self.admin_service.convert_to_player(account_info)
 
+            player.is_from_user_id = is_user_id
+
             if is_login_event:
                 player.raw_message = "Arrived new player"
                 if player.nicknames:
                     primary_nick = player.nicknames[0]
                     if not hasattr(player, 'login_priorities'):
                         player.login_priorities = {}
-                    player.login_priorities[primary_nick] = 1
+                    priority = 1 if is_user_id else 2
+                    player.login_priorities[primary_nick] = priority
                     if not hasattr(player, 'login_timestamps'):
                         player.login_timestamps = {}
                     current_time = datetime.now().isoformat()
@@ -854,38 +902,62 @@ class Scanner:
             target_player.login_priorities = {}
         if not hasattr(target_player, 'login_timestamps'):
             target_player.login_timestamps = {}
+
+        if not hasattr(target_player, 'is_from_user_id'):
+            target_player.is_from_user_id = False
+        if hasattr(source_player, 'is_from_user_id') and source_player.is_from_user_id:
+            target_player.is_from_user_id = True
+
         source_is_login_event = False
         if hasattr(source_player, 'raw_message') and source_player.raw_message:
             source_is_login_event = "Arrived new player" in source_player.raw_message
             if source_is_login_event and (not hasattr(target_player, 'raw_message') or not target_player.raw_message):
                 target_player.raw_message = source_player.raw_message
+
         for nickname in source_player.nicknames:
             is_login_event = source_is_login_event
+            priority = 2
+
             if hasattr(source_player, 'login_priorities') and nickname in source_player.login_priorities:
-                if source_player.login_priorities[nickname] == 1:
+                priority = source_player.login_priorities[nickname]
+                if priority == 1:
                     is_login_event = True
-            if is_login_event:
+
+            if hasattr(source_player, 'is_from_user_id') and source_player.is_from_user_id and nickname == \
+                    source_player.nicknames[0]:
+                priority = 1
+                is_login_event = True
+
+            if is_login_event or priority == 1:
                 target_player.nicknames_sources[nickname] = "login"
-                target_player.login_priorities[nickname] = 1
+                target_player.login_priorities[nickname] = priority
+
                 if hasattr(source_player, 'login_timestamps') and nickname in source_player.login_timestamps:
                     target_player.login_timestamps[nickname] = source_player.login_timestamps[nickname]
+
                 if nickname in target_player.nicknames:
                     target_player.nicknames.remove(nickname)
                 target_player.nicknames.insert(0, nickname)
             elif nickname not in target_player.nicknames:
                 target_player.nicknames_sources[nickname] = "other"
+
                 if nickname not in target_player.login_priorities:
-                    target_player.login_priorities[nickname] = 2
+                    target_player.login_priorities[nickname] = priority
+
                 target_player.nicknames.append(nickname)
+
         if hasattr(source_player, 'login_timestamps'):
             for nick, timestamp in source_player.login_timestamps.items():
                 if nick not in target_player.login_timestamps or timestamp > target_player.login_timestamps[nick]:
                     target_player.login_timestamps[nick] = timestamp
+
         source_status = source_player.status.lower()
         target_status = target_player.status.lower()
         if self.status_priority.get(source_status, 0) > self.status_priority.get(target_status, 0):
             target_player.status = source_player.status
+
         target_player.ban_counts = max(target_player.ban_counts, source_player.ban_counts)
+
         if hasattr(source_player, 'associated_ips') and hasattr(target_player, 'associated_ips'):
             for ip, nicks in source_player.associated_ips.items():
                 if ip in target_player.associated_ips:
@@ -894,6 +966,7 @@ class Scanner:
                     target_player.associated_ips[ip] = list(combined_nicks)
                 else:
                     target_player.associated_ips[ip] = nicks
+
         if hasattr(source_player, 'associated_hwids') and hasattr(target_player, 'associated_hwids'):
             for hwid, nicks in source_player.associated_hwids.items():
                 if hwid in target_player.associated_hwids:
@@ -902,6 +975,7 @@ class Scanner:
                     target_player.associated_hwids[hwid] = list(combined_nicks)
                 else:
                     target_player.associated_hwids[hwid] = nicks
+
         if hasattr(source_player, 'complaint_links') and source_player.complaint_links:
             if not hasattr(target_player, 'complaint_links'):
                 target_player.complaint_links = []
@@ -914,6 +988,7 @@ class Scanner:
                 if link_tuple not in existing_links:
                     target_player.complaint_links.append(link)
                     existing_links.add(link_tuple)
+
         if hasattr(source_player, 'ban_reasons') and source_player.ban_reasons:
             if not hasattr(target_player, 'ban_reasons'):
                 target_player.ban_reasons = []
