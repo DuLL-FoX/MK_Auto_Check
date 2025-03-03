@@ -512,7 +512,6 @@ class ReportService:
                 "status": banned_player.status,
                 "ban_counts": banned_player.ban_counts,
                 "ban_reasons": banned_player.ban_reasons,
-                "suspected_vpn": banned_player.suspected_vpn,
                 "connection_link": banned_player.connection_link,
                 "bypass_confidence": check.bypass_confidence,
                 "potential_bypassers": potential_bypassers_data,

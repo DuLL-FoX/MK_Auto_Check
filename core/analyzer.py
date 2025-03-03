@@ -131,7 +131,7 @@ class PlayerAnalyzer:
         bypasser_nicknames: Set[str] = set()
         highest_confidence = self.confidence_levels['no_match']
 
-        banned_user_name = ban_hit.user_name
+        banned_user_name = ban_hit.banned_user_name or ban_hit.user_name
         all_banned_hwids, all_banned_ips = self._extract_banned_identifiers(ban_hit, banned_player)
 
         connection_maps = self._build_connection_maps(connections, banned_user_name)
@@ -141,8 +141,9 @@ class PlayerAnalyzer:
         user_ips = connection_maps['user_ips']
         user_status = connection_maps['user_status']
         user_connections = connection_maps['user_connections']
-
-        hwid_matched_users = self._find_hwid_matched_users(all_banned_hwids, hwid_to_users)
+        user_ids = connection_maps['user_ids']
+        hwid_matched_users = self._find_hwid_matched_users(all_banned_hwids, hwid_to_users, user_hwids,
+                                                           banned_user_name)
 
         ban_time = ban_hit.time if ban_hit.time else ban_hit.ban_time
 
@@ -178,7 +179,16 @@ class PlayerAnalyzer:
         # HWID matches (100% confidence)
         for nick in hwid_matched_users:
             if nick not in bypasser_nicknames and nick != banned_user_name:
-                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                user_id = user_ids.get(nick, "")
+                if not user_id:
+                    user_id = self._find_user_id_for_nickname(nick, connections)
+
+                bypasser = self._create_bypasser_player(
+                    nick,
+                    user_id=user_id,
+                    is_banned=(user_status.get(nick) == "banned")
+                )
+
                 potential_bypassers.append(bypasser)
                 bypasser_nicknames.add(nick)
                 highest_confidence = self.confidence_levels['hwid_match']
@@ -186,7 +196,16 @@ class PlayerAnalyzer:
         # Very close time IP matches (80-90% confidence)
         for nick in very_close_time_matches:
             if nick not in bypasser_nicknames and nick != banned_user_name:
-                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                user_id = user_ids.get(nick, "")
+                if not user_id:
+                    user_id = self._find_user_id_for_nickname(nick, connections)
+
+                bypasser = self._create_bypasser_player(
+                    nick,
+                    user_id=user_id,
+                    is_banned=(user_status.get(nick) == "banned")
+                )
+
                 potential_bypassers.append(bypasser)
                 bypasser_nicknames.add(nick)
                 if highest_confidence == self.confidence_levels['no_match']:
@@ -195,7 +214,16 @@ class PlayerAnalyzer:
         # Close time IP matches (60-70% confidence)
         for nick in close_time_matches:
             if nick not in bypasser_nicknames and nick != banned_user_name:
-                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                user_id = user_ids.get(nick, "")
+                if not user_id:
+                    user_id = self._find_user_id_for_nickname(nick, connections)
+
+                bypasser = self._create_bypasser_player(
+                    nick,
+                    user_id=user_id,
+                    is_banned=(user_status.get(nick) == "banned")
+                )
+
                 potential_bypassers.append(bypasser)
                 bypasser_nicknames.add(nick)
                 if highest_confidence in [self.confidence_levels['no_match'], self.confidence_levels['ip_match']]:
@@ -204,7 +232,16 @@ class PlayerAnalyzer:
         # Moderate time IP matches (40-50% confidence)
         for nick in moderate_time_matches:
             if nick not in bypasser_nicknames and nick != banned_user_name:
-                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                user_id = user_ids.get(nick, "")
+                if not user_id:
+                    user_id = self._find_user_id_for_nickname(nick, connections)
+
+                bypasser = self._create_bypasser_player(
+                    nick,
+                    user_id=user_id,
+                    is_banned=(user_status.get(nick) == "banned")
+                )
+
                 potential_bypassers.append(bypasser)
                 bypasser_nicknames.add(nick)
                 if highest_confidence in [self.confidence_levels['no_match'], self.confidence_levels['ip_match']]:
@@ -213,7 +250,16 @@ class PlayerAnalyzer:
         # Distant time IP matches (20-30% confidence)
         for nick in distant_time_matches:
             if nick not in bypasser_nicknames and nick != banned_user_name:
-                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                user_id = user_ids.get(nick, "")
+                if not user_id:
+                    user_id = self._find_user_id_for_nickname(nick, connections)
+
+                bypasser = self._create_bypasser_player(
+                    nick,
+                    user_id=user_id,
+                    is_banned=(user_status.get(nick) == "banned")
+                )
+
                 potential_bypassers.append(bypasser)
                 bypasser_nicknames.add(nick)
                 if highest_confidence in [self.confidence_levels['no_match'], self.confidence_levels['ip_match']]:
@@ -222,7 +268,16 @@ class PlayerAnalyzer:
         # Simple IP matches (10-20% confidence)
         for nick in ip_matched_users:
             if nick not in bypasser_nicknames and nick != banned_user_name:
-                bypasser = self._create_bypasser_player(nick, user_status.get(nick) == "banned")
+                user_id = user_ids.get(nick, "")
+                if not user_id:
+                    user_id = self._find_user_id_for_nickname(nick, connections)
+
+                bypasser = self._create_bypasser_player(
+                    nick,
+                    user_id=user_id,
+                    is_banned=(user_status.get(nick) == "banned")
+                )
+
                 potential_bypassers.append(bypasser)
                 bypasser_nicknames.add(nick)
                 if highest_confidence == self.confidence_levels['no_match']:
@@ -232,6 +287,13 @@ class PlayerAnalyzer:
             self._enrich_bypasser_player(bypasser, user_connections, hwid_to_users, ip_to_users)
 
         return highest_confidence, potential_bypassers
+
+    def _find_user_id_for_nickname(self, nickname: str, connections: List[Dict[str, Any]]) -> str:
+        """Find user_id for a nickname from connections data."""
+        for conn in connections:
+            if conn.get("user_name") == nickname and conn.get("user_id", "N/A") != "N/A":
+                return conn.get("user_id")
+        return ""
 
     def _extract_banned_identifiers(self, ban_hit: BanHit, banned_player: Player) -> Tuple[Set[str], Set[str]]:
         all_banned_hwids = {hwid for hwid in banned_player.associated_hwids if hwid != "N/A"}
@@ -249,9 +311,11 @@ class PlayerAnalyzer:
         user_ips = defaultdict(set)
         user_status = {}
         user_connections = defaultdict(list)
+        user_ids = {}  # New map to store user_id -> nickname
 
         for conn in connections:
             user_name = conn.get("user_name", "")
+            user_id = conn.get("user_id", "")
             conn_hwid = conn.get("hwid", "N/A")
             conn_ip = conn.get("ip_address", "N/A")
             conn_status = conn.get("status", "")
@@ -260,6 +324,10 @@ class PlayerAnalyzer:
                 continue
 
             user_connections[user_name].append(conn)
+
+            # Store user_id for each nickname
+            if user_id and user_id != "N/A":
+                user_ids[user_name] = user_id
 
             if conn_hwid != "N/A":
                 hwid_to_users[conn_hwid].add(user_name)
@@ -278,16 +346,33 @@ class PlayerAnalyzer:
             'user_hwids': user_hwids,
             'user_ips': user_ips,
             'user_status': user_status,
-            'user_connections': user_connections
+            'user_connections': user_connections,
+            'user_ids': user_ids  # Add user_ids to the returned maps
         }
 
-    def _find_hwid_matched_users(self, all_banned_hwids: Set[str], hwid_to_users: Dict[str, Set[str]]) -> Set[str]:
+    def _find_hwid_matched_users(self, all_banned_hwids: Set[str],
+                                 hwid_to_users: Dict[str, Set[str]],
+                                 user_hwids: Dict[str, Set[str]],
+                                 banned_user_name: str) -> Set[str]:
+        """
+        Find users who share the same HWID with the banned user.
+        This is a true hardware match (using the same physical device).
+        """
         hwid_matched_users = set()
+
+        # Only consider users who actually have the exact same HWID values
         for hwid in all_banned_hwids:
-            hwid_matched_users.update(hwid_to_users.get(hwid, set()))
+            users_with_this_hwid = hwid_to_users.get(hwid, set())
+            for user in users_with_this_hwid:
+                if user != banned_user_name:  # Don't include the banned user themselves
+                    # Verify this is an actual HWID match by checking if user has this HWID
+                    if hwid in user_hwids.get(user, set()):
+                        hwid_matched_users.add(user)
+
         return hwid_matched_users
 
     def _find_ip_matched_users(self, all_banned_ips: Set[str], ip_to_users: Dict[str, Set[str]]) -> Set[str]:
+        """Find users who share IPs with the banned user."""
         ip_matched_users = set()
         for ip in all_banned_ips:
             ip_matched_users.update(ip_to_users.get(ip, set()))
@@ -332,22 +417,37 @@ class PlayerAnalyzer:
 
         return time_matches
 
-    def _create_bypasser_player(self, nickname: str, is_denied_banned: bool) -> Player:
+    def _create_bypasser_player(self, nickname: str, user_id: str = "", is_banned: bool = False) -> Player:
+        """
+        Create a bypasser player with improved initialization.
+        Now includes user_id when available.
+        """
+        status = "banned" if is_banned else "suspicious"
+
         return Player(
-            user_id="UNKNOWN",
+            user_id=user_id if user_id else "UNKNOWN",
             nicknames=[nickname],
-            status="banned" if is_denied_banned else "suspicious",
-            ban_counts=1 if is_denied_banned else 0
+            status=status,
+            ban_counts=1 if is_banned else 0
         )
 
     def _enrich_bypasser_player(self, bypasser: Player, user_connections: Dict[str, List[Dict[str, Any]]],
                                 hwid_to_users: Dict[str, Set[str]], ip_to_users: Dict[str, Set[str]]) -> None:
+        """
+        Enrich bypasser player with additional connection data.
+        Improved to better handle nickname and connection data.
+        """
         nick = bypasser.nicknames[0] if bypasser.nicknames else "Unknown"
         bypasser_hwids = {}
         bypasser_ips = {}
         denied_logins = []
 
+        # First, gather connection data
         for conn in user_connections.get(nick, []):
+            # Get user_id if available and not already set
+            if bypasser.user_id == "UNKNOWN" and conn.get("user_id", "N/A") != "N/A":
+                bypasser.user_id = conn.get("user_id")
+
             if "Denied: Banned" in conn.get("status", ""):
                 denied_logins.append({
                     "user_name": nick,

@@ -445,7 +445,6 @@ class AdminService:
             status=account_info.get("status", "unknown"),
             ban_counts=account_info.get("ban_counts", 0),
             ban_reasons=account_info.get("ban_reasons", []),
-            suspected_vpn=account_info.get("suspected_vpn", False),
             connection_link=account_info.get("connection_link", "N/A"),
             associated_ips=account_info.get("associated_ips", {}),
             associated_hwids=account_info.get("associated_hwids", {}),

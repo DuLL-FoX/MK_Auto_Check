@@ -641,16 +641,21 @@ class Scanner:
                 account_info = self.admin_panel.aggregate_single_user_info(initial_connections)
                 banned_player = self.admin_service.convert_to_player(account_info)
 
-                if hit.user_name and hit.user_name != "N/A":
-                    if hit.user_name in banned_player.nicknames:
-                        banned_player.nicknames.remove(hit.user_name)
-                    banned_player.nicknames.insert(0, hit.user_name)
+                if hit.banned_user_name and hit.banned_user_name != "N/A":
+                    banned_user_name = hit.banned_user_name
+                else:
+                    banned_user_name = hit.user_name
+
+                if banned_user_name and banned_user_name != "N/A":
+                    if banned_user_name in banned_player.nicknames:
+                        banned_player.nicknames.remove(banned_user_name)
+                    banned_player.nicknames.insert(0, banned_user_name)
 
                 bypass_confidence, potential_bypassers = self.player_analyzer.find_potential_bypassers(
                     hit, banned_player, initial_connections
                 )
 
-                nickname_to_search = hit.banned_user_name or hit.user_name
+                nickname_to_search = banned_user_name or hit.user_name
                 complaint_links = await self.discord_service.find_nickname_mentions(
                     [nickname_to_search], self.complaint_channels
                 )
@@ -673,15 +678,42 @@ class Scanner:
         results = await gather_with_concurrency(self.max_concurrent_requests, *processing_tasks)
         ban_bypass_checks = [result for result in results if result]
 
+        refined_checks = []
+        for check in ban_bypass_checks:
+            filtered_bypassers = []
+            banned_user_name = check.banned_player.nicknames[0] if check.banned_player.nicknames else ""
+            banned_user_id = check.banned_player.user_id if check.banned_player.user_id != "UNKNOWN" else ""
+
+            for bypasser in check.potential_bypassers:
+                bypasser_name = bypasser.nicknames[0] if bypasser.nicknames else ""
+                bypasser_id = bypasser.user_id if bypasser.user_id != "UNKNOWN" else ""
+
+                if (not bypasser_name or bypasser_name != banned_user_name) and \
+                        (not bypasser_id or not banned_user_id or bypasser_id != banned_user_id):
+                    filtered_bypassers.append(bypasser)
+
+            if filtered_bypassers:
+                check.potential_bypassers = filtered_bypassers
+                refined_checks.append(check)
+            else:
+                if check.bypass_confidence in [
+                    ConfidenceLevel.HWID_MATCH.value,
+                    ConfidenceLevel.IP_VERY_CLOSE_TIME.value,
+                    ConfidenceLevel.IP_CLOSE_TIME.value
+                ]:
+                    check.bypass_confidence = ConfidenceLevel.NO_MATCH.value
+                    check.potential_bypassers = []
+                    refined_checks.append(check)
+
         self.logger.info(
             f"Connection cache stats: {cache_stats['connection_hits']} hits, "
             f"{cache_stats['connection_misses']} misses"
         )
         self.cache_service.save_complaint_cache(self.complaint_channels)
-        confidence_counts = self._count_confidence_levels(ban_bypass_checks)
+        confidence_counts = self._count_confidence_levels(refined_checks)
         duration = (datetime.now() - start_time).total_seconds()
         self.perf_logger.info(
-            f"Ban bypass check completed in {duration:.2f}s with {len(ban_bypass_checks)} potential bypasses found"
+            f"Ban bypass check completed in {duration:.2f}s with {len(refined_checks)} potential bypasses found"
         )
 
         self.logger.info(
@@ -694,7 +726,7 @@ class Scanner:
             f"No Match: {confidence_counts['no_match']}"
         )
 
-        return ban_bypass_checks
+        return refined_checks
 
     def _deduplicate_ban_hits(self, ban_hits: List[Any]) -> Dict[str, Any]:
         unique_ban_hits = {}

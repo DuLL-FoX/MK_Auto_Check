@@ -9,7 +9,6 @@ class Player:
     status: str = "unknown"
     ban_counts: int = 0
     ban_reasons: List[str] = field(default_factory=list)
-    suspected_vpn: bool = False
     connection_link: str = "N/A"
     associated_ips: Dict[str, List[str]] = field(default_factory=dict)
     associated_hwids: Dict[str, List[str]] = field(default_factory=dict)
