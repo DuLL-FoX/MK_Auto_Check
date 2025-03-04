@@ -38,7 +38,7 @@ class CacheService:
                     complaint_channels[ch_id] = ComplaintChannel(
                         id=ch_str_id,
                         name=ch_data.get("name", f"Channel {ch_str_id}"),
-                        guild_id=ch_data.get("guild_id", "0"),
+                        guild_id=ch_data.get("guild_id", ""),
                         messages=messages,
                         last_cached_id=ch_data.get("last_cached_id")
                     )

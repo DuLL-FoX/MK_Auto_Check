@@ -161,6 +161,13 @@ class DiscordService:
             if not channel_data.messages:
                 continue
 
+            guild_id = channel_data.guild_id
+            if not guild_id or guild_id == "0":
+                discord_channel = self.client.get_channel(int(channel_id))
+                if discord_channel and hasattr(discord_channel, 'guild'):
+                    guild_id = str(discord_channel.guild.id)
+                    channel_data.guild_id = guild_id
+
             for message in channel_data.messages:
                 message_count += 1
                 if message_count % 20 == 0:
@@ -204,7 +211,7 @@ class DiscordService:
 
                     if mentioned_nicknames:
                         result.append({
-                            "link": f"https://discord.com/channels/{channel_data.guild_id}/{channel_id}/{message.id}",
+                            "link": f"https://discord.com/channels/{guild_id}/{channel_id}/{message.id}",
                             "channel": channel_data.name,
                             "content": searchable_text,
                             "message_id": message.id,
