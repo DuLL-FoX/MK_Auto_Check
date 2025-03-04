@@ -130,66 +130,94 @@ class DiscordService:
             complaint_channels: Dict[int, ComplaintChannel],
             search_term: Optional[str] = None
     ) -> List[Dict[str, Any]]:
+        import asyncio
+
         if not nicknames or not complaint_channels:
             return []
 
         result = []
         patterns = {}
         for nickname in nicknames:
-            escaped_nick = re.escape(nickname)
-            patterns[nickname] = re.compile(r'\b' + escaped_nick + r'\b', re.IGNORECASE)
+            if not nickname or not isinstance(nickname, str):
+                continue
+            try:
+                escaped_nick = re.escape(nickname)
+                patterns[nickname] = re.compile(r'\b' + escaped_nick + r'\b', re.IGNORECASE)
+            except Exception as e:
+                logging.warning(f"Error compiling regex for nickname '{nickname}': {e}")
+                continue
 
         search_pattern = None
-        if search_term:
-            search_pattern = re.compile(re.escape(search_term), re.IGNORECASE)
-            logging.info(f"Filtering complaints for search term: '{search_term}'")
+        if search_term and isinstance(search_term, str):
+            try:
+                search_pattern = re.compile(re.escape(search_term), re.IGNORECASE)
+                logging.info(f"Filtering complaints for search term: '{search_term}'")
+            except Exception as e:
+                logging.warning(f"Error compiling regex for search term '{search_term}': {e}")
+                search_term = None
 
+        message_count = 0
         for channel_id, channel_data in complaint_channels.items():
             if not channel_data.messages:
                 continue
 
             for message in channel_data.messages:
-                searchable_text = message.content or ""
+                message_count += 1
+                if message_count % 20 == 0:
+                    await asyncio.sleep(0)
 
-                if hasattr(message, 'embeds') and message.embeds:
-                    for embed in message.embeds:
-                        if isinstance(embed, dict):
-                            if 'description' in embed and embed['description']:
-                                searchable_text += " " + embed['description']
+                try:
+                    searchable_text = message.content or ""
 
-                            if 'fields' in embed and isinstance(embed['fields'], list):
-                                for field in embed['fields']:
-                                    if isinstance(field, dict):
-                                        if 'name' in field and field['name']:
-                                            searchable_text += " " + field['name']
-                                        if 'value' in field and field['value']:
-                                            searchable_text += " " + field['value']
+                    if hasattr(message, 'embeds') and message.embeds:
+                        for embed in message.embeds:
+                            if isinstance(embed, dict):
+                                if 'description' in embed and embed['description']:
+                                    searchable_text += " " + str(embed['description'])
 
-                            if 'title' in embed and embed['title']:
-                                searchable_text += " " + embed['title']
+                                if 'fields' in embed and isinstance(embed['fields'], list):
+                                    for field in embed['fields']:
+                                        if isinstance(field, dict):
+                                            if 'name' in field and field['name']:
+                                                searchable_text += " " + str(field['name'])
+                                            if 'value' in field and field['value']:
+                                                searchable_text += " " + str(field['value'])
 
-                if not searchable_text:
+                                if 'title' in embed and embed['title']:
+                                    searchable_text += " " + str(embed['title'])
+
+                    if not searchable_text:
+                        continue
+
+                    if search_term and search_term.lower() not in searchable_text.lower():
+                        continue
+
+                    mentioned_nicknames = []
+                    for nickname, pattern in patterns.items():
+                        if nickname.lower() in searchable_text.lower():
+                            try:
+                                if pattern.search(searchable_text):
+                                    mentioned_nicknames.append(nickname)
+                            except Exception as e:
+                                logging.warning(f"Error searching for nickname '{nickname}': {e}")
+                                mentioned_nicknames.append(nickname)
+
+                    if mentioned_nicknames:
+                        result.append({
+                            "link": f"https://discord.com/channels/{channel_data.guild_id}/{channel_id}/{message.id}",
+                            "channel": channel_data.name,
+                            "content": searchable_text,
+                            "message_id": message.id,
+                            "message_id_as_timestamp": int(message.id),
+                            "author": message.author.name if hasattr(message, 'author') else "Unknown",
+                            "mentioned_nicknames": mentioned_nicknames
+                        })
+                except Exception as e:
+                    logging.warning(f"Error processing message {message.id}: {e}")
                     continue
 
-                if search_term and search_term.lower() not in searchable_text.lower():
-                    continue
-
-                mentioned_nicknames = []
-                for nickname, pattern in patterns.items():
-                    if pattern.search(searchable_text):
-                        mentioned_nicknames.append(nickname)
-
-                if mentioned_nicknames:
-                    shortened_content = searchable_text[:200] + "..." if len(searchable_text) > 200 else searchable_text
-                    result.append({
-                        "link": f"https://discord.com/channels/{channel_data.guild_id}/{channel_id}/{message.id}",
-                        "channel": channel_data.name,
-                        "content": searchable_text,
-                        "message_id": message.id,
-                        "message_id_as_timestamp": int(message.id),
-                        "author": message.author.name if hasattr(message, 'author') else "Unknown",
-                        "mentioned_nicknames": mentioned_nicknames
-                    })
+                if len(result) % 10 == 0 and len(result) > 0:
+                    await asyncio.sleep(0)
 
         result.sort(key=lambda x: x.get("message_id_as_timestamp", 0), reverse=True)
 

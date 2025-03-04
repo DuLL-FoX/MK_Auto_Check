@@ -54,8 +54,8 @@ def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:
             logging.debug(f"Collected link: {normalized} with key: {key}")
 
     for field in embed.fields:
-        if field.name.lower() == "name":
-            continue
+        # if field.name.lower() == "name":
+        #     continue
         if field.value == "[Unknown](https://admin.deadspace14.net/Connections?showSet=true&search=Unknown&showAccepted=true&showBanned=true&showWhitelist=true&showFull=true&showPanic=true)":
             continue
         if field.value:

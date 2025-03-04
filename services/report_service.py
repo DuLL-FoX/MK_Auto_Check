@@ -113,6 +113,16 @@ class ReportService:
             f"  {fmt['BOLD']}{fmt['CYAN']}{box['V']}{' ' * padding} {player_header} {' ' * right_padding}{box['V']}{fmt['END']}")
         print(f"  {fmt['BOLD']}{fmt['CYAN']}{box['VR']}{box['H'] * (width - 2)}{box['VL']}{fmt['END']}")
 
+    def _print_section_header(self, title, width=76):
+        box = self.box
+        fmt = self.fmt
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * (width - 2)}{box['VL']}{fmt['END']}")
+        padding = (width - len(title) - 4) // 2
+        right_padding = width - padding - len(title) - 4
+        print(
+            f"  {fmt['BOLD']}{box['V']}{' ' * padding} {title} {' ' * right_padding}{box['V']}{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * (width - 2)}{box['VL']}{fmt['END']}")
+
     def write_json_report(self, data: List[Dict[str, Any]], filename: Optional[str] = None) -> bool:
         report_file = filename or self.report_filename
         try:
@@ -251,9 +261,11 @@ class ReportService:
         fmt = self.fmt
         status_str = self._format_status(player.status, getattr(player, 'hwid_erased', False))
         self._print_header(f"SCAN RESULTS FOR: {nickname}", 100)
+
         print(f"  {fmt['BOLD']}STATUS:{fmt['END']} {status_str} | {fmt['BOLD']}BANS:{fmt['END']} {player.ban_counts}")
         if hasattr(player, 'ban_reasons') and player.ban_reasons:
             print(f"  {fmt['BOLD']}BAN REASONS:{fmt['END']} {', '.join(player.ban_reasons)}")
+
         if len(player.nicknames) > 1:
             print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
             print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED NICKNAMES:{fmt['END']}")
@@ -261,10 +273,15 @@ class ReportService:
             if other_nicks:
                 print(f"  {box['V']}   {', '.join(other_nicks)}")
             print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
+
         self._print_complaints_section(player, nickname)
+
         self._print_ip_section(player, nickname)
+
         self._print_hwid_section(player, nickname)
+
         self._print_denied_logins_section(player, nickname)
+
         print(f"\n{'=' * 100}")
 
     def _print_complaints_section(self, player: Player, nickname: str) -> None:
@@ -309,138 +326,221 @@ class ReportService:
     def _print_ip_section(self, player: Player, nickname: str) -> None:
         box = self.box
         fmt = self.fmt
+
         if not hasattr(player, 'associated_ips') or not player.associated_ips:
             return
-        ip_count = len(player.associated_ips)
-        width = 96
-        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * width}{box['TR']}{fmt['END']}")
-        print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED IPs ({ip_count}):{fmt['END']}")
-        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * width}{box['VL']}{fmt['END']}")
 
-        owned_ips = []
-        alt_ips = []
-        other_ips = []
+        original_ips = []
+        shared_ips = []
+        alt_shared_ips = []
+        multi_user_ips = []
+
+        # Count IPs by category
+        solo_non_relevant_count = 0
+        total_ips = 0
 
         for ip, shared_with in player.associated_ips.items():
+            total_ips += 1
+
             if nickname in shared_with:
-                owned_ips.append((ip, shared_with))
-            elif any(nick in player.nicknames for nick in shared_with):
-                alt_ips.append((ip, shared_with))
-            else:
-                other_ips.append((ip, shared_with))
-
-        if owned_ips:
-            print(f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ IPs owned by {nickname}:{fmt['END']}")
-            for i, (ip, shared_with) in enumerate(owned_ips):
-                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
-                others = [nick for nick in shared_with if nick != nickname]
-                if others:
-                    shared_str = self._truncate_list(others, 10)
-                    shared_str = self._truncate_text(shared_str, 70)
-                    print(f"  {box['V']}      {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                if len(shared_with) == 1:
+                    original_ips.append(ip)
                 else:
-                    print(f"  {box['V']}      {fmt['GREEN']}Only user{fmt['END']}")
-                if i < len(owned_ips) - 1:
+                    shared_ips.append((ip, shared_with))
+            elif any(nick in player.nicknames for nick in shared_with):
+                if len(shared_with) > 1:
+                    alt_shared_ips.append((ip, shared_with))
+            elif len(shared_with) > 1:
+                multi_user_ips.append((ip, shared_with))
+            else:
+                solo_non_relevant_count += 1
+
+        shared_ips.sort(key=lambda x: len(x[1]), reverse=True)
+        alt_shared_ips.sort(key=lambda x: len(x[1]), reverse=True)
+        multi_user_ips.sort(key=lambda x: len(x[1]), reverse=True)
+
+        meaningful_count = len(original_ips) + len(shared_ips) + len(alt_shared_ips) + len(multi_user_ips)
+
+        if meaningful_count == 0:
+            return
+
+        width = 96
+        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * width}{box['TR']}{fmt['END']}")
+        print(
+            f"  {fmt['BOLD']}{box['V']} ASSOCIATED IPs ({total_ips} total, {meaningful_count} with intersections):{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * width}{box['VL']}{fmt['END']}")
+
+        if original_ips:
+            print(
+                f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ PRIMARY IPs ({len(original_ips)}) - Used only by {nickname}:{fmt['END']}")
+            for i, ip in enumerate(original_ips, 1):
+                print(
+                    f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']} - {fmt['GREEN']}Only used by {nickname}{fmt['END']}")
+
+            if shared_ips or alt_shared_ips or multi_user_ips:
+                print(f"  {box['V']}")
+
+        if shared_ips:
+            print(
+                f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ SHARED IPs ({len(shared_ips)}) - Used by {nickname} and others:{fmt['END']}")
+            for i, (ip, users) in enumerate(shared_ips, 1):
+                others = [user for user in users if user != nickname]
+                others_str = self._truncate_list(others, 5)
+                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
+                print(f"  {box['V']}      {fmt['GREEN']}Used by {nickname}{fmt['END']}")
+                print(f"  {box['V']}      {fmt['YELLOW']}Also used by:{fmt['END']} {others_str}")
+                if i < len(shared_ips):
                     print(f"  {box['V']}")
 
-            if alt_ips or other_ips:
-                print(f"  {box['V']}{box['H'] * width}")
+            if alt_shared_ips or multi_user_ips:
+                print(f"  {box['V']}")
 
-        if alt_ips:
-            print(f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ IPs owned by alt accounts:{fmt['END']}")
-            for i, (ip, shared_with) in enumerate(alt_ips):
-                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
-                alt_owners = [nick for nick in shared_with if nick in player.nicknames]
-                others = [nick for nick in shared_with if nick not in player.nicknames]
-                print(f"  {box['V']}      {fmt['YELLOW']}Owner(s):{fmt['END']} {', '.join(alt_owners)}")
-                if others:
-                    shared_str = self._truncate_list(others, 10)
-                    shared_str = self._truncate_text(shared_str, 70)
-                    print(f"  {box['V']}      {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
-                if i < len(alt_ips) - 1:
-                    print(f"  {box['V']}")
+        if alt_shared_ips:
+            section_added = False
+            alt_section_header = (
+                f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ ALT ACCOUNT SHARED IPs ({len(alt_shared_ips)}):{fmt['END']}"
+            )
 
-            if other_ips:
-                print(f"  {box['V']}{box['H'] * width}")
+            for i, (ip, users) in enumerate(alt_shared_ips, 1):
+                alt_owners = [user for user in users if user in player.nicknames]
+                others = [user for user in users if user not in player.nicknames]
 
-        if other_ips:
-            print(f"  {box['V']} {fmt['BOLD']}■ Other associated IPs:{fmt['END']}")
-            for i, (ip, shared_with) in enumerate(other_ips):
-                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
-                users_str = self._truncate_list(shared_with, 10)
-                users_str = self._truncate_text(users_str, 70)
-                print(f"  {box['V']}      {fmt['BOLD']}Users:{fmt['END']} {users_str}")
-                player_alts = [nick for nick in shared_with if nick in player.nicknames]
-                if player_alts:
-                    print(
-                        f"  {box['V']}      {fmt['BOLD']}Note:{fmt['END']} Used by alt account(s): {', '.join(player_alts)}")
-                if i < len(other_ips) - 1:
-                    print(f"  {box['V']}")
+                if alt_owners and others:
+                    if not section_added:
+                        print(alt_section_header)
+                        section_added = True
+
+                    print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
+                    print(f"  {box['V']}      {fmt['YELLOW']}Used by alt(s):{fmt['END']} {', '.join(alt_owners)}")
+                    if others:
+                        others_str = self._truncate_list(others, 5)
+                        print(f"  {box['V']}      {fmt['YELLOW']}Also used by:{fmt['END']} {others_str}")
+                    if i < len(alt_shared_ips) - 1:
+                        print(f"  {box['V']}")
+
+            if section_added and multi_user_ips:
+                print(f"  {box['V']}")
+
+        if multi_user_ips and len(multi_user_ips) <= 10:
+            print(f"  {box['V']} {fmt['BOLD']}■ OTHER SHARED IPs ({len(multi_user_ips)}):{fmt['END']}")
+            for i, (ip, users) in enumerate(multi_user_ips, 1):
+                users_str = self._truncate_list(users, 5)
+                print(
+                    f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']} - Used by: {users_str}")
+        elif multi_user_ips:
+            print(f"  {box['V']} {fmt['BOLD']}■ OTHER SHARED IPs ({len(multi_user_ips)}):{fmt['END']}")
+            ip_ranges = {}
+            for ip, _ in multi_user_ips:
+                prefix = '.'.join(ip.split('.')[:2])
+                if prefix not in ip_ranges:
+                    ip_ranges[prefix] = []
+                ip_ranges[prefix].append(ip)
+
+            print(f"  {box['V']}   {fmt['BOLD']}IP Range Distribution:{fmt['END']}")
+            sorted_ranges = sorted(ip_ranges.items(), key=lambda x: len(x[1]), reverse=True)
+            for prefix, ips in sorted_ranges[:5]:
+                print(f"  {box['V']}      {prefix}.x.x: {len(ips)} IPs")
+
+            if len(sorted_ranges) > 5:
+                remaining = sum(len(ips) for prefix, ips in sorted_ranges[5:])
+                print(f"  {box['V']}      Other ranges: {remaining} IPs")
+
+        if solo_non_relevant_count > 0:
+            print(f"  {box['V']}")
+            print(
+                f"  {box['V']} {fmt['BOLD']}■ NOTE:{fmt['END']} {solo_non_relevant_count} additional IPs with single users not shown")
 
         print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * width}{box['BR']}{fmt['END']}")
 
     def _print_hwid_section(self, player: Player, nickname: str) -> None:
         box = self.box
         fmt = self.fmt
+
         if not hasattr(player, 'associated_hwids') or not player.associated_hwids:
             return
+
         hwid_count = len(player.associated_hwids)
         width = 96
+
         print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * width}{box['TR']}{fmt['END']}")
         print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED HWIDs ({hwid_count}):{fmt['END']}")
         print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * width}{box['VL']}{fmt['END']}")
-        owned_hwids = []
+
+        original_hwids = []
+        shared_hwids = []
         alt_hwids = []
         other_hwids = []
+
         for hwid, shared_with in player.associated_hwids.items():
             if nickname in shared_with:
-                owned_hwids.append((hwid, shared_with))
+                if len(shared_with) == 1:
+                    original_hwids.append((hwid, shared_with))
+                else:
+                    shared_hwids.append((hwid, shared_with))
             elif any(nick in player.nicknames for nick in shared_with):
                 alt_hwids.append((hwid, shared_with))
             else:
                 other_hwids.append((hwid, shared_with))
-        if owned_hwids:
-            print(f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ HWIDs owned by {nickname}:{fmt['END']}")
-            for i, (hwid, shared_with) in enumerate(owned_hwids):
+
+        if original_hwids:
+            print(
+                f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ PRIMARY HWIDs ({len(original_hwids)}) - Used only by {nickname}:{fmt['END']}")
+            for i, (hwid, _) in enumerate(original_hwids, 1):
+                formatted_hwid = self._format_hwid(hwid)
+                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
+                print(f"  {box['V']}      {fmt['GREEN']}Only used by {nickname}{fmt['END']}")
+                if i < len(original_hwids):
+                    print(f"  {box['V']}")
+            if shared_hwids or alt_hwids or other_hwids:
+                print(f"  {box['V']}{box['H'] * width}")
+
+        if shared_hwids:
+            print(
+                f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ SHARED HWIDs ({len(shared_hwids)}) - Used by {nickname} and others:{fmt['END']}")
+            for i, (hwid, shared_with) in enumerate(shared_hwids, 1):
                 formatted_hwid = self._format_hwid(hwid)
                 others = [nick for nick in shared_with if nick != nickname]
-                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {formatted_hwid}")
+                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
+                print(f"  {box['V']}      {fmt['GREEN']}Used by {nickname}{fmt['END']}")
                 if others:
                     shared_str = self._truncate_list(others, 10)
                     shared_str = self._truncate_text(shared_str, 70)
-                    print(f"  {box['V']}      {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
-                else:
-                    print(f"  {box['V']}      {fmt['GREEN']}Only user{fmt['END']}")
-                if i < len(owned_hwids) - 1:
+                    print(f"  {box['V']}      {fmt['YELLOW']}Also used by:{fmt['END']} {shared_str}")
+                if i < len(shared_hwids):
                     print(f"  {box['V']}")
             if alt_hwids or other_hwids:
                 print(f"  {box['V']}{box['H'] * width}")
+
         if alt_hwids:
-            print(f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ HWIDs owned by alt accounts:{fmt['END']}")
-            for i, (hwid, shared_with) in enumerate(alt_hwids):
+            print(
+                f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ ALT ACCOUNT HWIDs ({len(alt_hwids)}) - Used by alts but not by {nickname}:{fmt['END']}")
+            for i, (hwid, shared_with) in enumerate(alt_hwids, 1):
                 formatted_hwid = self._format_hwid(hwid)
                 alt_owners = [nick for nick in shared_with if nick in player.nicknames]
                 others = [nick for nick in shared_with if nick not in player.nicknames]
-                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {formatted_hwid}")
-                print(f"  {box['V']}      {fmt['YELLOW']}Owner(s):{fmt['END']} {', '.join(alt_owners)}")
+                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
+                print(f"  {box['V']}      {fmt['YELLOW']}Used by alt(s):{fmt['END']} {', '.join(alt_owners)}")
                 if others:
                     shared_str = self._truncate_list(others, 10)
                     shared_str = self._truncate_text(shared_str, 70)
-                    print(f"  {box['V']}      {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
-                if i < len(alt_hwids) - 1:
+                    print(f"  {box['V']}      {fmt['YELLOW']}Also used by:{fmt['END']} {shared_str}")
+                if i < len(alt_hwids):
                     print(f"  {box['V']}")
             if other_hwids:
                 print(f"  {box['V']}{box['H'] * width}")
+
         if other_hwids:
-            print(f"  {box['V']} {fmt['BOLD']}■ Other associated HWIDs:{fmt['END']}")
-            for i, (hwid, shared_with) in enumerate(other_hwids):
+            print(
+                f"  {box['V']} {fmt['BOLD']}■ OTHER HWIDs ({len(other_hwids)}) - Not associated with {nickname} or alts:{fmt['END']}")
+            for i, (hwid, shared_with) in enumerate(other_hwids, 1):
                 formatted_hwid = self._format_hwid(hwid)
-                print(f"  {box['V']}   {fmt['BOLD']}{i + 1}.{fmt['END']} {formatted_hwid}")
                 users_str = self._truncate_list(shared_with, 10)
                 users_str = self._truncate_text(users_str, 70)
-                print(f"  {box['V']}      {fmt['BOLD']}Users:{fmt['END']} {users_str}")
-                if i < len(other_hwids) - 1:
+                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
+                print(f"  {box['V']}      {fmt['BOLD']}Used by:{fmt['END']} {users_str}")
+                if i < len(other_hwids):
                     print(f"  {box['V']}")
+
         print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * width}{box['BR']}{fmt['END']}")
 
     def _print_denied_logins_section(self, player: Player, nickname: str) -> None:
@@ -645,6 +745,7 @@ class ReportService:
                 if hasattr(player, 'hwid_erased') and player.hwid_erased:
                     hwid_erased = f" {fmt['YELLOW']}(HWID ERASED){fmt['END']}"
                 self._print_player_header(player.primary_nickname)
+
                 print(
                     f"  {box['V']} {fmt['BOLD']}STATUS:{fmt['END']} {status_str}{hwid_erased} {box['V']} {fmt['BOLD']}BANS:{fmt['END']} {player.ban_counts}")
                 if hasattr(player, 'ban_reasons') and player.ban_reasons:
@@ -655,11 +756,12 @@ class ReportService:
                     if alt_nicks:
                         alt_names_text = f"{fmt['BOLD']}ALT NAMES:{fmt['END']} {', '.join(alt_nicks)}"
                         print(f"  {box['V']} {alt_names_text}")
-                print(f"  {box['VR']}{box['H'] * 74}{box['VL']}")
+
                 if hasattr(player, 'complaint_links') and player.complaint_links:
                     total_complaints += len(player.complaint_links)
+                    self._print_section_header("COMPLAINTS")
                     print(
-                        f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}COMPLAINTS ({len(player.complaint_links)}):{fmt['END']}")
+                        f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}FOUND ({len(player.complaint_links)}):{fmt['END']}")
                     for i, complaint in enumerate(player.complaint_links, 1):
                         link = complaint.get("link", "No link")
                         channel = complaint.get("channel", "Unknown channel")
@@ -686,63 +788,141 @@ class ReportService:
                             print(
                                 f"  {box['V']}   {box['V']} {fmt['BOLD']}Associated with:{fmt['END']} {', '.join(mentioned_nicks)}")
                         print(f"  {box['V']}   {box['BL']}{box['H'] * 70}{box['BR']}")
-                    print(f"  {box['VR']}{box['H'] * 74}{box['VL']}")
-                has_details = False
+
+                has_indirect = False
+                if hasattr(player, 'associated_ips') and player.associated_ips or \
+                        hasattr(player, 'associated_hwids') and player.associated_hwids or \
+                        hasattr(player, 'denied_logins') and player.denied_logins:
+                    self._print_section_header("CONNECTION INFORMATION")
+                    has_indirect = True
+
+                multi_user_ips = {}
+                single_user_ips = {}
+                single_user_count = 0
                 if hasattr(player, 'associated_ips') and player.associated_ips:
+                    for ip, shared_with in player.associated_ips.items():
+                        if len(shared_with) > 1:
+                            multi_user_ips[ip] = shared_with
+                        else:
+                            single_user_ips[ip] = shared_with
+                            single_user_count += 1
+
                     ip_count = len(player.associated_ips)
                     total_ips += ip_count
-                    has_details = True
-                    print(f"  {box['V']} {fmt['BOLD']}IPs ({ip_count}):{fmt['END']}")
-                    for ip, shared_with in player.associated_ips.items():
-                        unique_ips.add(ip)
-                        if player.primary_nickname in shared_with:
-                            if len(shared_with) <= 1:
-                                print(
-                                    f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['GREEN']}Owner/Only user:{fmt['END']} {player.primary_nickname}")
+
+                    if multi_user_ips:
+                        print(f"  {box['V']} {fmt['BOLD']}SHARED IPs ({len(multi_user_ips)}):{fmt['END']}")
+
+                        owned_ips = []
+                        alt_ips = []
+                        other_ips = []
+
+                        for ip, shared_with in multi_user_ips.items():
+                            if player.primary_nickname in shared_with:
+                                owned_ips.append((ip, shared_with))
+                            elif any(nick in player.nicknames for nick in shared_with):
+                                alt_ips.append((ip, shared_with))
                             else:
+                                other_ips.append((ip, shared_with))
+
+                        if owned_ips:
+                            print(
+                                f"  {box['V']}   {fmt['BOLD']}{fmt['GREEN']}■ Owned by {player.primary_nickname}:{fmt['END']}")
+                            for i, (ip, shared_with) in enumerate(owned_ips):
+                                unique_ips.add(ip)
                                 others = [nick for nick in shared_with if nick != player.primary_nickname]
                                 if others:
                                     shared_str = self._truncate_list(others, 5)
                                     print(
-                                        f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['GREEN']}Owner:{fmt['END']} {player.primary_nickname} | {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
-                        else:
-                            player_alts = [nick for nick in shared_with if nick in player.nicknames]
-                            other_users = [nick for nick in shared_with if nick not in player.nicknames]
-                            all_users = player_alts + other_users
-                            users_str = self._truncate_list(all_users, 5)
-                            print(
-                                f"  {box['V']}   • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['YELLOW']}Owner/Users:{fmt['END']} {users_str}")
+                                        f"  {box['V']}     • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                                else:
+                                    print(f"  {box['V']}     • {fmt['CYAN']}{ip}{fmt['END']}")
+                            print(f"  {box['V']}")
+
+                        if alt_ips:
+                            print(f"  {box['V']}   {fmt['BOLD']}{fmt['YELLOW']}■ Owned by alt accounts:{fmt['END']}")
+                            for i, (ip, shared_with) in enumerate(alt_ips):
+                                unique_ips.add(ip)
+                                alt_owners = [nick for nick in shared_with if nick in player.nicknames]
+                                others = [nick for nick in shared_with if nick not in player.nicknames]
+                                print(
+                                    f"  {box['V']}     • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['YELLOW']}Owner(s):{fmt['END']} {', '.join(alt_owners)}")
+                                if others:
+                                    shared_str = self._truncate_list(others, 5)
+                                    print(f"  {box['V']}       {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                            print(f"  {box['V']}")
+
+                        if other_ips:
+                            print(f"  {box['V']}   {fmt['BOLD']}■ Other associated IPs:{fmt['END']}")
+                            for i, (ip, shared_with) in enumerate(other_ips):
+                                unique_ips.add(ip)
+                                users_str = self._truncate_list(shared_with, 5)
+                                print(
+                                    f"  {box['V']}     • {fmt['CYAN']}{ip}{fmt['END']} - {fmt['BOLD']}Users:{fmt['END']} {users_str}")
+                            print(f"  {box['V']}")
+
+                    if single_user_count > 0:
+                        print(
+                            f"  {box['V']} {fmt['BOLD']}SINGLE-USER IPs:{fmt['END']} {single_user_count} IPs with only one user")
+                        print(f"  {box['V']}")
+
                 if hasattr(player, 'associated_hwids') and player.associated_hwids:
                     hwid_count = len(player.associated_hwids)
                     total_hwids += hwid_count
-                    if has_details:
-                        print(f"  {box['VR']}{box['H'] * 74}{box['VL']}")
-                    has_details = True
                     print(f"  {box['V']} {fmt['BOLD']}HWIDs ({hwid_count}):{fmt['END']}")
+
+                    owned_hwids = []
+                    alt_hwids = []
+                    other_hwids = []
+
                     for hwid, shared_with in player.associated_hwids.items():
-                        unique_hwids.add(hwid)
-                        formatted_hwid = self._format_hwid(hwid)
                         if player.primary_nickname in shared_with:
-                            if len(shared_with) <= 1:
-                                print(
-                                    f"  {box['V']}   • {formatted_hwid} - {fmt['GREEN']}Owner/Only user:{fmt['END']} {player.primary_nickname}")
-                            else:
-                                others = [nick for nick in shared_with if nick != player.primary_nickname]
-                                if others:
-                                    shared_str = self._truncate_list(others, 5)
-                                    print(
-                                        f"  {box['V']}   • {formatted_hwid} - {fmt['GREEN']}Owner:{fmt['END']} {player.primary_nickname} | {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                            owned_hwids.append((hwid, shared_with))
+                        elif any(nick in player.nicknames for nick in shared_with):
+                            alt_hwids.append((hwid, shared_with))
                         else:
-                            player_alts = [nick for nick in shared_with if nick in player.nicknames]
-                            other_users = [nick for nick in shared_with if nick not in player.nicknames]
-                            all_users = player_alts + other_users
-                            users_str = self._truncate_list(all_users, 5)
+                            other_hwids.append((hwid, shared_with))
+
+                    if owned_hwids:
+                        print(
+                            f"  {box['V']}   {fmt['BOLD']}{fmt['GREEN']}■ Owned by {player.primary_nickname}:{fmt['END']}")
+                        for i, (hwid, shared_with) in enumerate(owned_hwids):
+                            unique_hwids.add(hwid)
+                            formatted_hwid = self._format_hwid(hwid)
+                            others = [nick for nick in shared_with if nick != player.primary_nickname]
+                            if others:
+                                shared_str = self._truncate_list(others, 5)
+                                print(
+                                    f"  {box['V']}     • {formatted_hwid} - {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                            else:
+                                print(f"  {box['V']}     • {formatted_hwid} - {fmt['GREEN']}Only user{fmt['END']}")
+                        print(f"  {box['V']}")
+
+                    if alt_hwids:
+                        print(f"  {box['V']}   {fmt['BOLD']}{fmt['YELLOW']}■ Owned by alt accounts:{fmt['END']}")
+                        for i, (hwid, shared_with) in enumerate(alt_hwids):
+                            unique_hwids.add(hwid)
+                            formatted_hwid = self._format_hwid(hwid)
+                            alt_owners = [nick for nick in shared_with if nick in player.nicknames]
+                            others = [nick for nick in shared_with if nick not in player.nicknames]
                             print(
-                                f"  {box['V']}   • {formatted_hwid} - {fmt['YELLOW']}Owner/Users:{fmt['END']} {users_str}")
+                                f"  {box['V']}     • {formatted_hwid} - {fmt['YELLOW']}Owner(s):{fmt['END']} {', '.join(alt_owners)}")
+                            if others:
+                                shared_str = self._truncate_list(others, 5)
+                                print(f"  {box['V']}       {fmt['YELLOW']}Shared with:{fmt['END']} {shared_str}")
+                        print(f"  {box['V']}")
+
+                    if other_hwids:
+                        print(f"  {box['V']}   {fmt['BOLD']}■ Other associated HWIDs:{fmt['END']}")
+                        for i, (hwid, shared_with) in enumerate(other_hwids):
+                            unique_hwids.add(hwid)
+                            formatted_hwid = self._format_hwid(hwid)
+                            users_str = self._truncate_list(shared_with, 5)
+                            print(f"  {box['V']}     • {formatted_hwid} - {fmt['BOLD']}Users:{fmt['END']} {users_str}")
+                        print(f"  {box['V']}")
+
                 if hasattr(player, 'denied_logins') and player.denied_logins:
                     login_count = len(player.denied_logins)
-                    if has_details:
-                        print(f"  {box['VR']}{box['H'] * 74}{box['VL']}")
                     print(f"  {box['V']} {fmt['BOLD']}{fmt['RED']}DENIED LOGINS ({login_count}):{fmt['END']}")
                     for i, login in enumerate(player.denied_logins[:3], 1):
                         time_str = login.get("time", "N/A")
@@ -756,7 +936,9 @@ class ReportService:
                             print(f"  {box['V']}      {fmt['BOLD']}Used name:{fmt['END']} {user_name}")
                     if len(player.denied_logins) > 3:
                         print(f"  {box['V']}   ... and {len(player.denied_logins) - 3} more")
+
                 print(f"  {box['BL']}{box['H'] * 74}{box['BR']}")
+
         self._print_header(" SCAN SUMMARY ", 100)
         print(f"  {box['V']} {fmt['BOLD']}Messages processed:{fmt['END']} {len(scan_results)}")
         print(f"  {box['V']} {fmt['BOLD']}Players found:{fmt['END']} {total_players}")
