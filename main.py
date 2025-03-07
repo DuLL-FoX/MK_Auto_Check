@@ -40,12 +40,16 @@ def main():
         print(f"Configuration error: {e}")
         sys.exit(1)
 
+    # Override config values with command line arguments
     if args.message_limit is not None:
         cfg.scan.message_limit = args.message_limit
     if args.username is not None:
         cfg.scan.username = args.username
     if args.check_ban_bypass:
         cfg.scan.check_ban_bypass = True
+        if args.username is None and args.message_limit is None:
+            cfg.scan.username = None
+            cfg.scan.message_limit = None
     if args.ban_bypass_pages is not None:
         cfg.scan.ban_bypass_pages = args.ban_bypass_pages
 
@@ -71,6 +75,10 @@ def main():
         use_colors=cfg.logging.use_colors,
         log_dir=cfg.logging.log_dir
     )
+
+    logging.info("Starting Ban Checker Bot")
+    logging.info(
+        f"Scan mode: {'Ban Bypass Check' if cfg.scan.check_ban_bypass else ('Username: ' + cfg.scan.username if cfg.scan.username else 'Messages: ' + str(cfg.scan.message_limit))}")
 
     admin_panel = AdminPanel(
         cfg.auth.admin_username,

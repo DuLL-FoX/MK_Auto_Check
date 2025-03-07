@@ -1,35 +1,10 @@
 import logging
-from typing import Dict, Optional
+from typing import Dict
 from urllib.parse import urlparse, parse_qs
 
 import discord
 
 from utils.url_utils import extract_markdown_links, extract_plain_links, normalize_url
-
-
-def embed_contains_nickname(embed: discord.Embed, nickname: str) -> bool:
-    lower_nick = nickname.lower()
-
-    def check_text(text: Optional[str]) -> bool:
-        if not isinstance(text, str):
-            return False
-        return lower_nick in text.lower()
-
-    if check_text(embed.title) or check_text(embed.description):
-        return True
-
-    if embed.footer and check_text(embed.footer.text):
-        return True
-
-    if embed.author and check_text(embed.author.name):
-        return True
-
-    for field in embed.fields:
-        if check_text(field.name) or check_text(field.value):
-            return True
-
-    logging.debug(f"Embed does not contain nickname '{nickname}'.")
-    return False
 
 
 def collect_unique_links_from_embed(embed: discord.Embed) -> Dict[str, str]:

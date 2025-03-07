@@ -1,9 +1,9 @@
 import asyncio
 import functools
-import time
 import logging
-from typing import Any, List, Coroutine, Dict, Set, Callable, TypeVar, Optional, Tuple
+import time
 from collections import deque
+from typing import Any, List, Coroutine, Dict, Callable, TypeVar, Tuple
 
 T = TypeVar('T')
 
@@ -20,60 +20,6 @@ async def gather_with_concurrency(n: int, *coros) -> List[Any]:
         return []
     semaphore = asyncio.Semaphore(n)
     return await asyncio.gather(*(run_with_semaphore(semaphore, c) for c in coros))
-
-
-async def gather_with_progress(n: int, coros: List[Coroutine],
-                               progress_callback: Optional[Callable[[int, int], None]] = None) -> List[Any]:
-    if not coros:
-        return []
-    semaphore = asyncio.Semaphore(n)
-    total = len(coros)
-    completed = 0
-    results = []
-
-    async def _run_with_progress(coro, idx):
-        nonlocal completed
-        try:
-            async with semaphore:
-                result = await coro
-            results.append((idx, result))
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total)
-            return result
-        except Exception as e:
-            results.append((idx, None))
-            completed += 1
-            if progress_callback:
-                progress_callback(completed, total)
-            logger.error(f"Error in task {idx}: {str(e)}")
-            return None
-
-    tasks = [_run_with_progress(coro, i) for i, coro in enumerate(coros)]
-    await asyncio.gather(*tasks, return_exceptions=True)
-    results.sort(key=lambda x: x[0])
-    return [r[1] for r in results]
-
-
-async def batch_process(items: List[T], process_func: Callable[[T], Coroutine],
-                        batch_size: int = 20, concurrency: int = 10,
-                        progress_callback: Optional[Callable[[int, int], None]] = None) -> List[Any]:
-    if not items:
-        return []
-    results = []
-    total_items = len(items)
-    processed_items = 0
-    for i in range(0, total_items, batch_size):
-        batch = items[i:i + batch_size]
-        batch_results = await gather_with_concurrency(
-            concurrency,
-            *[process_func(item) for item in batch]
-        )
-        results.extend(batch_results)
-        processed_items += len(batch)
-        if progress_callback:
-            progress_callback(processed_items, total_items)
-    return results
 
 
 class RateLimiter:
@@ -134,16 +80,6 @@ class AsyncCache:
                 self.evictions += 1
             self.cache[key] = (value, time.time())
         return value
-
-    def get_stats(self) -> Dict[str, int]:
-        return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "size": len(self.cache),
-            "max_size": self.max_size,
-            "evictions": self.evictions,
-            "hit_ratio": self.hits / (self.hits + self.misses) if (self.hits + self.misses) > 0 else 0
-        }
 
     async def clear(self):
         async with self.lock:

@@ -35,30 +35,39 @@ class BanCheckerBot:
         logging.info(f"Logged in as: {self.client.user} (ID: {self.client.user.id})")
         target_channel_id = self.config.get("TARGET_CHANNEL_ID")
         complaint_channel_ids = self.config.get("COMPLAINT_CHANNEL_IDS", [])
+
         if not await self.scanner.setup(target_channel_id, complaint_channel_ids):
             logging.error("Failed to set up scanner. Exiting.")
             await self.close()
             return
+
         try:
             report_data: List[Dict[str, Any]] = []
-            original_checks = []
+
             if self.config.get("check_ban_bypass"):
-                original_checks = await self.scanner.check_ban_bypasses_raw(
+                logging.info("Starting ban bypass check")
+                report_data = await self.scanner.scan_ban_bypasses(
                     max_pages=self.config.get("ban_bypass_pages", 5)
                 )
-                report_data = self.report_service.generate_ban_bypass_report(original_checks)
             elif self.config.get("username"):
-                report_data = await self.scanner.scan_nickname(self.config.get("username"))
+                logging.info(f"Starting nickname scan for: {self.config.get('username')}")
+                report_data = await self.scanner.scan_nickname(
+                    self.config.get("username")
+                )
             elif self.config.get("message_limit") is not None:
+                logging.info(f"Starting message scan with limit: {self.config.get('message_limit')}")
                 report_data = await self.scanner.scan_messages(
                     message_limit=self.config.get("message_limit", 10)
                 )
             else:
                 logging.warning("No scan type specified or missing parameters.")
+
             if report_data:
                 self.report_service.write_json_report(report_data)
+                logging.info(f"Report with {len(report_data)} items written to file")
         except Exception as e:
             logging.error(f"Error during scan: {e}", exc_info=True)
+
         logging.info("Scan complete. Disconnecting from Discord.")
         await self.close()
 

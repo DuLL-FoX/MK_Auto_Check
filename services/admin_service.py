@@ -2,14 +2,12 @@ import asyncio
 import logging
 import time
 from collections import deque
-from datetime import datetime
 from typing import List, Dict, Any, Optional, Set
 from urllib.parse import urlparse, parse_qs, quote_plus
 
 from config_system import get_config
-from models.ban_hit import BanHit
 from models.player import Player
-from utils.async_utils import gather_with_concurrency, RateLimiter, AsyncCache
+from utils.async_utils import RateLimiter, AsyncCache
 
 
 class PerformanceTracker:
@@ -310,127 +308,6 @@ class AdminService:
                     denied_set.add(conn_key)
             target['denied_banned_connections'] = target_denied
 
-    @monitor_performance
-    async def fetch_associated_players(self, player_info: Dict[str, Any]) -> List[Dict[str, Any]]:
-        search_terms = set()
-        processed_terms = set()
-        for ip in player_info.get("associated_ips", {}):
-            if ip != "N/A" and ip not in processed_terms:
-                search_terms.add(ip)
-                processed_terms.add(ip)
-        for hwid in player_info.get("associated_hwids", {}):
-            if hwid != "N/A" and hwid not in processed_terms:
-                search_terms.add(hwid)
-                processed_terms.add(hwid)
-        if not search_terms:
-            return []
-        limited_terms = list(search_terms)[:20]
-        start_time = time.time()
-        results = await gather_with_concurrency(
-            100,
-            *[self.search_player(term) for term in limited_terms]
-        )
-        elapsed = time.time() - start_time
-        self.perf_tracker.record("fetch_associated_players", elapsed)
-        valid_results = [r for r in results if r]
-        if len(valid_results) < len(limited_terms):
-            self.logger.debug(f"Found {len(valid_results)} associated players from {len(limited_terms)} search terms")
-        return valid_results
-
-    @monitor_performance
-    async def fetch_ban_hits(self, max_pages: int = 5) -> List[BanHit]:
-        start_time = time.time()
-        self.logger.info(f"Fetching ban hits (max pages: {max_pages})")
-        raw_ban_hits = await asyncio.to_thread(
-            self.admin_panel.fetch_ban_hit_connections,
-            max_pages=max_pages
-        )
-        if not raw_ban_hits:
-            self.logger.info("No raw ban hits found")
-            return []
-
-        async def process_ban_hit(hit):
-            try:
-                return BanHit(
-                    ban_hit_id=hit.get("connection_id", "N/A"),
-                    ban_hit_link=hit.get("ban_hits_link", "N/A"),
-                    user_id=hit.get("user_id", "N/A"),
-                    user_name=hit.get("user_name", ""),
-                    ip_address=hit.get("ip_address", "N/A"),
-                    hwid=hit.get("hwid", "N/A"),
-                    time=datetime.strptime(hit.get("time", "1970-01-01 00:00:00"), "%Y-%m-%d %H:%M:%S"),
-                    hwid_erased=not hit.get("hwid") or hit.get("hwid").strip() == ""
-                )
-            except (ValueError, KeyError) as e:
-                self.logger.error(f"Error creating BanHit: {str(e)}")
-                return None
-
-        ban_hits_results = await gather_with_concurrency(
-            100,
-            *[process_ban_hit(hit) for hit in raw_ban_hits]
-        )
-        valid_hits = [hit for hit in ban_hits_results if hit]
-        elapsed = time.time() - start_time
-        self.perf_tracker.record("fetch_ban_hits", elapsed)
-        self.perf_logger.info(
-            f"Processed {len(valid_hits)} ban hits (from {len(raw_ban_hits)} raw hits) in {elapsed:.2f}s"
-        )
-        return valid_hits
-
-    @monitor_performance
-    async def fetch_ban_info(self, ban_hit: BanHit) -> Dict[str, Any]:
-        if ban_hit.ban_hit_link == "N/A":
-            return {}
-        cache_key = f"ban_info:{ban_hit.ban_hit_link}"
-
-        async def fetch_factory():
-            async with self.semaphore:
-                await self.rate_limiter.acquire()
-                start_time = time.time()
-                result = await asyncio.to_thread(
-                    self.admin_panel.fetch_ban_info,
-                    ban_hit.ban_hit_link
-                )
-                elapsed = time.time() - start_time
-                self.perf_tracker.record("fetch_ban_info", elapsed)
-                if elapsed > self.slow_operation_threshold:
-                    short_link = ban_hit.ban_hit_link.split('/')[-1]
-                    self.perf_logger.debug(f"Slow ban info fetch: {elapsed:.2f}s for {short_link}")
-                return result
-
-        return await self.cache.get(cache_key, fetch_factory)
-
-    @monitor_performance
-    async def batch_fetch_connections(self, identifiers: List[str]) -> Dict[str, List[Dict[str, Any]]]:
-        results = {}
-        valid_identifiers = [id for id in identifiers if id != "N/A"]
-        if not valid_identifiers:
-            return results
-        start_time = time.time()
-        self.perf_logger.debug(f"Batch fetching connections for {len(valid_identifiers)} identifiers")
-
-        async def fetch_for_identifier(identifier):
-            connections = await self.fetch_with_rate_limit(
-                self.admin_panel.fetch_connections_for_user,
-                identifier
-            )
-            return identifier, connections
-
-        fetch_results = await gather_with_concurrency(
-            100,
-            *[fetch_for_identifier(identifier) for identifier in valid_identifiers]
-        )
-        for identifier, connections in fetch_results:
-            if connections:
-                results[identifier] = connections
-        elapsed = time.time() - start_time
-        self.perf_tracker.record("batch_fetch_connections", elapsed)
-        self.perf_logger.debug(
-            f"Batch fetch completed in {elapsed:.2f}s for {len(valid_identifiers)} identifiers, "
-            f"got data for {len(results)} identifiers"
-        )
-        return results
-
     def convert_to_player(self, account_info: Dict[str, Any]) -> Player:
         if not account_info:
             self.logger.warning("Empty account_info provided to convert_to_player")
@@ -454,19 +331,3 @@ class AdminService:
         if "denied_banned_connections" in account_info:
             player.denied_logins = account_info["denied_banned_connections"]
         return player
-
-    @monitor_performance
-    async def get_cache_stats(self) -> Dict[str, Any]:
-        cache_stats = self.cache.get_stats()
-        total_requests = self._request_stats["total"]
-        hit_ratio = 0
-        if total_requests > 0:
-            hit_ratio = self._request_stats["cache_hits"] / total_requests
-        stats = {
-            "rate_limiter_calls": len(self.rate_limiter.calls),
-            "rate_limiter_max_calls": self.rate_limiter.max_calls,
-            "request_stats": dict(self._request_stats),
-            "cache_hit_ratio": hit_ratio,
-            "cache_stats": cache_stats
-        }
-        return stats

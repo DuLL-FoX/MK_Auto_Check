@@ -1,5 +1,4 @@
 import logging
-import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -358,63 +357,6 @@ class AdminPanel:
                 self.perf_logger.info(line)
         return all_connections
 
-    def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, Any]]:
-        url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true"
-        self.logger.info(f"Fetching ban hit connections from URL: {url}")
-        connections = self.fetch_paginated_data(url, max_pages)
-        return [conn.to_dict() for conn in connections]
-
-    def fetch_ban_info(self, ban_hits_link: str) -> Dict[str, str]:
-        if not self._ensure_authenticated():
-            return {}
-        ban_info: Dict[str, str] = {}
-        try:
-            if ban_hits_link and "connection=" in ban_hits_link:
-                ban_hit_id = ban_hits_link.split("connection=")[-1].split("&")[0]
-                ban_info["ban_hit_id"] = ban_hit_id
-            start_time = time.time()
-            response = self.session.get(ban_hits_link, timeout=self.TIMEOUT)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-            dl = soup.select_one("dl")
-            if dl:
-                dt_tags = dl.select("dt")
-                dd_tags = dl.select("dd")
-                info = {dt.get_text(strip=True).rstrip(":"): dd.get_text(strip=True)
-                        for dt, dd in zip(dt_tags, dd_tags)}
-                ban_info.update({
-                    "banned_user_name": info.get("Name", ""),
-                    "user_id": info.get("User ID", ""),
-                    "ip_address": info.get("IP", ""),
-                    "hwid": info.get("HWID", ""),
-                    "time": info.get("Time", ""),
-                })
-            table = soup.select_one("table.table")
-            if table:
-                rows = table.select("tr")
-                for row in rows:
-                    cols = row.select("td")
-                    if len(cols) >= 6:
-                        ban_info["ban_time"] = cols[2].get_text(strip=True)
-                        ban_info["expires"] = cols[4].get_text(strip=True)
-                        link_tag = cols[6].select_one("a")
-                        if link_tag:
-                            m = re.search(r"/Bans/Hits/(\d+)", link_tag.get("href", ""))
-                            if m:
-                                ban_info["ban_id"] = m.group(1)
-                        break
-            elapsed = time.time() - start_time
-            self.perf_stats.record("fetch_ban_info", elapsed)
-            if elapsed > self.SLOW_REQUEST_THRESHOLD:
-                short_link = ban_hits_link.split('/')[-1]
-                self.perf_logger.debug(f"Slow ban info fetch: {elapsed:.2f}s for {short_link}")
-        except requests.exceptions.HTTPError as e:
-            self._request_metrics["errors"] += 1
-            self.logger.error(f"Error fetching ban info: {str(e)}")
-        except Exception as e:
-            self.logger.error(f"Error parsing ban info: {str(e)}")
-        return ban_info
-
     def get_connections_url(self, user_id: str = "", search: str = "", show_accepted: str = "true",
                             show_banned: str = "true", show_whitelist: str = "true", show_full: str = "true",
                             show_panic: str = "true") -> str:
@@ -503,7 +445,6 @@ class AdminPanel:
                 "status": "unknown",
                 "nicknames": [],
                 "raw_html_snippet": [],
-                "suspected_vpn": False,
                 "ban_counts": 0,
                 "ban_reasons": [],
                 "shared_hwid_nicknames": [],
@@ -517,7 +458,6 @@ class AdminPanel:
         result: Dict[str, Any] = {
             "status": "unknown",
             "nicknames": set(),
-            "suspected_vpn": False,
             "ban_counts": 0,
             "ban_reasons": set(),
             "shared_hwid_nicknames": set(),
@@ -641,74 +581,65 @@ class AdminPanel:
             f"Aggregation complete: status={result['status']}, user_id={result['user_id']}, nicknames count={len(result['nicknames'])}")
         return result
 
-    def aggregate_player_info(self, partial_results_list: List[Dict[str, Any]]) -> List[
-        Dict[str, Union[str, List[str], bool, int]]]:
-        if not partial_results_list:
-            return []
-        merged_results = []
-        used = [False] * len(partial_results_list)
-        for i, result_i in enumerate(partial_results_list):
-            if used[i]:
-                continue
-            merged_dict = {
-                "status": result_i["status"],
-                "nicknames": set(result_i["nicknames"]),
-                "suspected_vpn": result_i["suspected_vpn"],
-                "ban_counts": result_i["ban_counts"],
-                "ban_reasons": set(result_i["ban_reasons"]),
-                "shared_hwid_nicknames": set(result_i["shared_hwid_nicknames"]),
-                "associated_ips": result_i["associated_ips"].copy(),
-                "associated_hwids": result_i["associated_hwids"].copy(),
-                "user_id": result_i.get("user_id", "N/A"),
-                "connection_link": result_i.get("connection_link", "N/A"),
-                "denied_banned_connections": result_i.get("denied_banned_connections", []).copy(),
-            }
-            used[i] = True
-            merged_nicknames = set(result_i["nicknames"])
-            for j in range(i + 1, len(partial_results_list)):
-                if used[j]:
-                    continue
-                result_j = partial_results_list[j]
-                if merged_nicknames.intersection(result_j["nicknames"]):
-                    used[j] = True
-                    merged_nicknames.update(result_j["nicknames"])
-                    merged_dict["nicknames"].update(result_j["nicknames"])
-                    merged_dict["ban_reasons"].update(result_j["ban_reasons"])
-                    merged_dict["shared_hwid_nicknames"].update(result_j["shared_hwid_nicknames"])
-                    merged_dict["ban_counts"] = max(merged_dict["ban_counts"], result_j["ban_counts"])
-                    merged_dict["suspected_vpn"] = merged_dict["suspected_vpn"] or result_j["suspected_vpn"]
-                    merged_dict["status"] = self._merge_statuses(merged_dict["status"], result_j["status"])
-                    if merged_dict["user_id"] == "N/A" and result_j.get("user_id") != "N/A":
-                        merged_dict["user_id"] = result_j.get("user_id")
-                    if merged_dict["connection_link"] == "N/A" and result_j.get("connection_link") != "N/A":
-                        merged_dict["connection_link"] = result_j.get("connection_link")
-                    merged_dict["denied_banned_connections"].extend(result_j.get("denied_banned_connections", []))
-                    for ip, nicks in result_j["associated_ips"].items():
-                        if ip in merged_dict["associated_ips"]:
-                            current_nicks = set(merged_dict["associated_ips"][ip])
-                            current_nicks.update(nicks)
-                            merged_dict["associated_ips"][ip] = list(current_nicks)
-                        else:
-                            merged_dict["associated_ips"][ip] = nicks.copy() if isinstance(nicks, list) else nicks
-                    for hwid, nicks in result_j["associated_hwids"].items():
-                        if hwid in merged_dict["associated_hwids"]:
-                            current_nicks = set(merged_dict["associated_hwids"][hwid])
-                            current_nicks.update(nicks)
-                            merged_dict["associated_hwids"][hwid] = list(current_nicks)
-                        else:
-                            merged_dict["associated_hwids"][hwid] = nicks.copy() if isinstance(nicks, list) else nicks
-            merged_dict["nicknames"] = list(merged_dict["nicknames"])
-            merged_dict["ban_reasons"] = list(merged_dict["ban_reasons"])
-            merged_dict["shared_hwid_nicknames"] = list(merged_dict["shared_hwid_nicknames"])
-            merged_results.append(merged_dict)
-        return merged_results
-
     def _merge_statuses(self, status_a: str, status_b: str) -> str:
         priority = {"suspicious": 4, "banned": 3, "unknown": 2, "clean": 1}
         return status_a if priority.get(status_a, 2) > priority.get(status_b, 2) else status_b
 
-    def get_request_metrics(self) -> Dict[str, int]:
-        if self.perf_stats.should_log_summary():
-            for line in self.perf_stats.get_summary():
-                self.perf_logger.info(line)
-        return dict(self._request_metrics)
+    def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, str]]:
+        url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true"
+        self.logger.info(f"Fetching ban hit connections, max_pages={max_pages}")
+
+        connections = self.fetch_paginated_data(url, max_pages=max_pages)
+
+        ban_hit_connections = []
+        for conn in connections:
+            if "Denied: Banned" in conn.status:
+                conn_dict = conn.to_dict()
+                if conn.ban_hits_link:
+                    ban_hit_connections.append(conn_dict)
+
+        self.logger.info(f"Found {len(ban_hit_connections)} ban hit connections")
+        return ban_hit_connections
+
+    def fetch_ban_info(self, ban_hits_link: str) -> Dict[str, str]:
+        if not ban_hits_link:
+            return {}
+
+        if not self._ensure_authenticated():
+            return {}
+
+        ban_info = {}
+        try:
+            response = self.session.get(ban_hits_link, timeout=self.TIMEOUT)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+
+            dl = soup.find("dl")
+            if dl:
+                dt_tags = dl.find_all("dt")
+                dd_tags = dl.find_all("dd")
+                info = {dt.get_text(strip=True).rstrip(":"): dd.get_text(strip=True)
+                        for dt, dd in zip(dt_tags, dd_tags)}
+                ban_info.update({
+                    "banned_user_name": info.get("Name", ""),
+                    "user_id": info.get("User ID", ""),
+                    "ip_address": info.get("IP", ""),
+                    "hwid": info.get("HWID", ""),
+                    "time": info.get("Time", ""),
+                })
+
+            table = soup.find("table", class_="table")
+            if table:
+                rows = table.find_all("tr")
+                for row in rows:
+                    cols = row.find_all("td")
+                    if len(cols) >= 6:
+                        ban_info["ban_time"] = cols[2].get_text(strip=True)
+                        ban_info["expires"] = cols[4].get_text(strip=True)
+                        break
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Error fetching ban info from {ban_hits_link}: {e}")
+        except Exception as e:
+            self.logger.error(f"Error parsing ban info from {ban_hits_link}: {e}", exc_info=True)
+
+        return ban_info
