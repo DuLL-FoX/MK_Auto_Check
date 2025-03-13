@@ -42,6 +42,7 @@ class ScanConfig:
     username: Optional[str] = None
     check_ban_bypass: bool = False
     ban_bypass_pages: int = 5
+    bypass_search_max_depth: int = 3
     search_max_depth: int = 4
     search_limit_root: int = 8
     search_limit_level1: int = 5
@@ -143,6 +144,8 @@ def load_from_file(file_path: str):
             config.scan.check_ban_bypass = config_module.CHECK_BAN_BYPASS
         if hasattr(config_module, "BAN_BYPASS_PAGES"):
             config.scan.ban_bypass_pages = config_module.BAN_BYPASS_PAGES
+        if hasattr(config_module, "BYPASS_SEARCH_MAX_DEPTH"):
+            config.scan.bypass_search_max_depth = config_module.BYPASS_SEARCH_MAX_DEPTH
 
         if hasattr(config_module, "SEARCH_MAX_DEPTH"):
             config.scan.search_max_depth = config_module.SEARCH_MAX_DEPTH

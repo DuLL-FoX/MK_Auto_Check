@@ -56,3 +56,5 @@ SEARCH_LIMIT_ROOT = 8  # Number of searches at root level (depth 0)
 SEARCH_LIMIT_LEVEL1 = 5  # Number of searches at level 1
 SEARCH_LIMIT_LEVEL2 = 3  # Number of searches at level 2
 SEARCH_LIMIT_DEFAULT = 2  # Number of searches at deeper levels
+
+BYPASS_SEARCH_MAX_DEPTH = 2  # Maximum depth for player searches for bypass
