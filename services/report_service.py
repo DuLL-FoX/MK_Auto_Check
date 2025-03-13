@@ -899,6 +899,7 @@ class ReportService:
             ban_time = result.get("ban_time", "Unknown")
             ban_expires = result.get("ban_expires", "Unknown")
             message_link = result.get("message_link", "")
+            bypass_success_status = result.get("bypass_success_status", "Unknown")
 
             total_players += 1
 
@@ -906,6 +907,17 @@ class ReportService:
             print(f"  {fmt['BOLD']}BANNED USER:{fmt['END']} {banned_user}")
             print(f"  {fmt['BOLD']}BAN TIME:{fmt['END']} {ban_time} {fmt['BOLD']}EXPIRES:{fmt['END']} {ban_expires}")
             print(f"  {fmt['BOLD']}CONFIDENCE:{fmt['END']} {confidence}")
+
+            if "Successful Bypass" == bypass_success_status:
+                status_str = f"{fmt['RED']}{fmt['BOLD']}{bypass_success_status}{fmt['END']}"
+            elif "Possibly Successful Bypass" == bypass_success_status:
+                status_str = f"{fmt['YELLOW']}{fmt['BOLD']}{bypass_success_status}{fmt['END']}"
+            elif "Unsuccessful Bypass" == bypass_success_status:
+                status_str = f"{fmt['GREEN']}{bypass_success_status}{fmt['END']}"
+            else:
+                status_str = bypass_success_status
+
+            print(f"  {fmt['BOLD']}BYPASS STATUS:{fmt['END']} {status_str}")
 
             if bypass_users:
                 print(
@@ -999,6 +1011,13 @@ class ReportService:
 
                     print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
 
+        total_successful_bypass = sum(
+            1 for r in ban_bypass_results if r.get("bypass_success_status") == "Successful Bypass")
+        total_possibly_successful = sum(
+            1 for r in ban_bypass_results if r.get("bypass_success_status") == "Possibly Successful Bypass")
+        total_unsuccessful = sum(
+            1 for r in ban_bypass_results if r.get("bypass_success_status") == "Unsuccessful Bypass")
+
         self._print_header(" BAN BYPASS SUMMARY ", 100)
         print(f"  {box['V']} {fmt['BOLD']}Ban Hits processed:{fmt['END']} {len(ban_bypass_results)}")
         print(f"  {box['V']} {fmt['BOLD']}Players analyzed:{fmt['END']} {total_players}")
@@ -1007,4 +1026,11 @@ class ReportService:
         print(f"  {box['V']}    • {fmt['RED']}{fmt['BOLD']}HWID Matches:{fmt['END']} {total_hwid_matches}")
         print(f"  {box['V']}    • {fmt['YELLOW']}{fmt['BOLD']}IP Matches:{fmt['END']} {total_ip_matches}")
         print(f"  {box['V']}    • No Matches: {total_no_matches}")
+        print(f"  {box['V']} {fmt['BOLD']}Bypass status breakdown:{fmt['END']}")
+        print(f"  {box['V']}    • {fmt['RED']}{fmt['BOLD']}Successful Bypasses:{fmt['END']} {total_successful_bypass}")
+        print(
+            f"  {box['V']}    • {fmt['YELLOW']}{fmt['BOLD']}Possibly Successful Bypasses:{fmt['END']} {total_possibly_successful}")
+        print(f"  {box['V']}    • {fmt['GREEN']}Unsuccessful Bypasses:{fmt['END']} {total_unsuccessful}")
+        print(
+            f"  {box['V']}    • Unknown Status: {len(ban_bypass_results) - total_successful_bypass - total_possibly_successful - total_unsuccessful}")
         print(f"\n{'=' * 100}")

@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import hashlib
 import logging
 import re
 import time
@@ -170,6 +171,161 @@ class Scanner:
             return []
         finally:
             self.cache.save_complaint_cache(self.complaint_channels)
+
+    def _consolidate_results(self, scan_results):
+        if not scan_results:
+            return []
+        user_id_groups = {}
+        no_user_id_players = []
+        for result in scan_results:
+            message_id = result.message.id
+            for player in result.players:
+                if player.user_id and player.user_id != "N/A":
+                    if player.user_id not in user_id_groups:
+                        user_id_groups[player.user_id] = {"players": [], "messages": set()}
+                    user_id_groups[player.user_id]["players"].append(player)
+                    user_id_groups[player.user_id]["messages"].add(message_id)
+                else:
+                    no_user_id_players.append((player, message_id))
+        player_registry = {}
+        message_to_players = defaultdict(set)
+        for user_id, data in user_id_groups.items():
+            players = data["players"]
+            message_ids = data["messages"]
+            merged_player = players[0]
+            for i in range(1, len(players)):
+                self._merge_player_info(merged_player, players[i])
+            player_id = f"uid:{user_id}"
+            player_registry[player_id] = merged_player
+            for message_id in message_ids:
+                message_to_players[message_id].add(player_id)
+        for player, message_id in no_user_id_players:
+            key_parts = []
+            primary_nickname = player.primary_nickname if hasattr(player, 'primary_nickname') else (
+                player.nicknames[0] if player.nicknames else "")
+            if primary_nickname:
+                key_parts.append(f"name:{primary_nickname}")
+            if hasattr(player, 'associated_hwids') and player.associated_hwids:
+                first_hwid = next(iter(player.associated_hwids.keys()), "")
+                if first_hwid and first_hwid != "N/A":
+                    key_parts.append(f"hwid:{first_hwid}")
+            if hasattr(player, 'associated_ips') and player.associated_ips:
+                first_ip = next(iter(player.associated_ips.keys()), "")
+                if first_ip and first_ip != "N/A":
+                    key_parts.append(f"ip:{first_ip}")
+            if not key_parts and player.nicknames:
+                for nick in player.nicknames:
+                    key_parts.append(f"name:{nick}")
+            identifier_string = '|'.join(key_parts)
+            player_id = hashlib.md5(identifier_string.encode()).hexdigest()
+            if player_id not in player_registry:
+                player_registry[player_id] = player
+            else:
+                self._merge_player_info(player_registry[player_id], player)
+            message_to_players[message_id].add(player_id)
+        consolidated_results = []
+        processed_messages = set()
+        for result in scan_results:
+            message_id = result.message.id
+            if message_id in processed_messages:
+                continue
+            processed_messages.add(message_id)
+            message_player_ids = message_to_players[message_id]
+            consolidated_players = [player_registry[pid] for pid in message_player_ids]
+            consolidated_results.append(
+                ScanResult(
+                    message=result.message,
+                    players=consolidated_players,
+                    scan_time=result.scan_time
+                )
+            )
+        self.logger.info(
+            f"Consolidated {len(scan_results)} results into {len(consolidated_results)} unique message results"
+        )
+        return consolidated_results
+
+    def _merge_player_info(self, target_player, source_player):
+        if not hasattr(target_player, 'nicknames_sources'):
+            target_player.nicknames_sources = {}
+        if not hasattr(target_player, 'is_from_user_id'):
+            target_player.is_from_user_id = False
+        if hasattr(source_player, 'is_from_user_id') and source_player.is_from_user_id:
+            target_player.is_from_user_id = True
+        source_is_primary = hasattr(source_player, 'is_primary') and source_player.is_primary
+        target_is_primary = hasattr(target_player, 'is_primary') and target_player.is_primary
+        source_primary = source_player.primary_nickname if source_player.nicknames else None
+        if source_is_primary and source_primary and source_primary in source_player.nicknames:
+            if source_primary not in target_player.nicknames:
+                target_player.nicknames.append(source_primary)
+            target_player.nicknames.remove(source_primary)
+            target_player.nicknames.insert(0, source_primary)
+            target_player.nicknames_sources[source_primary] = "login"
+            target_player.is_primary = True
+            target_player.primary_nickname = source_primary
+            if hasattr(source_player, 'search_term'):
+                target_player.search_term = source_player.search_term
+        source_is_login_event = False
+        if hasattr(source_player, 'raw_message') and source_player.raw_message:
+            source_is_login_event = "Arrived new player" in source_player.raw_message
+            if source_is_login_event and (not hasattr(target_player, 'raw_message') or not target_player.raw_message):
+                target_player.raw_message = source_player.raw_message
+        for nickname in source_player.nicknames:
+            if source_is_primary and source_primary and nickname == source_primary:
+                continue
+            is_login_event = source_is_login_event
+            if hasattr(source_player, 'is_from_user_id') and source_player.is_from_user_id and nickname == \
+                    source_player.nicknames[0]:
+                is_login_event = True
+            if is_login_event:
+                target_player.nicknames_sources[nickname] = "login"
+                if nickname in target_player.nicknames:
+                    target_player.nicknames.remove(nickname)
+                if target_is_primary and hasattr(target_player, 'primary_nickname'):
+                    target_player.nicknames.insert(1, nickname)
+                else:
+                    target_player.nicknames.insert(0, nickname)
+            elif nickname not in target_player.nicknames:
+                target_player.nicknames_sources[nickname] = "other"
+                target_player.nicknames.append(nickname)
+        source_status = source_player.status.lower()
+        target_status = target_player.status.lower()
+        if self.status_priority.get(source_status, 0) > self.status_priority.get(target_status, 0):
+            target_player.status = source_player.status
+        target_player.ban_counts = max(target_player.ban_counts, source_player.ban_counts)
+        if hasattr(source_player, 'associated_ips') and hasattr(target_player, 'associated_ips'):
+            for ip, nicks in source_player.associated_ips.items():
+                if ip in target_player.associated_ips:
+                    combined_nicks = set(target_player.associated_ips[ip])
+                    combined_nicks.update(nicks)
+                    target_player.associated_ips[ip] = list(combined_nicks)
+                else:
+                    target_player.associated_ips[ip] = nicks
+        if hasattr(source_player, 'associated_hwids') and hasattr(target_player, 'associated_hwids'):
+            for hwid, nicks in source_player.associated_hwids.items():
+                if hwid in target_player.associated_hwids:
+                    combined_nicks = set(target_player.associated_hwids[hwid])
+                    combined_nicks.update(nicks)
+                    target_player.associated_hwids[hwid] = list(combined_nicks)
+                else:
+                    target_player.associated_hwids[hwid] = nicks
+        if hasattr(source_player, 'complaint_links') and source_player.complaint_links:
+            if not hasattr(target_player, 'complaint_links'):
+                target_player.complaint_links = []
+            existing_links = {
+                tuple(sorted((k, str(v)) for k, v in link.items()))
+                for link in target_player.complaint_links
+            } if target_player.complaint_links else set()
+            for link in source_player.complaint_links:
+                link_tuple = tuple(sorted((k, str(v)) for k, v in link.items()))
+                if link_tuple not in existing_links:
+                    target_player.complaint_links.append(link)
+                    existing_links.add(link_tuple)
+        if hasattr(source_player, 'ban_reasons') and source_player.ban_reasons:
+            if not hasattr(target_player, 'ban_reasons'):
+                target_player.ban_reasons = []
+            target_reasons = set(target_player.ban_reasons)
+            target_reasons.update(source_player.ban_reasons)
+            target_player.ban_reasons = list(target_reasons)
 
     def _extract_message_data(self, messages):
         all_terms = set()
@@ -662,6 +818,9 @@ class Scanner:
                         bypass_reason = ConfidenceLevel.IP_MATCH.value
                         bypass_user_names = sorted(set(ip_nicks) - {banned_user_name})
 
+            bypass_success_status = self._determine_bypass_success(connections, bypass_user_names,
+                                                                   ban_time_str, hwid, ip_address)
+
             player = self.admin.convert_to_player(account_info)
             player.hwid_erased = hwid_erased
 
@@ -680,6 +839,7 @@ class Scanner:
                 "ban_expires": ban_expires_str,
                 "ban_bypass_confidence": bypass_reason,
                 "bypass_user_names": bypass_user_names,
+                "bypass_success_status": bypass_success_status,
                 "hwid_erased": hwid_erased,
                 "results": [{
                     "initial_account": account_info,
@@ -693,7 +853,8 @@ class Scanner:
             }
 
             self.logger.info(
-                f"Ban hit for {banned_user_name}: Confidence: {bypass_reason}, "
+                f"Ban hit for {banned_user_name}: Confidence: {bypass_reason}, " +
+                f"Bypass status: {bypass_success_status}, " +
                 f"Potential bypassers: {', '.join(bypass_user_names) if bypass_user_names else 'None'}"
             )
 
@@ -727,3 +888,54 @@ class Scanner:
             self.logger.error(f"Error processing time difference for ban hit: {str(ex)}", exc_info=True)
 
         return time_suspected_users
+
+    def _determine_bypass_success(self, connections, bypass_user_names, ban_time_str, banned_hwid, banned_ip):
+        if not bypass_user_names or not connections:
+            return "Unknown"
+
+        try:
+            ban_time = datetime.strptime(ban_time_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return "Unknown"
+
+        successful_logins = []
+        unsuccessful_logins = []
+
+        for conn in connections:
+            user_name = conn.get("user_name", "")
+            if user_name not in bypass_user_names:
+                continue
+
+            conn_time_str = conn.get("time", "")
+            if not conn_time_str:
+                continue
+
+            try:
+                conn_time = datetime.strptime(conn_time_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+
+            if conn_time <= ban_time:
+                continue
+
+            status = conn.get("status", "")
+
+            if "Denied: Banned" in status:
+                unsuccessful_logins.append(conn)
+            elif "Accepted" in status:
+                successful_logins.append(conn)
+
+        if successful_logins:
+            hwid_changed = any(conn.get("hwid", "") != banned_hwid for conn in successful_logins)
+            ip_changed = any(conn.get("ip_address", "") != banned_ip for conn in successful_logins)
+
+            if hwid_changed:
+                return "Successful Bypass"
+            elif ip_changed:
+                return "Possibly Successful Bypass"
+            else:
+                return "Unknown"
+        elif unsuccessful_logins:
+            return "Unsuccessful Bypass"
+        else:
+            return "Unknown"
