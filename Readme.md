@@ -127,13 +127,9 @@ then cross-referencing these connections with the administrative panel data and 
 
 ## ⚙️ Configuration
 
-The bot is configured through the `config.py` file. Copy the example configuration and modify it with your settings:
+The bot is configured through the `config.py` file.
 
-```bash
-cp config_example.py config.py
-```
-
-Then edit the `config.py` file with your credentials and settings:
+Edit the `config.py` file with your credentials and settings:
 
 ```python
 # Discord configuration
