@@ -427,14 +427,6 @@ Contributions to improve the detector are welcome. Here's how to contribute:
 4. Push to the branch: `git push origin feature/your-feature-name`
 5. Submit a pull request
 
-### Development Setup
-
-For development, install additional development dependencies:
-
-```bash
-pip install -r requirements-dev.txt
-```
-
 ## ❗ Troubleshooting
 
 ### Common Issues
