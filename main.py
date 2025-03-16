@@ -33,7 +33,7 @@ def main():
     args = parse_arguments()
 
     # Параметры по умолчанию (будут использованы, если не указаны ни в конфиге, ни в аргументах)
-    default_message_limit = 11
+    default_message_limit = 12
     default_username = None
     default_check_ban_bypass = False
     default_ban_bypass_pages = 1
@@ -49,13 +49,13 @@ def main():
     if not hasattr(cfg, 'scan'):
         cfg.scan = type('ScanConfig', (), {})
 
-    if not hasattr(cfg.scan, 'message_limit'):
+    if default_message_limit is not None:
         cfg.scan.message_limit = default_message_limit
-    if not hasattr(cfg.scan, 'username'):
+    if default_username is not None:
         cfg.scan.username = default_username
-    if not hasattr(cfg.scan, 'check_ban_bypass'):
+    if default_check_ban_bypass is not None:
         cfg.scan.check_ban_bypass = default_check_ban_bypass
-    if not hasattr(cfg.scan, 'ban_bypass_pages'):
+    if default_ban_bypass_pages is not None:
         cfg.scan.ban_bypass_pages = default_ban_bypass_pages
 
     if args.message_limit is not None:
