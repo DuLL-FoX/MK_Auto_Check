@@ -1,7 +1,6 @@
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime
 from functools import lru_cache
 from typing import Dict, Union, List, Any, Optional
 from urllib.parse import urljoin, quote_plus
@@ -52,8 +51,11 @@ class PerformanceStats:
         self.operations = {}
         self.last_summary_time = time.time()
         self.summary_interval = 60
+        self.log_enabled = True
 
     def record(self, operation, duration):
+        if not self.log_enabled:
+            return
         if operation not in self.operations:
             self.operations[operation] = {
                 'count': 0,
@@ -69,7 +71,7 @@ class PerformanceStats:
         stats['max_time'] = max(stats['max_time'], duration)
 
     def should_log_summary(self):
-        return time.time() - self.last_summary_time >= self.summary_interval
+        return self.log_enabled and (time.time() - self.last_summary_time >= self.summary_interval)
 
     def get_summary(self):
         if not self.operations:
@@ -107,9 +109,12 @@ class AdminPanel:
         self.session = self._create_session()
         self.login_attempts = 0
         self._is_authenticated = False
+        self._auth_token_timestamp = 0
+        self._auth_token_ttl = 1800
         self._request_metrics = {"total": 0, "slow_requests": 0, "errors": 0}
         self._setup_loggers()
         self.perf_stats = PerformanceStats(self.perf_logger)
+        self._response_cache = {}
         self.logger.info(
             f"AdminPanel initialized with URLs: BASE={self.BASE_ADMIN_URL}, CONNECTIONS={self.CONNECTIONS_URL}")
 
@@ -121,20 +126,26 @@ class AdminPanel:
         session = requests.Session()
         retries = Retry(
             total=5,
-            backoff_factor=0.5,
+            backoff_factor=0.3,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
         )
-        adapter = HTTPAdapter(max_retries=retries, pool_connections=150, pool_maxsize=150)
+        adapter = HTTPAdapter(
+            max_retries=retries,
+            pool_connections=150,
+            pool_maxsize=150,
+            pool_block=False
+        )
         session.mount('http://', adapter)
         session.mount('https://', adapter)
         session.headers.update({
             "User-Agent": "Mozilla/5.0 (compatible)",
+            "Connection": "keep-alive"
         })
         return session
 
     def login(self) -> bool:
-        if self._is_authenticated:
+        if self._is_authenticated and (time.time() - self._auth_token_timestamp) < self._auth_token_ttl:
             return True
         while self.login_attempts < self.LOGIN_RETRY_LIMIT:
             self.login_attempts += 1
@@ -146,6 +157,7 @@ class AdminPanel:
                 self.perf_stats.record("login", elapsed)
                 if result:
                     self._is_authenticated = True
+                    self._auth_token_timestamp = time.time()
                     self.login_attempts = 0
                     return True
             except Exception as e:
@@ -156,6 +168,10 @@ class AdminPanel:
 
     def _attempt_login(self) -> bool:
         try:
+            response = self.session.get(self.PLAYERS_URL, allow_redirects=False, timeout=self.TIMEOUT)
+            if response.status_code == 200:
+                self.logger.debug("Already logged in (direct access to PLAYERS_URL)")
+                return True
             response = self.session.get(self.PLAYERS_URL, allow_redirects=True, timeout=self.TIMEOUT)
             response.raise_for_status()
             if response.url == self.PLAYERS_URL:
@@ -220,7 +236,7 @@ class AdminPanel:
             return False
 
     def _ensure_authenticated(self) -> bool:
-        if not self._is_authenticated:
+        if not self._is_authenticated or (time.time() - self._auth_token_timestamp) >= self._auth_token_ttl:
             return self.login()
         return True
 
@@ -232,10 +248,12 @@ class AdminPanel:
                 return None
             ban_hits_link = None
             connection_id = None
-            if len(cols) >= 9 and cols[8].select_one("a"):
-                ban_hits_link = urljoin(self.BASE_ADMIN_URL, cols[8].select_one("a")["href"])
-                if ban_hits_link and "connection=" in ban_hits_link:
-                    connection_id = ban_hits_link.split("connection=")[-1].split("&")[0]
+            if len(cols) >= 9:
+                link_tag = cols[8].select_one("a")
+                if link_tag:
+                    ban_hits_link = urljoin(self.BASE_ADMIN_URL, link_tag["href"])
+                    if ban_hits_link and "connection=" in ban_hits_link:
+                        connection_id = ban_hits_link.split("connection=")[-1].split("&")[0]
             user_name_el = cols[0].select_one("strong")
             user_name = user_name_el.text.strip() if user_name_el else cols[0].text.strip()
             user_id = cols[1].text.strip()
@@ -275,24 +293,35 @@ class AdminPanel:
             return connections
         rows = tbody.select("tr")
         self.logger.debug(f"Found {len(rows)} rows in the connections table")
-        for i, row in enumerate(rows):
-            connection = self._parse_connection_row(row)
-            if connection:
-                connections.append(connection)
-            else:
-                self.logger.warning(f"Failed to parse row {i}")
+        connections = [conn for row in rows if (conn := self._parse_connection_row(row))]
         return connections
 
     def _get_next_page_link(self, soup: BeautifulSoup) -> Optional[str]:
-        next_page_link = soup.select_one("a.btn[href*='page=']")
-        if next_page_link and "Next" in next_page_link.text and "disabled" not in next_page_link.get("class", []):
-            link = urljoin(self.BASE_ADMIN_URL, next_page_link["href"])
-            return link
         next_page_link = soup.select_one("a.page-link[rel='next']")
         if next_page_link:
             link = urljoin(self.BASE_ADMIN_URL, next_page_link["href"])
             return link
+        next_page_link = soup.select_one("a.btn[href*='page=']")
+        if next_page_link and "Next" in next_page_link.text and "disabled" not in next_page_link.get("class", []):
+            link = urljoin(self.BASE_ADMIN_URL, next_page_link["href"])
+            return link
         return None
+
+    def _get_cached_response(self, url: str) -> Optional[str]:
+        cache_entry = self._response_cache.get(url)
+        if cache_entry:
+            timestamp, html = cache_entry
+            if time.time() - timestamp < 300:
+                return html
+        return None
+
+    def _cache_response(self, url: str, html: str) -> None:
+        if len(self._response_cache) > 1000:
+            oldest_keys = sorted(self._response_cache.keys(),
+                                 key=lambda k: self._response_cache[k][0])[:200]
+            for key in oldest_keys:
+                del self._response_cache[key]
+        self._response_cache[url] = (time.time(), html)
 
     def fetch_paginated_data(self, url: str, max_pages: int = 0) -> List[ConnectionData]:
         self.logger.info(f"Fetching paginated data from URL: {url}")
@@ -312,7 +341,15 @@ class AdminPanel:
                 self._request_metrics["total"] += 1
                 req_start = time.time()
                 self.logger.debug(f"Fetching page {page_num} from URL: {current_url}")
-                response = self.session.get(current_url, timeout=self.TIMEOUT)
+                cached_html = self._get_cached_response(current_url)
+                if cached_html:
+                    self.logger.debug(f"Using cached response for page {page_num}")
+                    html_content = cached_html
+                else:
+                    response = self.session.get(current_url, timeout=self.TIMEOUT)
+                    response.raise_for_status()
+                    html_content = response.text
+                    self._cache_response(current_url, html_content)
                 req_time = time.time() - req_start
                 if req_time > self.SLOW_REQUEST_THRESHOLD:
                     self._request_metrics["slow_requests"] += 1
@@ -320,15 +357,8 @@ class AdminPanel:
                     if len(log_url) > 60:
                         log_url = log_url[:57] + "..."
                     self.perf_logger.debug(f"Slow request ({req_time:.2f}s): {log_url}")
-                response.raise_for_status()
-                self.logger.debug(
-                    f"Page {page_num} response status: {response.status_code}, length: {len(response.text)}")
-                if response.status_code != 200:
-                    html_filename = f"error_page_{page_num}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
-                    with open(html_filename, 'w', encoding='utf-8') as f:
-                        f.write(response.text)
-                    self.logger.warning(f"Saved error HTML to {html_filename}")
-                soup = BeautifulSoup(response.text, "html.parser")
+                self.logger.debug(f"Page {page_num} response length: {len(html_content)}")
+                soup = BeautifulSoup(html_content, "html.parser")
                 connections = self._parse_connections_table(soup)
                 self.logger.debug(f"Found {len(connections)} connections on page {page_num}")
                 all_connections.extend(connections)
@@ -398,7 +428,7 @@ class AdminPanel:
         self.logger.debug(f"Returning {len(connection_dicts)} connection dicts")
         return connection_dicts
 
-    @lru_cache(maxsize=200)
+    @lru_cache(maxsize=500)
     def fetch_player_info(self, user_id: str) -> Dict[str, Union[int, List[str]]]:
         if not self._ensure_authenticated():
             return {"ban_counts": 0, "ban_reasons": []}
@@ -406,21 +436,24 @@ class AdminPanel:
         info_url = self.PLAYER_INFO_URL_PATTERN.format(user_id)
         try:
             start_time = time.time()
-            resp = self.session.get(info_url, timeout=self.TIMEOUT)
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            ban_section = soup.select_one("h2:contains('Bans')")
-            if ban_section:
-                ban_table = ban_section.find_next("table")
-                if ban_table:
-                    ban_body = ban_table.select_one("tbody")
-                    if ban_body:
-                        for row in ban_body.select("tr"):
-                            cols = row.select("td")
-                            if len(cols) >= 2:
-                                reason = cols[1].get_text(strip=True)
-                                info_result["ban_reasons"].append(reason)
-                    info_result["ban_counts"] = len(info_result["ban_reasons"])
+            cached_html = self._get_cached_response(info_url)
+            if cached_html:
+                html_content = cached_html
+            else:
+                resp = self.session.get(info_url, timeout=self.TIMEOUT)
+                resp.raise_for_status()
+                html_content = resp.text
+                self._cache_response(info_url, html_content)
+            soup = BeautifulSoup(html_content, "html.parser")
+            ban_table = soup.select_one("h2:contains('Bans') + table, h2:contains('Bans') ~ table")
+            if ban_table:
+                ban_body = ban_table.select_one("tbody")
+                if ban_body:
+                    ban_reasons = [cols[1].get_text(strip=True)
+                                   for row in ban_body.select("tr")
+                                   if (cols := row.select("td")) and len(cols) >= 2]
+                    info_result["ban_reasons"] = ban_reasons
+                    info_result["ban_counts"] = len(ban_reasons)
             elapsed = time.time() - start_time
             self.perf_stats.record("fetch_player_info", elapsed)
             if elapsed > self.SLOW_REQUEST_THRESHOLD:
@@ -588,32 +621,30 @@ class AdminPanel:
     def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, str]]:
         url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true"
         self.logger.info(f"Fetching ban hit connections, max_pages={max_pages}")
-
         connections = self.fetch_paginated_data(url, max_pages=max_pages)
-
-        ban_hit_connections = []
-        for conn in connections:
-            if "Denied: Banned" in conn.status:
-                conn_dict = conn.to_dict()
-                if conn.ban_hits_link:
-                    ban_hit_connections.append(conn_dict)
-
+        ban_hit_connections = [
+            conn.to_dict() for conn in connections
+            if "Denied: Banned" in conn.status and conn.ban_hits_link
+        ]
         self.logger.info(f"Found {len(ban_hit_connections)} ban hit connections")
         return ban_hit_connections
 
     def fetch_ban_info(self, ban_hits_link: str) -> Dict[str, str]:
         if not ban_hits_link:
             return {}
-
         if not self._ensure_authenticated():
             return {}
-
         ban_info = {}
         try:
-            response = self.session.get(ban_hits_link, timeout=self.TIMEOUT)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, 'html.parser')
-
+            cached_html = self._get_cached_response(ban_hits_link)
+            if cached_html:
+                html_content = cached_html
+            else:
+                response = self.session.get(ban_hits_link, timeout=self.TIMEOUT)
+                response.raise_for_status()
+                html_content = response.text
+                self._cache_response(ban_hits_link, html_content)
+            soup = BeautifulSoup(html_content, 'html.parser')
             dl = soup.find("dl")
             if dl:
                 dt_tags = dl.find_all("dt")
@@ -627,7 +658,6 @@ class AdminPanel:
                     "hwid": info.get("HWID", ""),
                     "time": info.get("Time", ""),
                 })
-
             table = soup.find("table", class_="table")
             if table:
                 rows = table.find_all("tr")
@@ -641,5 +671,4 @@ class AdminPanel:
             self.logger.error(f"Error fetching ban info from {ban_hits_link}: {e}")
         except Exception as e:
             self.logger.error(f"Error parsing ban info from {ban_hits_link}: {e}", exc_info=True)
-
         return ban_info

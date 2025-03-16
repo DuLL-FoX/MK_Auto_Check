@@ -3,33 +3,38 @@ import functools
 import logging
 import time
 from collections import deque
-from typing import Any, List, Coroutine, Dict, Callable, TypeVar, Tuple
+from typing import Any, List, Coroutine, Dict, Callable, TypeVar, Tuple, Optional
 
 T = TypeVar('T')
 
 logger = logging.getLogger(__name__)
 
-
 async def run_with_semaphore(semaphore: asyncio.Semaphore, coro: Coroutine) -> Any:
     async with semaphore:
         return await coro
-
 
 async def gather_with_concurrency(n: int, *coros) -> List[Any]:
     if not coros:
         return []
     semaphore = asyncio.Semaphore(n)
-    return await asyncio.gather(*(run_with_semaphore(semaphore, c) for c in coros))
-
+    tasks = [run_with_semaphore(semaphore, c) for c in coros]
+    return await asyncio.gather(*tasks)
 
 class RateLimiter:
     def __init__(self, max_calls: int, period: float = 1.0):
         self.max_calls = max_calls
         self.period = period
-        self.calls = deque(maxlen=max_calls * 2)
+        self.calls = deque(maxlen=max_calls + 5)
         self.lock = asyncio.Lock()
+        self._last_acquire_time = 0
+        self._min_interval = period / max_calls if max_calls > 0 else 0
 
     async def acquire(self):
+        now = time.time()
+        if not self.calls and now - self._last_acquire_time > self._min_interval:
+            self.calls.append(now)
+            self._last_acquire_time = now
+            return
         async with self.lock:
             now = time.time()
             while self.calls and now - self.calls[0] >= self.period:
@@ -41,46 +46,103 @@ class RateLimiter:
                     await asyncio.sleep(wait_time)
                     now = time.time()
             self.calls.append(now)
+            self._last_acquire_time = now
 
     async def wrapped_call(self, coro):
         await self.acquire()
         return await coro
 
-
 def to_thread(func):
     @functools.wraps(func)
     async def wrapper(*args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
-
     return wrapper
 
-
 class AsyncCache:
-    def __init__(self, max_size: int = 1000):
+    def __init__(self, max_size: int = 1000, default_ttl: float = 3600):
         self.cache: Dict[str, Tuple[Any, float]] = {}
         self.max_size = max_size
+        self.default_ttl = default_ttl
         self.lock = asyncio.Lock()
         self.hits = 0
         self.misses = 0
         self.evictions = 0
+        self._key_access_times = {}
+        self._last_cleanup_time = time.time()
+        self._cleanup_interval = 1800
 
-    async def get(self, key: str, factory: Callable[[], Coroutine]) -> Any:
+    async def get(self, key: str, factory: Callable[[], Coroutine], ttl: Optional[float] = None) -> Any:
+        current_time = time.time()
+        ttl = ttl or self.default_ttl
+        if current_time - self._last_cleanup_time > self._cleanup_interval:
+            await self._cleanup_expired()
+        if key in self.cache:
+            value, timestamp = self.cache[key]
+            if current_time - timestamp < ttl:
+                async with self.lock:
+                    self._key_access_times[key] = current_time
+                    self.hits += 1
+                return value
         async with self.lock:
             if key in self.cache:
-                self.hits += 1
-                value, _ = self.cache[key]
-                self.cache[key] = (value, time.time())
-                return value
+                value, timestamp = self.cache[key]
+                if current_time - timestamp < ttl:
+                    self._key_access_times[key] = current_time
+                    self.hits += 1
+                    return value
             self.misses += 1
         value = await factory()
         async with self.lock:
             if len(self.cache) >= self.max_size:
-                oldest_key = min(self.cache.items(), key=lambda x: x[1][1])[0]
-                del self.cache[oldest_key]
-                self.evictions += 1
-            self.cache[key] = (value, time.time())
+                await self._evict_entries()
+            self.cache[key] = (value, current_time)
+            self._key_access_times[key] = current_time
         return value
+
+    async def _evict_entries(self):
+        current_time = time.time()
+        expired_keys = [
+            k for k, (_, timestamp) in self.cache.items()
+            if current_time - timestamp > self.default_ttl
+        ]
+        for key in expired_keys:
+            del self.cache[key]
+            if key in self._key_access_times:
+                del self._key_access_times[key]
+            self.evictions += 1
+        if len(self.cache) >= self.max_size:
+            to_remove = sorted(
+                self._key_access_times.items(),
+                key=lambda x: x[1]
+            )[:max(1, self.max_size // 10)]
+            for key, _ in to_remove:
+                if key in self.cache:
+                    del self.cache[key]
+                if key in self._key_access_times:
+                    del self._key_access_times[key]
+                self.evictions += 1
+
+    async def _cleanup_expired(self):
+        async with self.lock:
+            current_time = time.time()
+            self._last_cleanup_time = current_time
+            expired_keys = [
+                k for k, (_, timestamp) in self.cache.items()
+                if current_time - timestamp > self.default_ttl
+            ]
+            for key in expired_keys:
+                del self.cache[key]
+                if key in self._key_access_times:
+                    del self._key_access_times[key]
+                self.evictions += 1
+            access_keys_to_remove = [
+                k for k in self._key_access_times
+                if k not in self.cache
+            ]
+            for key in access_keys_to_remove:
+                del self._key_access_times[key]
 
     async def clear(self):
         async with self.lock:
             self.cache.clear()
+            self._key_access_times.clear()
