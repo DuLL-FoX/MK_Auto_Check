@@ -39,7 +39,7 @@ def main():
     default_ban_bypass_pages = 1
 
     try:
-        config_file = args.config if args.config else "config_backup_v2.py"
+        config_file = args.config if args.config else "config.py"
         initialize(config_file)
         cfg = get_config()
     except Exception as e:
