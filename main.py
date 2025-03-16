@@ -32,6 +32,12 @@ def parse_arguments():
 def main():
     args = parse_arguments()
 
+    # Параметры по умолчанию (будут использованы, если не указаны ни в конфиге, ни в аргументах)
+    default_message_limit = 11
+    default_username = None
+    default_check_ban_bypass = False
+    default_ban_bypass_pages = 1
+
     try:
         config_file = args.config if args.config else "config_backup_v2.py"
         initialize(config_file)
@@ -40,7 +46,18 @@ def main():
         print(f"Configuration error: {e}")
         sys.exit(1)
 
-    # Override config values with command line arguments
+    if not hasattr(cfg, 'scan'):
+        cfg.scan = type('ScanConfig', (), {})
+
+    if not hasattr(cfg.scan, 'message_limit'):
+        cfg.scan.message_limit = default_message_limit
+    if not hasattr(cfg.scan, 'username'):
+        cfg.scan.username = default_username
+    if not hasattr(cfg.scan, 'check_ban_bypass'):
+        cfg.scan.check_ban_bypass = default_check_ban_bypass
+    if not hasattr(cfg.scan, 'ban_bypass_pages'):
+        cfg.scan.ban_bypass_pages = default_ban_bypass_pages
+
     if args.message_limit is not None:
         cfg.scan.message_limit = args.message_limit
     if args.username is not None:
