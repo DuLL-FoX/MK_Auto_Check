@@ -1,5 +1,6 @@
 import json
 import sys
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
 from models.message import ScanResult
@@ -259,7 +260,7 @@ class ReportService:
                 "links": player.complaint_links
             }
             report_data.append(complaints_data)
-        self.print_nickname_search_results(nickname, player)
+        self._print_nickname_search_results(nickname, player)
         return report_data
 
     def _generate_ip_data(self, nickname: str, player: Player) -> Dict[str, Any]:
@@ -277,7 +278,7 @@ class ReportService:
             owner = _determine_owner(nickname, player.nicknames, shared_with)
             others = [nick for nick in shared_with if nick != owner]
             ip_entry = {
-                "ip": ip,
+                "direct_ip_connections": ip,
                 "owner": owner,
                 "owned_by_primary": owner == nickname,
                 "owned_by_alt": owner in player.nicknames and owner != nickname,
@@ -316,7 +317,7 @@ class ReportService:
             hwid_data["hwids"].append(hwid_entry)
         return hwid_data
 
-    def print_nickname_search_results(self, nickname: str, player: Player) -> None:
+    def _print_nickname_search_results(self, nickname: str, player: Player) -> None:
         box = self.box
         fmt = self.fmt
         status_str = self._format_status(player.status, getattr(player, 'hwid_erased', False))
@@ -329,20 +330,146 @@ class ReportService:
         if len(player.nicknames) > 1:
             print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
             print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED NICKNAMES:{fmt['END']}")
-            other_nicks = [nick for nick in player.nicknames if nick != nickname]
-            if other_nicks:
-                print(f"  {box['V']}   {', '.join(other_nicks)}")
+
+            categorized_nicks = self._categorize_associated_nicknames(player, nickname)
+            has_categories = False
+
+            if categorized_nicks["marked_alts"] or categorized_nicks["direct_hwid_connected"]:
+                has_categories = True
+                print(f"  {box['V']}")
+                print(f"  {box['V']}   {fmt['BOLD']}{fmt['RED']}■ CONFIRMED ALTS:{fmt['END']}")
+                if categorized_nicks["marked_alts"]:
+                    print(
+                        f"  {box['V']}     {fmt['BOLD']}Identified Alts:{fmt['END']} {', '.join(categorized_nicks['marked_alts'])}")
+                if categorized_nicks["alt_hwid_relations"]:
+                    print(f"  {box['V']}     {fmt['BOLD']}Alt accounts sharing HWIDs:{fmt['END']}")
+                    for hwid, connected_alts in categorized_nicks["alt_hwid_relations"].items():
+                        print(f"  {box['V']}       • {self._format_hwid(hwid)}: {', '.join(connected_alts)}")
+
+            if categorized_nicks["secondary_hwid_groups"]:
+                has_categories = True
+                print(f"  {box['V']}")
+                print(f"  {box['V']}   {fmt['BOLD']}{fmt['YELLOW']}■ LIKELY CONNECTIONS:{fmt['END']}")
+                for group_info in categorized_nicks["secondary_hwid_groups"].values():
+                    print(f"  {box['V']}     • {fmt['BOLD']}HWID:{fmt['END']} {self._format_hwid(group_info['hwid'])}")
+                    print(f"  {box['V']}       {fmt['BOLD']}Accounts:{fmt['END']} {', '.join(group_info['accounts'])}")
+
+            if categorized_nicks["direct_ip_connections"] or categorized_nicks["login"]:
+                has_categories = True
+                print(f"  {box['V']}")
+                print(f"  {box['V']}   {fmt['BOLD']}{fmt['CYAN']}■ POSSIBLE CONNECTIONS:{fmt['END']}")
+                if categorized_nicks["direct_ip_connections"]:
+                    print(f"  {box['V']}     {fmt['BOLD']}IP Matches:{fmt['END']}")
+                    for ip, nicks in categorized_nicks["direct_ip_connections"].items():
+                        print(f"  {box['V']}       • {fmt['CYAN']}{ip}{fmt['END']}: {', '.join(nicks)}")
+                if categorized_nicks["login"]:
+                    print(
+                        f"  {box['V']}     {fmt['BOLD']}Login Event Matches:{fmt['END']} {', '.join(categorized_nicks['login'])}")
+
+            if categorized_nicks["other"]:
+                has_categories = True
+                print(f"  {box['V']}")
+                print(
+                    f"  {box['V']}   {fmt['BOLD']}■ OTHER ASSOCIATED NICKNAMES:{fmt['END']} {', '.join(categorized_nicks['other'])}")
+
+            if not has_categories:
+                other_nicks = [nick for nick in player.nicknames if nick != nickname]
+                if other_nicks:
+                    print(f"  {box['V']}   {', '.join(other_nicks)}")
+
             print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
 
         self._print_complaints_section(player, nickname)
-
         self._print_ip_section(player, nickname)
-
         self._print_hwid_section(player, nickname)
-
         self._print_denied_logins_section(player, nickname)
-
         print(f"\n{'=' * 100}")
+
+    def _categorize_associated_nicknames(self, player: Player, primary_nickname: str):
+        categories = {
+            "marked_alts": [], "unverified_alts": [], "direct_hwid": {}, "secondary_hwid_groups": {},
+            "direct_ip_connections": {}, "secondary_ip_connections": {}, "login": set(), "other": set(),
+            "direct_hwid_connected": set(), "alt_hwid_relations": {}, "connection_paths": {},
+            "time_based_links": {"recent": set(), "historical": set()}
+        }
+        categorized = {primary_nickname}
+
+        if hasattr(player, 'shared_hwid_nicknames') and player.shared_hwid_nicknames:
+            categories["marked_alts"] = [n for n in player.shared_hwid_nicknames if n != primary_nickname]
+            categorized.update(categories["marked_alts"])
+
+        for hwid, nicks in player.associated_hwids.items():
+            if primary_nickname in nicks:
+                others = [n for n in nicks if n != primary_nickname]
+                if others:
+                    categories["direct_hwid"][hwid] = others
+                    categories["direct_hwid_connected"].update(others)
+                    categorized.update(others)
+                    for other in others:
+                        categories["connection_paths"][other] = {"type": "hwid", "hwid": hwid, "confidence": "high"}
+
+        verified_alts, unverified_alts = [], []
+        for alt in categories["marked_alts"]:
+            (verified_alts if alt in categories["direct_hwid_connected"] else unverified_alts).append(alt)
+        categories["marked_alts"], categories["unverified_alts"] = verified_alts, unverified_alts
+
+        for hwid, nicks in player.associated_hwids.items():
+            if hwid in categories["direct_hwid"] or primary_nickname in nicks or len(nicks) < 2:
+                continue
+            key = "-".join(sorted(nicks))
+            categories["secondary_hwid_groups"][key] = {"hwid": hwid, "accounts": nicks}
+            categorized.update(nicks)
+            for nick in nicks:
+                if nick not in categories["connection_paths"]:
+                    categories["connection_paths"][nick] = {"type": "secondary_hwid", "hwid": hwid,
+                                                            "confidence": "medium",
+                                                            "shared_with": [n for n in nicks if n != nick]}
+
+        for hwid, nicks in player.associated_hwids.items():
+            alt_nicks = [n for n in nicks if n in player.nicknames and n != primary_nickname]
+            if len(alt_nicks) >= 2:
+                categories["alt_hwid_relations"][hwid] = alt_nicks
+
+        for ip, nicks in player.associated_ips.items():
+            if primary_nickname in nicks:
+                matches = [n for n in nicks if n != primary_nickname]
+                if matches:
+                    categories["direct_ip_connections"][ip] = matches
+                    categorized.update(matches)
+                    for match in matches:
+                        categories["connection_paths"].setdefault(match, {"type": "ip", "ip": ip, "confidence": "low"})
+
+        for ip, direct in categories["direct_ip_connections"].items():
+            for d in direct:
+                for sec_ip, sec_nicks in player.associated_ips.items():
+                    if d in sec_nicks and primary_nickname not in sec_nicks:
+                        for sec in sec_nicks:
+                            if sec != d and sec not in categorized:
+                                categories["secondary_ip_connections"].setdefault(sec_ip, []).append(
+                                    {"nickname": sec, "through": d})
+                                categorized.add(sec)
+                                categories["connection_paths"].setdefault(sec, {"type": "indirect_ip", "ip": sec_ip,
+                                                                                "through": d, "confidence": "very_low"})
+
+        if hasattr(player, 'nicknames_sources'):
+            for nick, source in player.nicknames_sources.items():
+                if source == "login" and nick != primary_nickname and nick not in categorized:
+                    categories["login"].add(nick)
+                    categorized.add(nick)
+                    categories["connection_paths"].setdefault(nick, {"type": "login_event", "confidence": "low"})
+
+        if hasattr(player, 'denied_logins') and player.denied_logins:
+            recent_threshold = datetime.now() - timedelta(days=360)
+            for login in player.denied_logins:
+                try:
+                    login_time = datetime.strptime(login['time'], "%Y-%m-%d %H:%M:%S")
+                    (categories["time_based_links"]["recent"] if login_time > recent_threshold else
+                     categories["time_based_links"]["historical"]).add(login['user_name'])
+                except Exception:
+                    pass
+
+        categories["other"] = {n for n in player.nicknames if n != primary_nickname and n not in categorized}
+        return categories
 
     def _print_complaints_section(self, player: Player, nickname: str) -> None:
         box = self.box
