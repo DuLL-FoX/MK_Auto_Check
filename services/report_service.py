@@ -317,6 +317,186 @@ class ReportService:
             hwid_data["hwids"].append(hwid_entry)
         return hwid_data
 
+    def _print_connection_paths_section(self, player: Player, nickname: str) -> None:
+        box = self.box
+        fmt = self.fmt
+
+        if not player.nicknames or len(player.nicknames) <= 1:
+            return
+
+        connection_paths = {}
+        primary_hwids = set()
+        primary_ips = set()
+
+        for hwid, nicks in player.associated_hwids.items():
+            if nickname in nicks:
+                primary_hwids.add(hwid)
+
+        for ip, nicks in player.associated_ips.items():
+            if nickname in nicks:
+                primary_ips.add(ip)
+
+        direct_connections = {}
+        for hwid in primary_hwids:
+            for nick in player.associated_hwids.get(hwid, []):
+                if nick != nickname and nick in player.nicknames:
+                    direct_connections[nick] = {
+                        "type": "hwid",
+                        "identifier": hwid,
+                        "confidence": "High",
+                        "path": f"{nickname} → {hwid} → {nick}"
+                    }
+
+        for ip in primary_ips:
+            for nick in player.associated_ips.get(ip, []):
+                if nick != nickname and nick in player.nicknames:
+                    if nick not in direct_connections:
+                        direct_connections[nick] = {
+                            "type": "ip",
+                            "identifier": ip,
+                            "confidence": "Medium",
+                            "path": f"{nickname} → {ip} → {nick}"
+                        }
+
+        indirect_connections = {}
+        indirect_by_via = {}
+        directly_connected_nicks = set(direct_connections.keys())
+
+        for middle_nick in directly_connected_nicks:
+            for hwid, nicks in player.associated_hwids.items():
+                if middle_nick in nicks and nickname not in nicks:
+                    for nick in nicks:
+                        if nick != middle_nick and nick != nickname and nick in player.nicknames and nick not in direct_connections:
+                            if middle_nick not in indirect_by_via:
+                                indirect_by_via[middle_nick] = {"hwid": [], "ip": []}
+
+                            indirect_by_via[middle_nick]["hwid"].append({
+                                "nick": nick,
+                                "identifier": hwid
+                            })
+
+                            indirect_connections[nick] = {
+                                "type": "hwid-indirect",
+                                "identifier": hwid,
+                                "via": middle_nick,
+                                "confidence": "Medium"
+                            }
+
+            for ip, nicks in player.associated_ips.items():
+                if middle_nick in nicks and nickname not in nicks:
+                    for nick in nicks:
+                        if nick != middle_nick and nick != nickname and nick in player.nicknames and nick not in direct_connections and nick not in indirect_connections:
+                            if middle_nick not in indirect_by_via:
+                                indirect_by_via[middle_nick] = {"hwid": [], "ip": []}
+
+                            indirect_by_via[middle_nick]["ip"].append({
+                                "nick": nick,
+                                "identifier": ip
+                            })
+
+                            indirect_connections[nick] = {
+                                "type": "ip-indirect",
+                                "identifier": ip,
+                                "via": middle_nick,
+                                "confidence": "Low"
+                            }
+
+        if direct_connections or indirect_connections:
+            print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
+            print(f"  {fmt['BOLD']}{box['V']} CONNECTION EVIDENCE:{fmt['END']}")
+            print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * 96}{box['VL']}{fmt['END']}")
+
+            total_connections = len(direct_connections) + len(indirect_connections)
+            high_confidence = sum(1 for info in direct_connections.values() if info["confidence"] == "High")
+            medium_confidence = sum(1 for info in direct_connections.values() if info["confidence"] == "Medium") + \
+                                sum(1 for info in indirect_connections.values() if info["confidence"] == "Medium")
+            low_confidence = sum(1 for info in indirect_connections.values() if info["confidence"] == "Low")
+
+            print(f"  {box['V']} {fmt['BOLD']}Overview:{fmt['END']} {total_connections} connected accounts detected")
+            print(f"  {box['V']}   • {fmt['GREEN']}{high_confidence} high confidence{fmt['END']} | "
+                  f"{fmt['YELLOW']}{medium_confidence} medium confidence{fmt['END']} | "
+                  f"{fmt['RED']}{low_confidence} low confidence{fmt['END']}")
+            print(f"  {box['V']}")
+
+            if direct_connections:
+                print(
+                    f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ DIRECT CONNECTIONS ({len(direct_connections)}):{fmt['END']}")
+
+                hwid_direct = [(nick, info) for nick, info in direct_connections.items() if info["type"] == "hwid"]
+                ip_direct = [(nick, info) for nick, info in direct_connections.items() if info["type"] == "ip"]
+
+                if hwid_direct:
+                    print(f"  {box['V']}   {fmt['BOLD']}HWID-linked accounts:{fmt['END']}")
+
+                    by_hwid = {}
+                    for nick, info in hwid_direct:
+                        hwid = info["identifier"]
+                        if hwid not in by_hwid:
+                            by_hwid[hwid] = []
+                        by_hwid[hwid].append(nick)
+
+                    for hwid, nicks in by_hwid.items():
+                        print(f"  {box['V']}     • {self._format_hwid(hwid)}: {', '.join(nicks)}")
+                        print(f"  {box['V']}       {fmt['GREEN']}High confidence{fmt['END']} (direct HWID sharing)")
+
+                    if ip_direct:
+                        print(f"  {box['V']}")
+
+                if ip_direct:
+                    print(f"  {box['V']}   {fmt['BOLD']}IP-linked accounts:{fmt['END']}")
+
+                    by_ip = {}
+                    for nick, info in ip_direct:
+                        ip = info["identifier"]
+                        if ip not in by_ip:
+                            by_ip[ip] = []
+                        by_ip[ip].append(nick)
+
+                    for ip, nicks in by_ip.items():
+                        print(f"  {box['V']}     • {fmt['CYAN']}{ip}{fmt['END']}: {', '.join(nicks)}")
+                        print(f"  {box['V']}       {fmt['YELLOW']}Medium confidence{fmt['END']} (direct IP sharing)")
+
+                if indirect_connections:
+                    print(f"  {box['V']}")
+
+            if indirect_connections:
+                print(
+                    f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ INDIRECT CONNECTIONS ({len(indirect_connections)}):{fmt['END']}")
+
+                for via_nick, connections in indirect_by_via.items():
+                    if connections["hwid"] or connections["ip"]:
+                        print(f"  {box['V']}   {fmt['BOLD']}Through {via_nick}:{fmt['END']}")
+
+                    if connections["hwid"]:
+                        by_hwid = {}
+                        for conn in connections["hwid"]:
+                            hwid = conn["identifier"]
+                            if hwid not in by_hwid:
+                                by_hwid[hwid] = []
+                            by_hwid[hwid].append(conn["nick"])
+
+                        for hwid, nicks in by_hwid.items():
+                            print(f"  {box['V']}     • HWID {self._format_hwid(hwid)}: {', '.join(nicks)}")
+                            print(
+                                f"  {box['V']}       {fmt['YELLOW']}Medium confidence{fmt['END']} | Path: {nickname} → {via_nick} → [accounts]")
+
+                    if connections["ip"]:
+                        by_ip = {}
+                        for conn in connections["ip"]:
+                            ip = conn["identifier"]
+                            if ip not in by_ip:
+                                by_ip[ip] = []
+                            by_ip[ip].append(conn["nick"])
+
+                        for ip, nicks in by_ip.items():
+                            print(f"  {box['V']}     • IP {fmt['CYAN']}{ip}{fmt['END']}: {', '.join(nicks)}")
+                            print(
+                                f"  {box['V']}       {fmt['RED']}Low confidence{fmt['END']} | Path: {nickname} → {via_nick} → [accounts]")
+
+                    print(f"  {box['V']}")
+
+            print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
+
     def _print_nickname_search_results(self, nickname: str, player: Player) -> None:
         box = self.box
         fmt = self.fmt
@@ -325,7 +505,7 @@ class ReportService:
 
         print(f"  {fmt['BOLD']}STATUS:{fmt['END']} {status_str} | {fmt['BOLD']}BANS:{fmt['END']} {player.ban_counts}")
         if hasattr(player, 'ban_reasons') and player.ban_reasons:
-            print(f"  {fmt['BOLD']}BAN REASONS:{fmt['END']} {', '.join(player.ban_reasons)}")
+            self._print_ban_reasons(player)
 
         if len(player.nicknames) > 1:
             print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
@@ -334,43 +514,109 @@ class ReportService:
             categorized_nicks = self._categorize_associated_nicknames(player, nickname)
             has_categories = False
 
-            if categorized_nicks["marked_alts"] or categorized_nicks["direct_hwid_connected"]:
+            if categorized_nicks["direct_hwid_connected"]:
                 has_categories = True
                 print(f"  {box['V']}")
                 print(f"  {box['V']}   {fmt['BOLD']}{fmt['RED']}■ CONFIRMED ALTS:{fmt['END']}")
-                if categorized_nicks["marked_alts"]:
+
+                confirmed_alts = list(categorized_nicks['direct_hwid_connected'])
+                if confirmed_alts:
+                    print(f"  {box['V']}     {fmt['BOLD']}Accounts:{fmt['END']} {', '.join(confirmed_alts)}")
+
+                if categorized_nicks["direct_hwid"]:
                     print(
-                        f"  {box['V']}     {fmt['BOLD']}Identified Alts:{fmt['END']} {', '.join(categorized_nicks['marked_alts'])}")
-                if categorized_nicks["alt_hwid_relations"]:
-                    print(f"  {box['V']}     {fmt['BOLD']}Alt accounts sharing HWIDs:{fmt['END']}")
-                    for hwid, connected_alts in categorized_nicks["alt_hwid_relations"].items():
-                        print(f"  {box['V']}       • {self._format_hwid(hwid)}: {', '.join(connected_alts)}")
+                        f"  {box['V']}     {fmt['BOLD']}Directly shared HWIDs:{fmt['END']} {len(categorized_nicks['direct_hwid'])}")
+                    for hwid, connected_alts in categorized_nicks["direct_hwid"].items():
+                        if len(connected_alts) <= 5:
+                            print(f"  {box['V']}       • {self._format_hwid(hwid)}: {', '.join(connected_alts)}")
+                        else:
+                            print(
+                                f"  {box['V']}       • {self._format_hwid(hwid)}: {', '.join(connected_alts[:5])}, and {len(connected_alts) - 5} more")
+
+            if categorized_nicks["alt_hwid_relations"]:
+                has_categories = True
+                print(f"  {box['V']}")
+                print(f"  {box['V']}   {fmt['BOLD']}{fmt['YELLOW']}■ ALT-TO-ALT CONNECTIONS:{fmt['END']}")
+                total_hwids = len(categorized_nicks["alt_hwid_relations"])
+
+                all_connections = []
+                for hwid, connected_alts in categorized_nicks["alt_hwid_relations"].items():
+                    all_connections.extend(connected_alts)
+
+                top_connected = [item for item, count in
+                                 sorted([(x, all_connections.count(x)) for x in set(all_connections)],
+                                        key=lambda x: x[1], reverse=True)]
+
+                print(
+                    f"  {box['V']}     {fmt['BOLD']}Connected Alt Accounts:{fmt['END']} {', '.join(top_connected[:10])}")
+                if len(top_connected) > 10:
+                    print(f"  {box['V']}       (and {len(top_connected) - 10} more accounts)")
+                print(f"  {box['V']}     {fmt['BOLD']}Shared across:{fmt['END']} {total_hwids} HWIDs")
+                print(
+                    f"  {box['V']}     {fmt['BOLD']}Note:{fmt['END']} These accounts share HWIDs with each other, but not directly with {nickname}")
 
             if categorized_nicks["secondary_hwid_groups"]:
                 has_categories = True
                 print(f"  {box['V']}")
                 print(f"  {box['V']}   {fmt['BOLD']}{fmt['YELLOW']}■ LIKELY CONNECTIONS:{fmt['END']}")
+
+                all_secondary_accounts = []
                 for group_info in categorized_nicks["secondary_hwid_groups"].values():
-                    print(f"  {box['V']}     • {fmt['BOLD']}HWID:{fmt['END']} {self._format_hwid(group_info['hwid'])}")
-                    print(f"  {box['V']}       {fmt['BOLD']}Accounts:{fmt['END']} {', '.join(group_info['accounts'])}")
+                    all_secondary_accounts.extend(group_info['accounts'])
+
+                account_counts = [(acc, all_secondary_accounts.count(acc)) for acc in set(all_secondary_accounts)]
+                sorted_accounts = sorted(account_counts, key=lambda x: x[1], reverse=True)
+
+                for account, count in sorted_accounts[:10]:
+                    strength = "Strong" if count > 1 else "Moderate"
+                    strength_fmt = fmt['YELLOW'] if count > 1 else fmt['CYAN']
+                    print(
+                        f"  {box['V']}     • {account}: {strength_fmt}{strength}{fmt['END']} ({count} shared identifiers)")
+
+                if len(sorted_accounts) > 10:
+                    print(
+                        f"  {box['V']}     • ...and {len(sorted_accounts) - 10} more accounts with likely connections")
 
             if categorized_nicks["direct_ip_connections"] or categorized_nicks["login"]:
                 has_categories = True
                 print(f"  {box['V']}")
                 print(f"  {box['V']}   {fmt['BOLD']}{fmt['CYAN']}■ POSSIBLE CONNECTIONS:{fmt['END']}")
-                if categorized_nicks["direct_ip_connections"]:
-                    print(f"  {box['V']}     {fmt['BOLD']}IP Matches:{fmt['END']}")
-                    for ip, nicks in categorized_nicks["direct_ip_connections"].items():
-                        print(f"  {box['V']}       • {fmt['CYAN']}{ip}{fmt['END']}: {', '.join(nicks)}")
+
                 if categorized_nicks["login"]:
-                    print(
-                        f"  {box['V']}     {fmt['BOLD']}Login Event Matches:{fmt['END']} {', '.join(categorized_nicks['login'])}")
+                    login_matches = list(categorized_nicks['login'])
+                    if len(login_matches) <= 5:
+                        print(
+                            f"  {box['V']}     {fmt['BOLD']}Login Event Matches:{fmt['END']} {', '.join(login_matches)}")
+                    else:
+                        print(
+                            f"  {box['V']}     {fmt['BOLD']}Login Event Matches:{fmt['END']} {', '.join(login_matches[:5])}, and {len(login_matches) - 5} more")
+
+                if categorized_nicks["direct_ip_connections"]:
+                    all_ip_accounts = []
+                    for ip, nicks in categorized_nicks["direct_ip_connections"].items():
+                        all_ip_accounts.extend(nicks)
+
+                    account_counts = [(acc, all_ip_accounts.count(acc)) for acc in set(all_ip_accounts)]
+                    sorted_accounts = sorted(account_counts, key=lambda x: x[1], reverse=True)
+
+                    print(f"  {box['V']}     {fmt['BOLD']}IP Matches ({len(set(all_ip_accounts))}):{fmt['END']}")
+                    for account, count in sorted_accounts[:5]:
+                        print(f"  {box['V']}       • {account} ({count} shared IPs)")
+
+                    if len(sorted_accounts) > 5:
+                        print(f"  {box['V']}       • ...and {len(sorted_accounts) - 5} more IP-connected accounts")
 
             if categorized_nicks["other"]:
                 has_categories = True
                 print(f"  {box['V']}")
-                print(
-                    f"  {box['V']}   {fmt['BOLD']}■ OTHER ASSOCIATED NICKNAMES:{fmt['END']} {', '.join(categorized_nicks['other'])}")
+
+                other_nicks = list(categorized_nicks['other'])
+                if len(other_nicks) <= 10:
+                    print(
+                        f"  {box['V']}   {fmt['BOLD']}■ OTHER ASSOCIATED NICKNAMES:{fmt['END']} {', '.join(other_nicks)}")
+                else:
+                    print(
+                        f"  {box['V']}   {fmt['BOLD']}■ OTHER ASSOCIATED NICKNAMES ({len(other_nicks)}):{fmt['END']} {', '.join(other_nicks[:7])}, and {len(other_nicks) - 7} more")
 
             if not has_categories:
                 other_nicks = [nick for nick in player.nicknames if nick != nickname]
@@ -379,6 +625,7 @@ class ReportService:
 
             print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
 
+        self._print_connection_paths_section(player, nickname)
         self._print_complaints_section(player, nickname)
         self._print_ip_section(player, nickname)
         self._print_hwid_section(player, nickname)
@@ -426,9 +673,10 @@ class ReportService:
                                                             "shared_with": [n for n in nicks if n != nick]}
 
         for hwid, nicks in player.associated_hwids.items():
-            alt_nicks = [n for n in nicks if n in player.nicknames and n != primary_nickname]
-            if len(alt_nicks) >= 2:
-                categories["alt_hwid_relations"][hwid] = alt_nicks
+            if primary_nickname not in nicks:
+                alt_nicks = [n for n in nicks if n in player.nicknames and n != primary_nickname]
+                if len(alt_nicks) >= 2:
+                    categories["alt_hwid_relations"][hwid] = alt_nicks
 
         for ip, nicks in player.associated_ips.items():
             if primary_nickname in nicks:
@@ -471,33 +719,107 @@ class ReportService:
         categories["other"] = {n for n in player.nicknames if n != primary_nickname and n not in categorized}
         return categories
 
+    def _print_ban_reasons(self, player, indent="  "):
+        box = self.box
+        fmt = self.fmt
+
+        if not hasattr(player, 'ban_reasons') or not player.ban_reasons:
+            return
+
+        print(f"{indent}{fmt['BOLD']}BAN REASONS ({len(player.ban_reasons)}):{fmt['END']}")
+
+        for i, reason in enumerate(player.ban_reasons, 1):
+            if len(reason) > 200:
+                print(f"{indent}  {fmt['RED']}{i}.{fmt['END']} {reason[:200]}")
+                remaining = reason[200:]
+                chunks = [remaining[j:j + 200] for j in range(0, len(remaining), 200)]
+                for chunk in chunks:
+                    print(f"{indent}     {chunk}")
+            else:
+                print(f"{indent}  {fmt['RED']}{i}.{fmt['END']} {reason}")
+
     def _print_complaints_section(self, player: Player, nickname: str) -> None:
         box = self.box
         fmt = self.fmt
         if not hasattr(player, 'complaint_links') or not player.complaint_links:
             return
-        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
-        print(f"  {fmt['BOLD']}{box['V']} {fmt['YELLOW']}COMPLAINTS ({len(player.complaint_links)}):{fmt['END']}")
-        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * 96}{box['VL']}{fmt['END']}")
-        for i, complaint in enumerate(player.complaint_links, 1):
-            link = complaint.get("link", "No link")
-            channel = complaint.get("channel", "Unknown channel")
-            content = complaint.get("content", "No content available")
-            author = complaint.get("author", "Unknown")
-            print(f"  {box['V']}   {box['TL']}{box['H'] * 92}{box['TR']}")
-            print(f"  {box['V']}   {box['V']} {i}. {fmt['BLUE']}{fmt['UNDERLINE']}{link}{fmt['END']}")
-            print(
-                f"  {box['V']}   {box['V']} {fmt['BOLD']}Channel:{fmt['END']} {channel} | {fmt['BOLD']}Author:{fmt['END']} {author}")
-            if content:
-                print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Content:{fmt['END']}")
-                _print_wrapped_content(content, box, indent="          ")
-            else:
-                print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Content:{fmt['END']} No content available")
+
+        direct_connections = set([nickname])
+
+        for hwid, nicks in player.associated_hwids.items():
+            if nickname in nicks:
+                direct_connections.update([n for n in nicks if n != nickname])
+
+        for ip, nicks in player.associated_ips.items():
+            if nickname in nicks:
+                direct_connections.update([n for n in nicks if n != nickname])
+
+        direct_complaints = []
+        indirect_complaints = []
+
+        for complaint in player.complaint_links:
             mentioned_nicks = complaint.get("mentioned_nicknames", [nickname])
-            if len(mentioned_nicks) > 1:
+
+            is_direct = any(nick in direct_connections for nick in mentioned_nicks)
+
+            if not is_direct and "content" in complaint:
+                content = complaint.get("content", "").lower()
+                is_direct = any(nick.lower() in content for nick in direct_connections)
+
+            if is_direct:
+                direct_complaints.append(complaint)
+            else:
+                indirect_complaints.append(complaint)
+
+        print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['V']} COMPLAINTS ({len(player.complaint_links)}):{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * 96}{box['VL']}{fmt['END']}")
+
+        if direct_complaints:
+            print(
+                f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ DIRECT CONNECTIONS ({len(direct_complaints)}):{fmt['END']}")
+            for i, complaint in enumerate(direct_complaints, 1):
+                link = complaint.get("link", "No link")
+                channel = complaint.get("channel", "Unknown channel")
+                content = complaint.get("content", "No content available")
+                author = complaint.get("author", "Unknown")
+                print(f"  {box['V']}   {box['TL']}{box['H'] * 92}{box['TR']}")
+                print(f"  {box['V']}   {box['V']} {i}. {fmt['BLUE']}{fmt['UNDERLINE']}{link}{fmt['END']}")
                 print(
-                    f"  {box['V']}   {box['V']} {fmt['BOLD']}Associated with:{fmt['END']} {', '.join(mentioned_nicks)}")
-            print(f"  {box['V']}   {box['BL']}{box['H'] * 92}{box['BR']}")
+                    f"  {box['V']}   {box['V']} {fmt['BOLD']}Channel:{fmt['END']} {channel} | {fmt['BOLD']}Author:{fmt['END']} {author}")
+                if content:
+                    print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Content:{fmt['END']}")
+                    _print_wrapped_content(content, box, indent="          ")
+                else:
+                    print(f"  {box['V']}   {box['V']} {fmt['BOLD']}Content:{fmt['END']} No content available")
+                mentioned_nicks = complaint.get("mentioned_nicknames", [nickname])
+                if len(mentioned_nicks) > 1:
+                    print(
+                        f"  {box['V']}   {box['V']} {fmt['BOLD']}Associated with:{fmt['END']} {', '.join(mentioned_nicks)}")
+                print(f"  {box['V']}   {box['BL']}{box['H'] * 92}{box['BR']}")
+
+        if indirect_complaints:
+            if direct_complaints:
+                print(f"  {box['V']}")
+            print(
+                f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ INDIRECT CONNECTIONS ({len(indirect_complaints)}):{fmt['END']}")
+
+            channels = {}
+            for complaint in indirect_complaints:
+                channel = complaint.get("channel", "Unknown channel")
+                channels[channel] = channels.get(channel, 0) + 1
+
+            if channels:
+                for channel, count in channels.items():
+                    print(f"  {box['V']}     • {channel}: {count} complaints")
+
+            if indirect_complaints:
+                links = [complaint.get("link", "No link") for complaint in indirect_complaints[:3]]
+                print(f"  {box['V']}     • Sample links: {', '.join(links)}")
+
+                if len(indirect_complaints) > 3:
+                    print(f"  {box['V']}     • ... and {len(indirect_complaints) - 3} more complaints not shown")
+
         print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
 
     def _print_ip_section(self, player: Player, nickname: str) -> None:
@@ -512,47 +834,40 @@ class ReportService:
         alt_shared_ips = []
         multi_user_ips = []
 
-        # Count IPs by category
-        solo_non_relevant_count = 0
-        total_ips = 0
-
         for ip, shared_with in player.associated_ips.items():
-            total_ips += 1
-
             if nickname in shared_with:
                 if len(shared_with) == 1:
                     original_ips.append(ip)
                 else:
                     shared_ips.append((ip, shared_with))
             elif any(nick in player.nicknames for nick in shared_with):
-                if len(shared_with) > 1:
-                    alt_shared_ips.append((ip, shared_with))
+                alt_shared_ips.append((ip, shared_with))
             elif len(shared_with) > 1:
                 multi_user_ips.append((ip, shared_with))
-            else:
-                solo_non_relevant_count += 1
 
         shared_ips.sort(key=lambda x: len(x[1]), reverse=True)
         alt_shared_ips.sort(key=lambda x: len(x[1]), reverse=True)
         multi_user_ips.sort(key=lambda x: len(x[1]), reverse=True)
 
-        meaningful_count = len(original_ips) + len(shared_ips) + len(alt_shared_ips) + len(multi_user_ips)
-
-        if meaningful_count == 0:
-            return
+        total_relevant_ips = len(original_ips) + len(shared_ips) + len(alt_shared_ips) + len(multi_user_ips)
 
         width = 96
         print(f"\n  {fmt['BOLD']}{box['TL']}{box['H'] * width}{box['TR']}{fmt['END']}")
-        print(
-            f"  {fmt['BOLD']}{box['V']} ASSOCIATED IPs ({total_ips} total, {meaningful_count} with intersections):{fmt['END']}")
+        print(f"  {fmt['BOLD']}{box['V']} ASSOCIATED IPs ({total_relevant_ips} total):{fmt['END']}")
         print(f"  {fmt['BOLD']}{box['VR']}{box['H'] * width}{box['VL']}{fmt['END']}")
 
         if original_ips:
             print(
                 f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ PRIMARY IPs ({len(original_ips)}) - Used only by {nickname}:{fmt['END']}")
-            for i, ip in enumerate(original_ips, 1):
+
+            if len(original_ips) == 1:
                 print(
-                    f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']} - {fmt['GREEN']}Only used by {nickname}{fmt['END']}")
+                    f"  {box['V']}   {fmt['BOLD']}1.{fmt['END']} {fmt['CYAN']}{original_ips[0]}{fmt['END']} - {fmt['GREEN']}Only used by {nickname}{fmt['END']}")
+            else:
+                print(
+                    f"  {box['V']}   {fmt['BOLD']}1.{fmt['END']} {fmt['CYAN']}{original_ips[0]}{fmt['END']} - {fmt['GREEN']}Only used by {nickname}{fmt['END']}")
+                print(
+                    f"  {box['V']}   {fmt['BOLD']}+ {len(original_ips) - 1} additional IPs used only by {nickname}{fmt['END']}")
 
             if shared_ips or alt_shared_ips or multi_user_ips:
                 print(f"  {box['V']}")
@@ -573,59 +888,75 @@ class ReportService:
                 print(f"  {box['V']}")
 
         if alt_shared_ips:
-            section_added = False
-            alt_section_header = (
-                f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ ALT ACCOUNT SHARED IPs ({len(alt_shared_ips)}):{fmt['END']}"
-            )
+            multi_alt_ips = []
+            solo_alt_ips = []
 
-            for i, (ip, users) in enumerate(alt_shared_ips, 1):
+            for ip, users in alt_shared_ips:
                 alt_owners = [user for user in users if user in player.nicknames]
                 others = [user for user in users if user not in player.nicknames]
 
-                if alt_owners and others:
-                    if not section_added:
-                        print(alt_section_header)
-                        section_added = True
+                if len(alt_owners) > 1 or others:
+                    multi_alt_ips.append((ip, alt_owners, others))
+                else:
+                    solo_alt_ips.append((ip, alt_owners[0]))
 
-                    print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
-                    print(f"  {box['V']}      {fmt['YELLOW']}Used by alt(s):{fmt['END']} {', '.join(alt_owners)}")
-                    if others:
-                        others_str = _truncate_list(others, 5)
-                        print(f"  {box['V']}      {fmt['YELLOW']}Also used by:{fmt['END']} {others_str}")
-                    if i < len(alt_shared_ips) - 1:
-                        print(f"  {box['V']}")
+            print(f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ ALT ACCOUNT IPs ({len(alt_shared_ips)}):{fmt['END']}")
 
-            if section_added and multi_user_ips:
+            for i, (ip, alt_owners, others) in enumerate(multi_alt_ips, 1):
+                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']}")
+                print(f"  {box['V']}      {fmt['YELLOW']}Used by alt(s):{fmt['END']} {', '.join(alt_owners)}")
+                if others:
+                    others_str = _truncate_list(others, 5)
+                    print(f"  {box['V']}      {fmt['YELLOW']}Also used by:{fmt['END']} {others_str}")
+                if i < len(multi_alt_ips) or solo_alt_ips:
+                    print(f"  {box['V']}")
+
+            if solo_alt_ips:
+                print(
+                    f"  {box['V']}   {fmt['BOLD']}+ {len(solo_alt_ips)} additional IPs used by single alt accounts{fmt['END']}")
+
+            if multi_user_ips:
                 print(f"  {box['V']}")
 
-        if multi_user_ips and len(multi_user_ips) <= 10:
+        if multi_user_ips:
             print(f"  {box['V']} {fmt['BOLD']}■ OTHER SHARED IPs ({len(multi_user_ips)}):{fmt['END']}")
-            for i, (ip, users) in enumerate(multi_user_ips, 1):
-                users_str = _truncate_list(users, 5)
-                print(
-                    f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']} - Used by: {users_str}")
-        elif multi_user_ips:
-            print(f"  {box['V']} {fmt['BOLD']}■ OTHER SHARED IPs ({len(multi_user_ips)}):{fmt['END']}")
-            ip_ranges = {}
-            for ip, _ in multi_user_ips:
-                prefix = '.'.join(ip.split('.')[:2])
-                if prefix not in ip_ranges:
-                    ip_ranges[prefix] = []
-                ip_ranges[prefix].append(ip)
 
-            print(f"  {box['V']}   {fmt['BOLD']}IP Range Distribution:{fmt['END']}")
-            sorted_ranges = sorted(ip_ranges.items(), key=lambda x: len(x[1]), reverse=True)
-            for prefix, ips in sorted_ranges[:5]:
-                print(f"  {box['V']}      {prefix}.x.x: {len(ips)} IPs")
+            if len(multi_user_ips) <= 20:
+                for i, (ip, users) in enumerate(multi_user_ips, 1):
+                    users_str = _truncate_list(users, 5)
+                    print(
+                        f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {fmt['CYAN']}{ip}{fmt['END']} - Used by: {users_str}")
 
-            if len(sorted_ranges) > 5:
-                remaining = sum(len(ips) for prefix, ips in sorted_ranges[5:])
-                print(f"  {box['V']}      Other ranges: {remaining} IPs")
+                    if i % 5 == 0 and i < len(multi_user_ips):
+                        print(f"  {box['V']}")
+            else:
+                ip_ranges = {}
+                for ip, _ in multi_user_ips:
+                    prefix = '.'.join(ip.split('.')[:2])
+                    if prefix not in ip_ranges:
+                        ip_ranges[prefix] = []
+                    ip_ranges[prefix].append(ip)
 
-        if solo_non_relevant_count > 0:
-            print(f"  {box['V']}")
-            print(
-                f"  {box['V']} {fmt['BOLD']}■ NOTE:{fmt['END']} {solo_non_relevant_count} additional IPs with single users not shown")
+                print(f"  {box['V']}   {fmt['BOLD']}IP Range Distribution:{fmt['END']}")
+                sorted_ranges = sorted(ip_ranges.items(), key=lambda x: len(x[1]), reverse=True)
+
+                for prefix, ips in sorted_ranges[:5]:
+                    print(f"  {box['V']}      {prefix}.x.x: {len(ips)} IPs")
+
+                    for sample_ip in ips[:3]:
+                        users = player.associated_ips[sample_ip]
+                        users_str = _truncate_list(users, 3)
+                        print(f"  {box['V']}        - {fmt['CYAN']}{sample_ip}{fmt['END']} (Used by: {users_str})")
+
+                    if len(ips) > 3:
+                        print(f"  {box['V']}        - ... and {len(ips) - 3} more IPs in this range")
+
+                    print(f"  {box['V']}")
+
+                if len(sorted_ranges) > 5:
+                    remaining_ranges = len(sorted_ranges) - 5
+                    remaining_ips = sum(len(ips) for prefix, ips in sorted_ranges[5:])
+                    print(f"  {box['V']}      Other {remaining_ranges} ranges: {remaining_ips} IPs")
 
         print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * width}{box['BR']}{fmt['END']}")
 
@@ -662,12 +993,23 @@ class ReportService:
         if original_hwids:
             print(
                 f"  {box['V']} {fmt['BOLD']}{fmt['GREEN']}■ PRIMARY HWIDs ({len(original_hwids)}) - Used only by {nickname}:{fmt['END']}")
-            for i, (hwid, _) in enumerate(original_hwids, 1):
-                formatted_hwid = self._format_hwid(hwid)
-                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
-                print(f"  {box['V']}      {fmt['GREEN']}Only used by {nickname}{fmt['END']}")
-                if i < len(original_hwids):
-                    print(f"  {box['V']}")
+            if len(original_hwids) <= 5:
+                for i, (hwid, _) in enumerate(original_hwids, 1):
+                    formatted_hwid = self._format_hwid(hwid)
+                    print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
+                    print(f"  {box['V']}      {fmt['GREEN']}Only used by {nickname}{fmt['END']}")
+                    if i < len(original_hwids):
+                        print(f"  {box['V']}")
+            else:
+                for i, (hwid, _) in enumerate(original_hwids[:3], 1):
+                    formatted_hwid = self._format_hwid(hwid)
+                    print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
+                    print(f"  {box['V']}      {fmt['GREEN']}Only used by {nickname}{fmt['END']}")
+                    if i < 3:
+                        print(f"  {box['V']}")
+                print(
+                    f"  {box['V']}   {fmt['BOLD']}+ {len(original_hwids) - 3} more HWIDs used only by {nickname}{fmt['END']}")
+
             if shared_hwids or alt_hwids or other_hwids:
                 print(f"  {box['V']}{box['H'] * width}")
 
@@ -689,34 +1031,127 @@ class ReportService:
                 print(f"  {box['V']}{box['H'] * width}")
 
         if alt_hwids:
-            print(
-                f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ ALT ACCOUNT HWIDs ({len(alt_hwids)}) - Used by alts but not by {nickname}:{fmt['END']}")
-            for i, (hwid, shared_with) in enumerate(alt_hwids, 1):
-                formatted_hwid = self._format_hwid(hwid)
+            multi_alt_hwids = []
+            single_alt_hwids = {}
+
+            for hwid, shared_with in alt_hwids:
                 alt_owners = [nick for nick in shared_with if nick in player.nicknames]
                 others = [nick for nick in shared_with if nick not in player.nicknames]
-                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
-                print(f"  {box['V']}      {fmt['YELLOW']}Used by alt(s):{fmt['END']} {', '.join(alt_owners)}")
-                if others:
-                    shared_str = _truncate_list(others, 10)
-                    shared_str = _truncate_text(shared_str, 70)
-                    print(f"  {box['V']}      {fmt['YELLOW']}Also used by:{fmt['END']} {shared_str}")
-                if i < len(alt_hwids):
-                    print(f"  {box['V']}")
+
+                if len(alt_owners) > 1 or others:
+                    multi_alt_hwids.append((hwid, alt_owners, others))
+                else:
+                    alt_name = alt_owners[0]
+                    if alt_name not in single_alt_hwids:
+                        single_alt_hwids[alt_name] = []
+                    single_alt_hwids[alt_name].append(hwid)
+
+            alt_hwid_counts = {alt: len(hwids) for alt, hwids in single_alt_hwids.items()}
+
+            sorted_alts = sorted(alt_hwid_counts.items(), key=lambda x: x[1], reverse=True)
+
+            multi_hwid_alts = [alt for alt, count in sorted_alts if count > 1]
+            single_hwid_alts = [alt for alt, count in sorted_alts if count == 1]
+
+            total_alts_with_hwids = len(single_alt_hwids)
+
+            print(
+                f"  {box['V']} {fmt['BOLD']}{fmt['YELLOW']}■ ALT ACCOUNT HWIDs ({len(alt_hwids)}) - Used by alts but not by {nickname}:{fmt['END']}")
+
+            if multi_alt_hwids:
+                print(
+                    f"  {box['V']}   {fmt['BOLD']}HWIDs shared between multiple accounts ({len(multi_alt_hwids)}):{fmt['END']}")
+
+                for i, (hwid, alt_owners, others) in enumerate(multi_alt_hwids, 1):
+                    formatted_hwid = self._format_hwid(hwid)
+                    print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
+                    print(f"  {box['V']}      {fmt['YELLOW']}Used by alt(s):{fmt['END']} {', '.join(alt_owners)}")
+                    if others:
+                        shared_str = _truncate_list(others, 10)
+                        shared_str = _truncate_text(shared_str, 70)
+                        print(f"  {box['V']}      {fmt['YELLOW']}Also used by:{fmt['END']} {shared_str}")
+
+                    if i < len(multi_alt_hwids) and i < 10:
+                        print(f"  {box['V']}")
+
+                    if i >= 10 and len(multi_alt_hwids) > 10:
+                        print(
+                            f"  {box['V']}      {fmt['BOLD']}+ {len(multi_alt_hwids) - 10} more shared HWIDs{fmt['END']}")
+                        break
+
+                print(f"  {box['V']}")
+
+            if multi_hwid_alts:
+                print(f"  {box['V']}   {fmt['BOLD']}Alts with multiple HWIDs ({len(multi_hwid_alts)}):{fmt['END']}")
+
+                for i, (alt, count) in enumerate(sorted_alts[:10], 1):
+                    if count > 1:
+                        print(f"  {box['V']}      • {alt}: {count} HWIDs")
+
+                if len(multi_hwid_alts) > 10:
+                    print(f"  {box['V']}      • ...and {len(multi_hwid_alts) - 10} more alts with multiple HWIDs")
+
+                print(f"  {box['V']}")
+
+            if single_hwid_alts:
+                print(f"  {box['V']}   {fmt['BOLD']}Alts with single HWID ({len(single_hwid_alts)}):{fmt['END']}")
+
+                v2_hwids = 0
+                legacy_hwids = 0
+
+                for alt in single_hwid_alts:
+                    hwid = single_alt_hwids[alt][0]
+                    if hwid.startswith("V2-"):
+                        v2_hwids += 1
+                    else:
+                        legacy_hwids += 1
+
+                print(f"  {box['V']}      • {v2_hwids} V2 HWIDs, {legacy_hwids} legacy HWIDs")
+
+                if single_hwid_alts:
+                    print(f"  {box['V']}      • Sample: {', '.join(single_hwid_alts[:5])}" +
+                          (f", and {len(single_hwid_alts) - 5} more" if len(single_hwid_alts) > 5 else ""))
+
+                print(f"  {box['V']}")
+
             if other_hwids:
                 print(f"  {box['V']}{box['H'] * width}")
 
         if other_hwids:
+            other_users = {}
+            for hwid, shared_with in other_hwids:
+                for user in shared_with:
+                    other_users[user] = other_users.get(user, 0) + 1
+
+            top_other_users = sorted(other_users.items(), key=lambda x: x[1], reverse=True)
+
             print(
                 f"  {box['V']} {fmt['BOLD']}■ OTHER HWIDs ({len(other_hwids)}) - Not associated with {nickname} or alts:{fmt['END']}")
-            for i, (hwid, shared_with) in enumerate(other_hwids, 1):
+
+            print(f"  {box['V']}   {fmt['BOLD']}Summary:{fmt['END']}")
+            print(f"  {box['V']}      • Total unique users: {len(other_users)}")
+
+            if top_other_users:
+                print(f"  {box['V']}      • Top users by HWID count:")
+                for user, count in top_other_users[:5]:
+                    print(f"  {box['V']}        - {user}: {count} HWIDs")
+
+                if len(top_other_users) > 5:
+                    print(f"  {box['V']}        - ...and {len(top_other_users) - 5} more users")
+
+            print(f"  {box['V']}   {fmt['BOLD']}Sample HWIDs:{fmt['END']}")
+            for i, (hwid, shared_with) in enumerate(other_hwids[:3], 1):
                 formatted_hwid = self._format_hwid(hwid)
-                users_str = _truncate_list(shared_with, 10)
+                users_str = _truncate_list(shared_with, 5)
                 users_str = _truncate_text(users_str, 70)
-                print(f"  {box['V']}   {fmt['BOLD']}{i}.{fmt['END']} {formatted_hwid}")
-                print(f"  {box['V']}      {fmt['BOLD']}Used by:{fmt['END']} {users_str}")
-                if i < len(other_hwids):
+                print(f"  {box['V']}      {i}. {formatted_hwid}")
+                print(f"  {box['V']}         Used by: {users_str}")
+
+                if i < min(3, len(other_hwids)):
                     print(f"  {box['V']}")
+
+            if len(other_hwids) > 3:
+                print(f"  {box['V']}      ...and {len(other_hwids) - 3} more HWIDs")
 
         print(f"  {fmt['BOLD']}{box['BL']}{box['H'] * width}{box['BR']}{fmt['END']}")
 
@@ -787,8 +1222,8 @@ class ReportService:
                 print(
                     f"  {box['V']} {fmt['BOLD']}STATUS:{fmt['END']} {status_str}{hwid_erased} {box['V']} {fmt['BOLD']}BANS:{fmt['END']} {player.ban_counts}")
                 if hasattr(player, 'ban_reasons') and player.ban_reasons:
-                    reason_text = f"{fmt['BOLD']}BAN REASONS:{fmt['END']} {', '.join(player.ban_reasons)}"
-                    print(f"  {box['V']} {reason_text}")
+                    print(f"  {box['V']} ", end="")
+                    self._print_ban_reasons(player, indent=f"  {box['V']} ")
                 if len(player.nicknames) > 1:
                     alt_nicks = [n for n in player.nicknames if n != player.primary_nickname]
                     if alt_nicks:
