@@ -53,9 +53,9 @@ JSON_REPORT_FILENAME = "scan_report.json"
 
 # Search depth settings
 SEARCH_MAX_DEPTH = 3  # Maximum depth for player searches
-SEARCH_LIMIT_ROOT = 8  # Number of searches at root level (depth 0)
-SEARCH_LIMIT_LEVEL1 = 5  # Number of searches at level 1
-SEARCH_LIMIT_LEVEL2 = 3  # Number of searches at level 2
-SEARCH_LIMIT_DEFAULT = 2  # Number of searches at deeper levels
+SEARCH_LIMIT_ROOT = 20  # Number of searches at root level (depth 0)
+SEARCH_LIMIT_LEVEL1 = 10  # Number of searches at level 1
+SEARCH_LIMIT_LEVEL2 = 5  # Number of searches at level 2
+SEARCH_LIMIT_DEFAULT = 3  # Number of searches at deeper levels
 
 BYPASS_SEARCH_MAX_DEPTH = 2  # Maximum depth for player searches for bypass
