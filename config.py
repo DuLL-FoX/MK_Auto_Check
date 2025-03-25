@@ -32,14 +32,14 @@ TIME_THRESHOLD_MINUTES = 30
 SUSPICIOUS_TIME_THRESHOLD_MINUTES = 60
 IP_MATCH_TIMEDELTA_MINUTES = 30
 
-# Перенесенно как default в main.py по просьбе Blade_soul
+# Moved to main.py by ask of @Blade_soul
 # MESSAGE_LIMIT = 10
 # USERNAME = None
 # CHECK_BAN_BYPASS = False
 # BAN_BYPASS_PAGES = 5
 
 # API settings
-MAX_CONCURRENT_REQUESTS = 10
+MAX_CONCURRENT_REQUESTS = 20  # Play with this value, very depends on site load and your connection
 LOGIN_RETRY_LIMIT = 3
 REQUEST_TIMEOUT = 60
 

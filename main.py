@@ -32,14 +32,14 @@ def parse_arguments():
 def main():
     args = parse_arguments()
 
-    # Параметры по умолчанию (будут использованы, если не указаны ни в конфиге, ни в аргументах)
-    default_message_limit = 12
-    default_username = None
+    # By default values (used if not set in config)
+    default_message_limit = 1
+    default_username = "qwarytt"
     default_check_ban_bypass = False
     default_ban_bypass_pages = 1
 
     try:
-        config_file = args.config if args.config else "config.py"
+        config_file = args.config if args.config else "config_backup_v2.py"
         initialize(config_file)
         cfg = get_config()
     except Exception as e:
