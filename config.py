@@ -19,6 +19,8 @@ COMPLAINT_CHANNEL_IDS = [
     1291023511607054387,  # Adventure Time
     1241692667214168166,  # Space Stories - Marines
     1264636346610221068,  # FIRE STATION 2.0
+    1105247551881498764,  # SS220 (SS13?)
+    1132930484847005726,  # Backman
 ]
 
 # Admin credentials for admin.deadspace14.net
