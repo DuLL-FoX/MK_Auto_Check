@@ -57,68 +57,115 @@ class PlayerAnalyzer:
                 merged_players.append(self._merge_player_group([players[idx] for idx in group]))
         return merged_players
 
-    def _merge_player_group(self, player_group: List[Player]) -> Player:
-        if not player_group:
+    def _merge_player_group(self, players: List[Player]) -> Player:
+        if not players:
             return None
-        base_player = player_group[0]
+
+        base_player = players[0]
+
         all_nicknames = set(base_player.nicknames)
-        all_hwids = dict(base_player.associated_hwids)
-        all_ips = dict(base_player.associated_ips)
-        all_shared_hwid_nicks = set(base_player.shared_hwid_nicknames)
-        max_ban_count = base_player.ban_counts
-        all_ban_reasons = set(base_player.ban_reasons)
-        all_login_priorities = dict(getattr(base_player, 'login_priorities', {}))
-        all_login_timestamps = dict(getattr(base_player, 'login_timestamps', {}))
-        raw_message = getattr(base_player, 'raw_message', None)
+        all_associated_ips = dict(base_player.associated_ips)
+        all_associated_hwids = dict(base_player.associated_hwids)
+        shared_hwid_nicknames = set(base_player.shared_hwid_nicknames) if hasattr(base_player,
+                                                                                  'shared_hwid_nicknames') else set()
+
+        merged_ban_reasons = []
+        existing_ban_reasons = set()
+
+        if hasattr(base_player, 'ban_reasons') and base_player.ban_reasons:
+            for ban_info in base_player.ban_reasons:
+                if isinstance(ban_info, dict) and "reason" in ban_info and "username" in ban_info:
+                    key = (ban_info["reason"], ban_info["username"])
+                    if key not in existing_ban_reasons:
+                        merged_ban_reasons.append(ban_info)
+                        existing_ban_reasons.add(key)
+                elif isinstance(ban_info, str):
+                    key = (ban_info, "Unknown")
+                    if key not in existing_ban_reasons:
+                        merged_ban_reasons.append({
+                            "reason": ban_info,
+                            "username": "Unknown"
+                        })
+                        existing_ban_reasons.add(key)
+
         status_priority = {'banned': 3, 'suspicious': 2, 'clean': 1, 'unknown': 0}
-        current_status_priority = status_priority.get(base_player.status.lower(), 0)
-        for other_player in player_group[1:]:
-            all_nicknames.update(other_player.nicknames)
-            for hwid, nicks in other_player.associated_hwids.items():
-                if hwid in all_hwids:
-                    combined_nicks = set(all_hwids[hwid])
-                    combined_nicks.update(nicks)
-                    all_hwids[hwid] = list(combined_nicks)
+        highest_status = base_player.status.lower()
+        highest_priority = status_priority.get(highest_status, 0)
+        max_ban_count = base_player.ban_counts
+
+        for player in players[1:]:
+            all_nicknames.update(player.nicknames)
+
+            for ip, nicks in player.associated_ips.items():
+                if ip in all_associated_ips:
+                    existing_nicks = all_associated_ips[ip]
+                    combined_nicks = list(set(existing_nicks) | set(nicks))
+                    all_associated_ips[ip] = combined_nicks
                 else:
-                    all_hwids[hwid] = nicks
-            for ip, nicks in other_player.associated_ips.items():
-                if ip in all_ips:
-                    combined_nicks = set(all_ips[ip])
-                    combined_nicks.update(nicks)
-                    all_ips[ip] = list(combined_nicks)
+                    all_associated_ips[ip] = nicks
+
+            for hwid, nicks in player.associated_hwids.items():
+                if hwid in all_associated_hwids:
+                    existing_nicks = all_associated_hwids[hwid]
+                    combined_nicks = list(set(existing_nicks) | set(nicks))
+                    all_associated_hwids[hwid] = combined_nicks
                 else:
-                    all_ips[ip] = nicks
-            all_shared_hwid_nicks.update(other_player.shared_hwid_nicknames)
-            max_ban_count = max(max_ban_count, other_player.ban_counts)
-            all_ban_reasons.update(other_player.ban_reasons)
-            other_status_priority = status_priority.get(other_player.status.lower(), 0)
-            if other_status_priority > current_status_priority:
-                base_player.status = other_player.status
-                current_status_priority = other_status_priority
-            other_login_priorities = getattr(other_player, 'login_priorities', {})
-            for nick, priority in other_login_priorities.items():
-                if nick not in all_login_priorities or priority < all_login_priorities[nick]:
-                    all_login_priorities[nick] = priority
-            other_login_timestamps = getattr(other_player, 'login_timestamps', {})
-            for nick, timestamp in other_login_timestamps.items():
-                if nick not in all_login_timestamps or timestamp > all_login_timestamps[nick]:
-                    all_login_timestamps[nick] = timestamp
-            other_raw_message = getattr(other_player, 'raw_message', None)
-            if other_raw_message and "Arrived new player" in other_raw_message:
-                raw_message = other_raw_message
+                    all_associated_hwids[hwid] = nicks
+
+            if hasattr(player, 'shared_hwid_nicknames'):
+                shared_hwid_nicknames.update(player.shared_hwid_nicknames)
+
+            if hasattr(player, 'ban_reasons') and player.ban_reasons:
+                for ban_info in player.ban_reasons:
+                    if isinstance(ban_info, dict) and "reason" in ban_info and "username" in ban_info:
+                        key = (ban_info["reason"], ban_info["username"])
+                        if key not in existing_ban_reasons:
+                            merged_ban_reasons.append(ban_info)
+                            existing_ban_reasons.add(key)
+                    elif isinstance(ban_info, str):
+                        key = (ban_info, "Unknown")
+                        if key not in existing_ban_reasons:
+                            merged_ban_reasons.append({
+                                "reason": ban_info,
+                                "username": "Unknown"
+                            })
+                            existing_ban_reasons.add(key)
+
+            current_status = player.status.lower()
+            current_priority = status_priority.get(current_status, 0)
+            if current_priority > highest_priority:
+                highest_status = player.status
+                highest_priority = current_priority
+
+            max_ban_count = max(max_ban_count, player.ban_counts)
+
+            if hasattr(player, 'hwid_erased') and player.hwid_erased:
+                base_player.hwid_erased = True
+
+            if hasattr(player, 'complaint_links') and player.complaint_links:
+                if not hasattr(base_player, 'complaint_links'):
+                    base_player.complaint_links = []
+
+                existing_complaints = set()
+                if base_player.complaint_links:
+                    for complaint in base_player.complaint_links:
+                        if isinstance(complaint, dict):
+                            complaint_tuple = tuple(sorted((k, str(v)) for k, v in complaint.items()))
+                            existing_complaints.add(complaint_tuple)
+
+                for complaint in player.complaint_links:
+                    if isinstance(complaint, dict):
+                        complaint_tuple = tuple(sorted((k, str(v)) for k, v in complaint.items()))
+                        if complaint_tuple not in existing_complaints:
+                            base_player.complaint_links.append(complaint)
+                            existing_complaints.add(complaint_tuple)
+
         base_player.nicknames = list(all_nicknames)
-        base_player.associated_hwids = all_hwids
-        base_player.associated_ips = all_ips
-        base_player.shared_hwid_nicknames = list(all_shared_hwid_nicks)
+        base_player.associated_ips = all_associated_ips
+        base_player.associated_hwids = all_associated_hwids
+        base_player.shared_hwid_nicknames = list(shared_hwid_nicknames)
+        base_player.ban_reasons = merged_ban_reasons
+        base_player.status = highest_status
         base_player.ban_counts = max_ban_count
-        base_player.ban_reasons = list(all_ban_reasons)
-        base_player.login_priorities = all_login_priorities
-        base_player.login_timestamps = all_login_timestamps
-        base_player.raw_message = raw_message
-        login_nicks = [nick for nick, priority in all_login_priorities.items() if
-                       priority == 1 and nick in all_nicknames]
-        other_nicks = [nick for nick in base_player.nicknames if nick not in login_nicks]
-        if login_nicks and all_login_timestamps:
-            login_nicks.sort(key=lambda n: all_login_timestamps.get(n, ""), reverse=True)
-        base_player.nicknames = login_nicks + other_nicks
+
         return base_player
