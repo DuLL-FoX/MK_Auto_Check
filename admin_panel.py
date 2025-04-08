@@ -429,7 +429,7 @@ class AdminPanel:
         return connection_dicts
 
     @lru_cache(maxsize=500)
-    def fetch_player_info(self, user_id: str) -> Dict[str, Union[int, List[str]]]:
+    def fetch_player_info(self, user_id: str) -> Dict[str, Union[int, List[Dict[str, str]]]]:
         if not self._ensure_authenticated():
             return {"ban_counts": 0, "ban_reasons": []}
         info_result = {"ban_counts": 0, "ban_reasons": []}
@@ -445,15 +445,36 @@ class AdminPanel:
                 html_content = resp.text
                 self._cache_response(info_url, html_content)
             soup = BeautifulSoup(html_content, "html.parser")
+
+            player_name = "Unknown"
+            name_header = soup.select_one("h1")
+            if name_header:
+                name_text = name_header.get_text(strip=True)
+                if "information for" in name_text.lower():
+                    player_name = name_text.split("information for")[-1].strip()
+
             ban_table = soup.select_one("h2:contains('Bans') + table, h2:contains('Bans') ~ table")
             if ban_table:
                 ban_body = ban_table.select_one("tbody")
                 if ban_body:
-                    ban_reasons = [cols[1].get_text(strip=True)
-                                   for row in ban_body.select("tr")
-                                   if (cols := row.select("td")) and len(cols) >= 2]
-                    info_result["ban_reasons"] = ban_reasons
-                    info_result["ban_counts"] = len(ban_reasons)
+                    ban_info = []
+                    rows = ban_body.select("tr")
+                    for row in rows:
+                        cols = row.select("td")
+                        if cols and len(cols) >= 2:
+                            ban_reason = cols[1].get_text(strip=True)
+                            ban_username = player_name
+                            name_col = cols[0].select_one("strong")
+                            if name_col:
+                                ban_username = name_col.get_text(strip=True)
+
+                            ban_info.append({
+                                "reason": ban_reason,
+                                "username": ban_username
+                            })
+
+                    info_result["ban_reasons"] = ban_info
+                    info_result["ban_counts"] = len(ban_info)
             elapsed = time.time() - start_time
             self.perf_stats.record("fetch_player_info", elapsed)
             if elapsed > self.SLOW_REQUEST_THRESHOLD:
@@ -578,7 +599,12 @@ class AdminPanel:
             try:
                 player_info = self.fetch_player_info(user_id)
                 result["ban_counts"] = player_info.get("ban_counts", 0)
-                result["ban_reasons"].update(player_info.get("ban_reasons", []))
+
+                ban_reasons_info = player_info.get("ban_reasons", [])
+                for ban_info in ban_reasons_info:
+                    reason_tuple = (ban_info["reason"], ban_info["username"])
+                    result["ban_reasons"].add(reason_tuple)
+
             except Exception as e:
                 self.logger.error(f"Error fetching player info for {user_id}: {str(e)}")
         result["associated_ips"] = {ip: list(nicks) for ip, nicks in all_ips.items()} if all_ips else {}
@@ -598,7 +624,10 @@ class AdminPanel:
             else:
                 result["raw_html_snippet"].append({"time": conn.get("time", ""), "status": conn.get("status", "")})
         result["nicknames"] = list(result["nicknames"]) if result["nicknames"] else []
-        result["ban_reasons"] = list(result["ban_reasons"]) if result["ban_reasons"] else []
+
+        result["ban_reasons"] = [{"reason": reason, "username": username}
+                                 for reason, username in result["ban_reasons"]]
+
         result["shared_hwid_nicknames"] = list(result["shared_hwid_nicknames"]) if result[
             "shared_hwid_nicknames"] else []
         for key in ['associated_ips', 'associated_hwids']:

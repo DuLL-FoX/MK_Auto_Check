@@ -319,12 +319,33 @@ class Scanner:
                 if link_tuple not in existing_links:
                     target_player.complaint_links.append(link)
                     existing_links.add(link_tuple)
+
         if hasattr(source_player, 'ban_reasons') and source_player.ban_reasons:
             if not hasattr(target_player, 'ban_reasons'):
                 target_player.ban_reasons = []
-            target_reasons = set(target_player.ban_reasons)
-            target_reasons.update(source_player.ban_reasons)
-            target_player.ban_reasons = list(target_reasons)
+
+            existing_ban_reasons = set()
+            for ban_info in target_player.ban_reasons:
+                if isinstance(ban_info, dict) and "reason" in ban_info and "username" in ban_info:
+                    existing_ban_reasons.add((ban_info["reason"], ban_info["username"]))
+                elif isinstance(ban_info, str):
+                    existing_ban_reasons.add((ban_info, "Unknown"))
+
+            # Add new ban reasons
+            for ban_info in source_player.ban_reasons:
+                if isinstance(ban_info, dict) and "reason" in ban_info and "username" in ban_info:
+                    key = (ban_info["reason"], ban_info["username"])
+                    if key not in existing_ban_reasons:
+                        target_player.ban_reasons.append(ban_info)
+                        existing_ban_reasons.add(key)
+                elif isinstance(ban_info, str):
+                    key = (ban_info, "Unknown")
+                    if key not in existing_ban_reasons:
+                        target_player.ban_reasons.append({
+                            "reason": ban_info,
+                            "username": "Unknown"
+                        })
+                        existing_ban_reasons.add(key)
 
     def _extract_message_data(self, messages):
         all_terms = set()

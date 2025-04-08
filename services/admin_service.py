@@ -343,7 +343,7 @@ class AdminService:
         if not target or not source:
             return
 
-        for key in ['associated_ips', 'associated_hwids', 'nicknames', 'shared_hwid_nicknames', 'ban_reasons']:
+        for key in ['associated_ips', 'associated_hwids', 'nicknames', 'shared_hwid_nicknames']:
             if key not in target:
                 target[key] = {} if key in ['associated_ips', 'associated_hwids'] else []
 
@@ -365,12 +365,38 @@ class AdminService:
                 existing_nicks.update(nicks)
                 target['associated_hwids'][hwid] = list(existing_nicks)
 
-        for key in ['nicknames', 'shared_hwid_nicknames', 'ban_reasons']:
+        for key in ['nicknames', 'shared_hwid_nicknames']:
             if key in source:
                 target_items = set(target.get(key, []))
                 source_items = source.get(key, [])
                 target_items.update(source_items)
                 target[key] = list(target_items)
+
+        if 'ban_reasons' in source:
+            if 'ban_reasons' not in target:
+                target['ban_reasons'] = []
+
+            existing_ban_reason_keys = set()
+            for ban_info in target['ban_reasons']:
+                if isinstance(ban_info, dict) and 'reason' in ban_info and 'username' in ban_info:
+                    existing_ban_reason_keys.add((ban_info['reason'], ban_info['username']))
+                elif isinstance(ban_info, str):
+                    existing_ban_reason_keys.add((ban_info, "Unknown"))
+
+            for ban_info in source.get('ban_reasons', []):
+                if isinstance(ban_info, dict) and 'reason' in ban_info and 'username' in ban_info:
+                    key = (ban_info['reason'], ban_info['username'])
+                    if key not in existing_ban_reason_keys:
+                        target['ban_reasons'].append(ban_info)
+                        existing_ban_reason_keys.add(key)
+                elif isinstance(ban_info, str):
+                    key = (ban_info, "Unknown")
+                    if key not in existing_ban_reason_keys:
+                        target['ban_reasons'].append({
+                            'reason': ban_info,
+                            'username': "Unknown"
+                        })
+                        existing_ban_reason_keys.add(key)
 
         target['ban_counts'] = max(
             target.get('ban_counts', 0),
@@ -412,12 +438,24 @@ class AdminService:
         if missing_fields:
             self.logger.warning(f"Missing required fields in account_info: {missing_fields}")
 
+        ban_reasons = account_info.get("ban_reasons", [])
+        formatted_ban_reasons = []
+        for reason in ban_reasons:
+            if isinstance(reason, dict) and "reason" in reason and "username" in reason:
+                formatted_ban_reasons.append(reason)
+            elif isinstance(reason, str):
+                formatted_ban_reasons.append({
+                    "reason": reason,
+                    "username": account_info.get("nicknames", ["Unknown"])[0] if account_info.get(
+                        "nicknames") else "Unknown"
+                })
+
         player = Player(
             user_id=account_info.get("user_id", "N/A"),
             nicknames=account_info.get("nicknames", []),
             status=account_info.get("status", "unknown"),
             ban_counts=account_info.get("ban_counts", 0),
-            ban_reasons=account_info.get("ban_reasons", []),
+            ban_reasons=formatted_ban_reasons,
             connection_link=account_info.get("connection_link", "N/A"),
             associated_ips=account_info.get("associated_ips", {}),
             associated_hwids=account_info.get("associated_hwids", {}),

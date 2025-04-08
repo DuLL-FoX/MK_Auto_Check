@@ -878,21 +878,60 @@ class ReportService:
 
     def _print_ban_reasons(self, player, indent="  "):
         fmt = self.formatter.fmt
+        box = self.formatter.box
 
         if not hasattr(player, 'ban_reasons') or not player.ban_reasons:
             return
 
-        print(f"{indent}{fmt['BOLD']}BAN REASONS ({len(player.ban_reasons)}):{fmt['END']}")
+        print(f"\n{indent}{fmt['BOLD']}{box['TL']}{box['H'] * 96}{box['TR']}{fmt['END']}")
+        print(f"{indent}{fmt['BOLD']}{box['V']} {fmt['RED']}BAN REASONS ({len(player.ban_reasons)}):{fmt['END']}")
+        print(f"{indent}{fmt['BOLD']}{box['VR']}{box['H'] * 96}{box['VL']}{fmt['END']}")
 
-        for i, reason in enumerate(player.ban_reasons, 1):
-            if len(reason) > 200:
-                print(f"{indent}  {fmt['RED']}{i}.{fmt['END']} {reason[:200]}")
-                remaining = reason[200:]
-                chunks = [remaining[j:j + 200] for j in range(0, len(remaining), 200)]
-                for chunk in chunks:
-                    print(f"{indent}     {chunk}")
+        for i, ban_info in enumerate(player.ban_reasons, 1):
+            if isinstance(ban_info, dict) and "reason" in ban_info and "username" in ban_info:
+                reason = ban_info["reason"]
+                username = ban_info["username"]
+
+                print(f"{indent}{box['V']}   {box['TL']}{box['H'] * 90}{box['TR']}")
+                print(
+                    f"{indent}{box['V']}   {box['V']} {fmt['BOLD']}{i}.{fmt['END']} {fmt['BOLD']}User:{fmt['END']} {fmt['BLUE']}[{username}]{fmt['END']}")
+
+                print(f"{indent}{box['V']}   {box['V']} {fmt['BOLD']}Reason:{fmt['END']}")
+                if len(reason) > 90:
+                    content_lines = reason.split('\n')
+                    for line in content_lines:
+                        if len(line) > 90:
+                            chunks = [line[j:j + 90] for j in range(0, len(line), 90)]
+                            for chunk in chunks:
+                                print(f"{indent}{box['V']}   {box['V']}   {chunk}")
+                        else:
+                            print(f"{indent}{box['V']}   {box['V']}   {line}")
+                else:
+                    print(f"{indent}{box['V']}   {box['V']}   {reason}")
+
+                print(f"{indent}{box['V']}   {box['BL']}{box['H'] * 90}{box['BR']}")
             else:
-                print(f"{indent}  {fmt['RED']}{i}.{fmt['END']} {reason}")
+                reason = ban_info if isinstance(ban_info, str) else str(ban_info)
+
+                print(f"{indent}{box['V']}   {box['TL']}{box['H'] * 90}{box['TR']}")
+                print(f"{indent}{box['V']}   {box['V']} {fmt['BOLD']}{i}.{fmt['END']}")
+
+                print(f"{indent}{box['V']}   {box['V']} {fmt['BOLD']}Reason:{fmt['END']}")
+                if len(reason) > 90:
+                    content_lines = reason.split('\n')
+                    for line in content_lines:
+                        if len(line) > 90:
+                            chunks = [line[j:j + 90] for j in range(0, len(line), 90)]
+                            for chunk in chunks:
+                                print(f"{indent}{box['V']}   {box['V']}   {chunk}")
+                        else:
+                            print(f"{indent}{box['V']}   {box['V']}   {line}")
+                else:
+                    print(f"{indent}{box['V']}   {box['V']}   {reason}")
+
+                print(f"{indent}{box['V']}   {box['BL']}{box['H'] * 90}{box['BR']}")
+
+        print(f"{indent}{fmt['BOLD']}{box['BL']}{box['H'] * 96}{box['BR']}{fmt['END']}")
 
     def _print_complaints_section(self, player: Player, nickname: str) -> None:
         fmt = self.formatter.fmt
