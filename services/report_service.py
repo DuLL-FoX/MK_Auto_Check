@@ -4,7 +4,7 @@ import shutil
 import sys
 from collections import defaultdict, Counter
 from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional, Callable, Tuple
+from typing import List, Dict, Any, Optional, Callable
 
 from models.message import ScanResult
 from models.player import Player
@@ -2022,10 +2022,7 @@ class ReportService:
 
         self.formatter.print_header(f"SCAN RESULTS - {len(scan_results)} messages processed", width)
 
-        message_display_limit = self.config.display_limit_large if self.config.detail_level >= 2 else min(10,
-                                                                                                          len(scan_results))
-
-        for result_idx, result in enumerate(scan_results[:message_display_limit]):
+        for result_idx, result in enumerate(scan_results):
             message = result.message
             players = result.players
             real_players = [p for p in players if getattr(p, 'primary_nickname', '') != "Unknown"]
@@ -2072,8 +2069,8 @@ class ReportService:
                             alt_names_text = f"{fmt['BOLD']}ALT NAMES:{fmt['END']} {', '.join(alt_nicks)}"
                         else:
                             alt_names_text = (
-                                        f"{fmt['BOLD']}ALT NAMES:{fmt['END']} {', '.join(alt_nicks[:self.config.truncate_list_limit])}" +
-                                        f", and {len(alt_nicks) - self.config.truncate_list_limit} more")
+                                    f"{fmt['BOLD']}ALT NAMES:{fmt['END']} {', '.join(alt_nicks[:self.config.truncate_list_limit])}" +
+                                    f", and {len(alt_nicks) - self.config.truncate_list_limit} more")
                         print(f"  {box['DOUBLE_V']} {alt_names_text}")
 
                 if hasattr(player, 'complaint_links') and player.complaint_links:
@@ -2337,12 +2334,8 @@ class ReportService:
 
                 print(f"  {box['BL']}{box['H'] * player_width}{box['BR']}")
 
-            if result_idx < min(message_display_limit - 1, len(scan_results) - 1):
+            if result_idx < len(scan_results) - 1:
                 print(f"\n{'-' * width}")
-
-        if len(scan_results) > message_display_limit:
-            print(
-                f"\n{fmt['BOLD']}... and {len(scan_results) - message_display_limit} more messages not shown in detail{fmt['END']}")
 
         self.formatter.print_header(" SCAN SUMMARY ", width)
 
