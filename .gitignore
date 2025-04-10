@@ -10,3 +10,4 @@ core/__pycache__/*
 models/__pycache__/*
 utils/__pycache__/*
 services/__pycache__/*
+services/reporting/__pycache__/*

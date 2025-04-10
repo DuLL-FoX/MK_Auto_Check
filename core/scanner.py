@@ -16,7 +16,7 @@ from models.player import Player
 from services.admin_service import AdminService
 from services.cache_service import CacheService
 from services.discord_service import DiscordService
-from services.report_service import ReportService
+from services.reporting import ReportService
 from utils.async_utils import gather_with_concurrency
 from utils.url_utils import extract_effective_search_term
 
