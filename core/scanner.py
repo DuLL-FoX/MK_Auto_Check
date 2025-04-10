@@ -408,33 +408,93 @@ class Scanner:
         }
 
     async def _process_all_terms(self, all_terms, term_is_login_event, user_id_terms, processed_terms, message_data):
+        high_priority_terms = []
+        normal_priority_terms = []
+
+        for term in all_terms:
+            if term in user_id_terms.values() or term_is_login_event.get(term, False):
+                high_priority_terms.append(term)
+            else:
+                normal_priority_terms.append(term)
+
         cache_lock = asyncio.Lock()
-        term_tasks = []
+        term_results = {}
         message_nicknames = message_data.get('message_nicknames', {})
         term_to_message_id = message_data.get('term_to_message_id', {})
-        for term in all_terms:
-            message_id = term_to_message_id.get(term)
-            nickname = message_nicknames.get(message_id) if message_id else None
-            term_tasks.append(
-                self.process_term(
-                    term,
-                    use_cache=True,
-                    shared_cache=processed_terms,
-                    cache_lock=cache_lock,
-                    is_login_event=term_is_login_event.get(term, False),
-                    is_user_id=(term in user_id_terms.values()),
-                    message_nickname=nickname
+
+        if high_priority_terms:
+            self.logger.info(f"Processing {len(high_priority_terms)} high priority terms")
+            term_tasks = []
+            for term in high_priority_terms:
+                message_id = term_to_message_id.get(term)
+                nickname = message_nicknames.get(message_id) if message_id else None
+
+                async with cache_lock:
+                    if term in processed_terms:
+                        continue
+                    processed_terms.add(term)
+
+                term_tasks.append(
+                    self.process_term(
+                        term,
+                        use_cache=True,
+                        shared_cache=None,
+                        cache_lock=None,
+                        is_login_event=term_is_login_event.get(term, False),
+                        is_user_id=(term in user_id_terms.values()),
+                        message_nickname=nickname
+                    )
                 )
-            )
-        term_results = await gather_with_concurrency(
-            self.max_concurrent,
-            *term_tasks
-        )
-        return {
-            term: player
-            for term, player in zip(all_terms, term_results)
-            if player
-        }
+
+            if term_tasks:
+                batch_size = max(5, self.max_concurrent // 2)
+                for i in range(0, len(term_tasks), batch_size):
+                    batch = term_tasks[i:i + batch_size]
+                    high_priority_results = await gather_with_concurrency(batch_size, *batch)
+                    for j, result in enumerate(high_priority_results):
+                        if result:
+                            term_index = i + j
+                            if term_index < len(high_priority_terms):
+                                term_results[high_priority_terms[term_index]] = result
+
+        if normal_priority_terms:
+            self.logger.info(f"Processing {len(normal_priority_terms)} normal priority terms")
+            batch_size = min(20, self.max_concurrent)
+            for i in range(0, len(normal_priority_terms), batch_size):
+                batch_terms = normal_priority_terms[i:i + batch_size]
+                batch_tasks = []
+
+                for term in batch_terms:
+                    async with cache_lock:
+                        if term in processed_terms:
+                            continue
+                        processed_terms.add(term)
+
+                    message_id = term_to_message_id.get(term)
+                    nickname = message_nicknames.get(message_id) if message_id else None
+
+                    batch_tasks.append(
+                        self.process_term(
+                            term,
+                            use_cache=True,
+                            shared_cache=None,
+                            cache_lock=None,
+                            is_login_event=term_is_login_event.get(term, False),
+                            is_user_id=False,
+                            message_nickname=nickname
+                        )
+                    )
+
+                if batch_tasks:
+                    batch_results = await gather_with_concurrency(self.max_concurrent, *batch_tasks)
+                    for term, result in zip(batch_terms, batch_results):
+                        if result:
+                            term_results[term] = result
+
+                if i + batch_size < len(normal_priority_terms):
+                    await asyncio.sleep(0.1)
+
+        return term_results
 
     async def _create_scan_results(self, messages, message_data, term_to_player):
         scan_results = []

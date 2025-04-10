@@ -358,7 +358,7 @@ class AdminPanel:
                         log_url = log_url[:57] + "..."
                     self.perf_logger.debug(f"Slow request ({req_time:.2f}s): {log_url}")
                 self.logger.debug(f"Page {page_num} response length: {len(html_content)}")
-                soup = BeautifulSoup(html_content, "html.parser")
+                soup = BeautifulSoup(html_content, "lxml")
                 connections = self._parse_connections_table(soup)
                 self.logger.debug(f"Found {len(connections)} connections on page {page_num}")
                 all_connections.extend(connections)
@@ -444,7 +444,7 @@ class AdminPanel:
                 resp.raise_for_status()
                 html_content = resp.text
                 self._cache_response(info_url, html_content)
-            soup = BeautifulSoup(html_content, "html.parser")
+            soup = BeautifulSoup(html_content, "lxml")
 
             player_name = "Unknown"
             name_header = soup.select_one("h1")

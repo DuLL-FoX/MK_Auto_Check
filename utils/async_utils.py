@@ -20,6 +20,7 @@ async def gather_with_concurrency(n: int, *coros) -> List[Any]:
     tasks = [run_with_semaphore(semaphore, c) for c in coros]
     return await asyncio.gather(*tasks)
 
+
 class RateLimiter:
     def __init__(self, max_calls: int, period: float = 1.0):
         self.max_calls = max_calls
@@ -28,25 +29,38 @@ class RateLimiter:
         self.lock = asyncio.Lock()
         self._last_acquire_time = 0
         self._min_interval = period / max_calls if max_calls > 0 else 0
+        self._pending_tasks = 0
 
     async def acquire(self):
         now = time.time()
-        if not self.calls and now - self._last_acquire_time > self._min_interval:
+        if (len(self.calls) < self.max_calls and
+                now - self._last_acquire_time >= self._min_interval and
+                self._pending_tasks == 0):
             self.calls.append(now)
             self._last_acquire_time = now
             return
+
         async with self.lock:
-            now = time.time()
-            while self.calls and now - self.calls[0] >= self.period:
-                self.calls.popleft()
-            if len(self.calls) >= self.max_calls:
-                oldest = self.calls[0]
-                wait_time = self.period - (now - oldest)
-                if wait_time > 0:
-                    await asyncio.sleep(wait_time)
-                    now = time.time()
-            self.calls.append(now)
-            self._last_acquire_time = now
+            self._pending_tasks += 1
+            try:
+                now = time.time()
+
+                while self.calls and now - self.calls[0] >= self.period:
+                    self.calls.popleft()
+
+                if len(self.calls) >= self.max_calls:
+                    oldest = self.calls[0]
+                    wait_time = self.period - (now - oldest)
+                    if wait_time > 0:
+                        await asyncio.sleep(wait_time)
+                        now = time.time()
+                        while self.calls and now - self.calls[0] >= self.period:
+                            self.calls.popleft()
+
+                self.calls.append(now)
+                self._last_acquire_time = now
+            finally:
+                self._pending_tasks -= 1
 
     async def wrapped_call(self, coro):
         await self.acquire()
@@ -57,6 +71,7 @@ def to_thread(func):
     async def wrapper(*args, **kwargs):
         return await asyncio.to_thread(func, *args, **kwargs)
     return wrapper
+
 
 class AsyncCache:
     def __init__(self, max_size: int = 1000, default_ttl: float = 3600):
@@ -70,33 +85,44 @@ class AsyncCache:
         self._key_access_times = {}
         self._last_cleanup_time = time.time()
         self._cleanup_interval = 1800
+        self._ttl_overrides = {}
+
+    def set_ttl_override(self, pattern: str, ttl: float):
+        self._ttl_overrides[pattern] = ttl
+
+    def _get_ttl_for_key(self, key: str) -> float:
+        for pattern, ttl in self._ttl_overrides.items():
+            if pattern in key:
+                return ttl
+        return self.default_ttl
 
     async def get(self, key: str, factory: Callable[[], Coroutine], ttl: Optional[float] = None) -> Any:
         current_time = time.time()
-        ttl = ttl or self.default_ttl
-        if current_time - self._last_cleanup_time > self._cleanup_interval:
-            await self._cleanup_expired()
+        ttl = ttl or self._get_ttl_for_key(key)
+
         if key in self.cache:
             value, timestamp = self.cache[key]
             if current_time - timestamp < ttl:
-                async with self.lock:
-                    self._key_access_times[key] = current_time
-                    self.hits += 1
+                self.hits += 1
                 return value
-        async with self.lock:
-            if key in self.cache:
-                value, timestamp = self.cache[key]
-                if current_time - timestamp < ttl:
-                    self._key_access_times[key] = current_time
-                    self.hits += 1
-                    return value
-            self.misses += 1
-        value = await factory()
+
+        if current_time - self._last_cleanup_time > self._cleanup_interval:
+            asyncio.create_task(self._cleanup_expired())
+            self._last_cleanup_time = current_time
+
+        self.misses += 1
+        try:
+            value = await factory()
+        except Exception as e:
+            logger.error(f"Cache fetch error for {key}: {str(e)}")
+            return None
+
         async with self.lock:
             if len(self.cache) >= self.max_size:
                 await self._evict_entries()
             self.cache[key] = (value, current_time)
             self._key_access_times[key] = current_time
+
         return value
 
     async def _evict_entries(self):
