@@ -8,7 +8,7 @@ from core.scanner import Scanner
 from services.admin_service import AdminService
 from services.cache_service import CacheService
 from services.discord_service import DiscordService
-from services.report_service import ReportService
+from services.reporting import ReportService
 
 
 class BanCheckerBot:
