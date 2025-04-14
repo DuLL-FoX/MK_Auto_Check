@@ -956,7 +956,7 @@ class ReportService:
                     if i < len(owned_hwids):
                         print(f"  {box['DOUBLE_V']}")
             else:
-                for i, (hwid, shared_with) in enumerate(owned_hwids[:10], 1):
+                for i, (hwid, shared_with) in enumerate(owned_hwids[:3], 1):
                     formatted_hwid = self.formatter.format_hwid(hwid)
 
                     if len(shared_with) == 1:
@@ -973,7 +973,7 @@ class ReportService:
                         print(f"  {box['DOUBLE_V']}")
 
                 print(
-                    f"  {box['DOUBLE_V']}   {fmt['BOLD']}+ {len(owned_hwids) - 10} more HWIDs used by {nickname}{fmt['END']}")
+                    f"  {box['DOUBLE_V']}   {fmt['BOLD']}+ {len(owned_hwids) - 3} more HWIDs used by {nickname}{fmt['END']}")
 
             if alt_hwids or other_hwids:
                 print(f"  {box['DOUBLE_V']}{box['H'] * width}")
