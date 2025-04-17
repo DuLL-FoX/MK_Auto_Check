@@ -1,10 +1,9 @@
+import importlib.util
+import json
 import os
 import sys
-import json
-import importlib.util
 from dataclasses import dataclass, field, fields, is_dataclass
 from typing import Any, Type, TypeVar, Optional, Dict
-
 
 T = TypeVar('T')
 
@@ -106,12 +105,12 @@ class ScanConfig:
     username: Optional[str] = None
     check_ban_bypass: bool = False
     ban_bypass_pages: int = 5
-    bypass_search_max_depth: int = 3
-    search_max_depth: int = 4
-    search_limit_root: int = 8
-    search_limit_level1: int = 5
-    search_limit_level2: int = 3
-    search_limit_default: int = 2
+    bypass_search_max_depth: int = 2
+    search_max_depth: int = 3
+    search_limit_root: int = 20
+    search_limit_level1: int = 10
+    search_limit_level2: int = 5
+    search_limit_default: int = 3
 
 @dataclass
 class LoggingConfig:
