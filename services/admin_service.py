@@ -8,63 +8,7 @@ from urllib.parse import urlparse, parse_qs, quote_plus
 from config_system import get_config
 from models.player import Player
 from utils.async_utils import RateLimiter, AsyncCache
-
-
-class PerformanceTracker:
-    def __init__(self, logger):
-        self.logger = logger
-        self.ops_stats = {}
-        self.last_summary_time = time.time()
-        self.summary_interval = 60
-        self.enabled = True
-
-    def record(self, operation, duration):
-        if not self.enabled:
-            return
-
-        if operation not in self.ops_stats:
-            self.ops_stats[operation] = {'count': 0, 'total_time': 0, 'min_time': float('inf'), 'max_time': 0}
-        stats = self.ops_stats[operation]
-        stats['count'] += 1
-        stats['total_time'] += duration
-        stats['min_time'] = min(stats['min_time'], duration)
-        stats['max_time'] = max(stats['max_time'], duration)
-
-    def should_log_summary(self):
-        return self.enabled and (time.time() - self.last_summary_time >= self.summary_interval)
-
-    def get_summary(self):
-        if not self.ops_stats:
-            return []
-
-        lines = ["Admin service performance summary:"]
-        lines.extend([
-            f"  {op_name}: {stats['count']} calls, avg {stats['total_time'] / stats['count']:.2f}s, "
-            f"min {stats['min_time']:.2f}s, max {stats['max_time']:.2f}s"
-            for op_name, stats in sorted(self.ops_stats.items())
-            if stats['count'] > 0
-        ])
-
-        self.ops_stats.clear()
-        self.last_summary_time = time.time()
-        return lines
-
-
-def monitor_performance(func):
-    async def wrapper(self, *args, **kwargs):
-        start_time = time.time()
-        try:
-            return await func(self, *args, **kwargs)
-        finally:
-            elapsed = time.time() - start_time
-            self.perf_tracker.record(func.__name__, elapsed)
-            if elapsed > self.slow_operation_threshold:
-                args_repr = str(args[0]) if args else ""
-                if len(args_repr) > 40:
-                    args_repr = args_repr[:37] + "..."
-                self.perf_logger.debug(f"Slow operation: {func.__name__} took {elapsed:.2f}s with args: {args_repr}")
-
-    return wrapper
+from utils.performance_monitor import monitor_performance, PerformanceTracker
 
 
 class AdminService:

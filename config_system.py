@@ -1,8 +1,76 @@
-import importlib.util
 import os
 import sys
-from dataclasses import dataclass, field
-from typing import List, Optional
+import json
+import importlib.util
+from dataclasses import dataclass, field, fields, is_dataclass
+from typing import Any, Type, TypeVar, Optional, Dict
+
+
+T = TypeVar('T')
+
+def _convert_value(value: str, target_type: Type[Any]) -> Any:
+    if target_type is bool:
+        return value.lower() in ('1', 'true', 'yes', 'on')
+    if target_type is int:
+        return int(value)
+    if target_type is float:
+        return float(value)
+    return value
+
+
+def _merge_data_into(instance: T, data: Dict[str, Any]) -> None:
+    for f in fields(instance):
+        if f.name in data:
+            raw = data[f.name]
+            if is_dataclass(f.type) and isinstance(raw, dict):
+                _merge_data_into(getattr(instance, f.name), raw)
+            else:
+                setattr(instance, f.name, raw)
+        elif is_dataclass(f.type):
+            nested = getattr(instance, f.name)
+            _merge_data_into(nested, data)
+
+
+def load_env_into(instance: T, prefix: str = '') -> None:
+    for f in fields(instance):
+        env_key = (prefix + f.name).upper()
+        if raw := os.getenv(env_key):
+            try:
+                converted = _convert_value(raw, f.type)
+                setattr(instance, f.name, converted)
+            except Exception:
+                pass
+        elif is_dataclass(f.type):
+            load_env_into(getattr(instance, f.name), env_key + '_')
+
+
+def load_file(path: str, instance: T) -> None:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in ('.yaml', '.yml'):
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required for YAML config files")
+        loader = yaml.safe_load
+    elif ext == '.json':
+        loader = json.load
+    elif ext == '.py':
+        spec = importlib.util.spec_from_file_location('_config', path)
+        if spec and spec.loader:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules['_config'] = module
+            spec.loader.exec_module(module)
+            data = {k.lower(): getattr(module, k) for k in dir(module) if k.isupper()}
+            _merge_data_into(instance, data)
+        return
+    else:
+        raise ValueError(f"Unsupported config file type: {ext}")
+
+    with open(path, 'r') as f:
+        data = loader(f)
+        if not isinstance(data, dict):
+            raise ValueError("Config file must contain a top-level mapping")
+        _merge_data_into(instance, data)
 
 
 @dataclass
@@ -12,7 +80,6 @@ class TimeThresholds:
     suspicious_time_threshold_minutes: int = 60
     ip_match_timedelta_minutes: int = 30
 
-
 @dataclass
 class APIConfig:
     base_admin_url: str = "https://admin.deadspace14.net"
@@ -21,20 +88,17 @@ class APIConfig:
     login_retry_limit: int = 3
     max_concurrent_requests: int = 15
 
-
 @dataclass
 class DiscordConfig:
-    token: str = ""
+    discord_user_token: str = ""
     target_channel_id: int = 0
-    complaint_channel_ids: List[int] = field(default_factory=list)
+    complaint_channel_ids: list[int] = field(default_factory=list)
     message_history_limit: int = 70000
-
 
 @dataclass
 class AuthConfig:
     admin_username: str = ""
     admin_password: str = ""
-
 
 @dataclass
 class ScanConfig:
@@ -49,16 +113,14 @@ class ScanConfig:
     search_limit_level2: int = 3
     search_limit_default: int = 2
 
-
 @dataclass
 class LoggingConfig:
     log_file: Optional[str] = None
     log_level: str = "INFO"
     log_dir: Optional[str] = None
-    max_bytes: int = 10 * 1024 * 1024  # 10MB
+    max_bytes: int = 10 * 1024 * 1024
     backup_count: int = 5
     use_colors: bool = True
-
 
 @dataclass
 class ConfidenceLevelConfig:
@@ -68,13 +130,11 @@ class ConfidenceLevelConfig:
     ip_match: str = "IP_MATCH"
     no_match: str = "NO_MATCH"
 
-
 @dataclass
 class ReportConfig:
     html_report_filename: str = "ban_bypass_report.html"
     json_report_filename: str = "scan_report.json"
     report_dir: Optional[str] = None
-
 
 @dataclass
 class Config:
@@ -87,107 +147,25 @@ class Config:
     confidence_levels: ConfidenceLevelConfig = field(default_factory=ConfidenceLevelConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
 
+    def validate(self) -> None:
+        missing = []
+        if not self.discord.discord_user_token:
+            missing.append('discord.token')
+        if not self.discord.target_channel_id:
+            missing.append('discord.target_channel_id')
+        if not self.auth.admin_username or not self.auth.admin_password:
+            missing.append('auth.admin_username and auth.admin_password')
+        if missing:
+            raise ValueError(f"Missing required configuration: {', '.join(missing)}")
 
 config = Config()
 
-
-def load_from_env():
-    if token := os.environ.get("DISCORD_TOKEN"):
-        config.discord.token = token
-    if channel_id := os.environ.get("TARGET_CHANNEL_ID"):
-        try:
-            config.discord.target_channel_id = int(channel_id)
-        except ValueError:
-            pass
-
-    if username := os.environ.get("ADMIN_USERNAME"):
-        config.auth.admin_username = username
-    if password := os.environ.get("ADMIN_PASSWORD"):
-        config.auth.admin_password = password
-
-    if log_level := os.environ.get("LOG_LEVEL"):
-        config.logging.log_level = log_level
-
-    if check_bypass := os.environ.get("CHECK_BAN_BYPASS"):
-        config.scan.check_ban_bypass = check_bypass.lower() in ('true', 'yes', '1')
-
-
-def load_from_file(file_path: str):
-    try:
-        spec = importlib.util.spec_from_file_location("config_module", file_path)
-        if not spec or not spec.loader:
-            return
-
-        config_module = importlib.util.module_from_spec(spec)
-        sys.modules["config_module"] = config_module
-        spec.loader.exec_module(config_module)
-
-        if hasattr(config_module, "DISCORD_USER_TOKEN"):
-            config.discord.token = config_module.DISCORD_USER_TOKEN
-        if hasattr(config_module, "TARGET_CHANNEL_ID"):
-            config.discord.target_channel_id = config_module.TARGET_CHANNEL_ID
-        if hasattr(config_module, "COMPLAINT_CHANNEL_IDS"):
-            config.discord.complaint_channel_ids = config_module.COMPLAINT_CHANNEL_IDS
-        if hasattr(config_module, "COMPLAINT_MESSAGE_HISTORY_LIMIT"):
-            config.discord.message_history_limit = config_module.COMPLAINT_MESSAGE_HISTORY_LIMIT
-
-        if hasattr(config_module, "ADMIN_USERNAME"):
-            config.auth.admin_username = config_module.ADMIN_USERNAME
-        if hasattr(config_module, "ADMIN_PASSWORD"):
-            config.auth.admin_password = config_module.ADMIN_PASSWORD
-
-        if hasattr(config_module, "MESSAGE_LIMIT"):
-            config.scan.message_limit = config_module.MESSAGE_LIMIT
-        if hasattr(config_module, "USERNAME"):
-            config.scan.username = config_module.USERNAME
-        if hasattr(config_module, "CHECK_BAN_BYPASS"):
-            config.scan.check_ban_bypass = config_module.CHECK_BAN_BYPASS
-        if hasattr(config_module, "BAN_BYPASS_PAGES"):
-            config.scan.ban_bypass_pages = config_module.BAN_BYPASS_PAGES
-        if hasattr(config_module, "BYPASS_SEARCH_MAX_DEPTH"):
-            config.scan.bypass_search_max_depth = config_module.BYPASS_SEARCH_MAX_DEPTH
-
-        if hasattr(config_module, "SEARCH_MAX_DEPTH"):
-            config.scan.search_max_depth = config_module.SEARCH_MAX_DEPTH
-        if hasattr(config_module, "SEARCH_LIMIT_ROOT"):
-            config.scan.search_limit_root = config_module.SEARCH_LIMIT_ROOT
-        if hasattr(config_module, "SEARCH_LIMIT_LEVEL1"):
-            config.scan.search_limit_level1 = config_module.SEARCH_LIMIT_LEVEL1
-        if hasattr(config_module, "SEARCH_LIMIT_LEVEL2"):
-            config.scan.search_limit_level2 = config_module.SEARCH_LIMIT_LEVEL2
-        if hasattr(config_module, "SEARCH_LIMIT_DEFAULT"):
-            config.scan.search_limit_default = config_module.SEARCH_LIMIT_DEFAULT
-
-        if hasattr(config_module, "CLOSE_TIME_THRESHOLD_MINUTES"):
-            config.time_thresholds.close_time_threshold_minutes = config_module.CLOSE_TIME_THRESHOLD_MINUTES
-        if hasattr(config_module, "TIME_THRESHOLD_MINUTES"):
-            config.time_thresholds.time_threshold_minutes = config_module.TIME_THRESHOLD_MINUTES
-
-        if hasattr(config_module, "MAX_CONCURRENT_REQUESTS"):
-            config.api.max_concurrent_requests = config_module.MAX_CONCURRENT_REQUESTS
-    except Exception as e:
-        print(f"Error loading configuration file: {e}")
-
-
-def validate():
-    missing = []
-
-    if not config.discord.token:
-        missing.append("Discord token")
-    if not config.discord.target_channel_id:
-        missing.append("Target channel ID")
-    if not config.auth.admin_username or not config.auth.admin_password:
-        missing.append("Admin credentials")
-
-    if missing:
-        raise ValueError(f"Missing required configuration: {', '.join(missing)}")
-
-
-def initialize(config_file: Optional[str] = None):
-    load_from_env()
+def initialize(config_file: Optional[str] = None) -> Config:
+    load_env_into(config)
     if config_file:
-        load_from_file(config_file)
-    validate()
+        load_file(config_file, config)
+    config.validate()
+    return config
 
 
 def get_config() -> Config:

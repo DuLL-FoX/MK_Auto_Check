@@ -11,6 +11,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from config_system import get_config
+from utils.performance_monitor import PerformanceStats
 
 N_A = "N/A"
 
@@ -44,51 +45,6 @@ class ConnectionData:
             "ban_hits_link": self.ban_hits_link,
             "connection_id": self.connection_id
         }
-
-class PerformanceStats:
-    def __init__(self, logger):
-        self.logger = logger
-        self.operations = {}
-        self.last_summary_time = time.time()
-        self.summary_interval = 60
-        self.log_enabled = True
-
-    def record(self, operation, duration):
-        if not self.log_enabled:
-            return
-        if operation not in self.operations:
-            self.operations[operation] = {
-                'count': 0,
-                'total_time': 0.0,
-                'min_time': float('inf'),
-                'max_time': 0.0,
-                'slow_count': 0
-            }
-        stats = self.operations[operation]
-        stats['count'] += 1
-        stats['total_time'] += duration
-        stats['min_time'] = min(stats['min_time'], duration)
-        stats['max_time'] = max(stats['max_time'], duration)
-
-    def should_log_summary(self):
-        return self.log_enabled and (time.time() - self.last_summary_time >= self.summary_interval)
-
-    def get_summary(self):
-        if not self.operations:
-            return []
-        lines = ["Admin panel performance summary:"]
-        for op_name, stats in sorted(self.operations.items()):
-            count = stats['count']
-            if count == 0:
-                continue
-            avg_time = stats['total_time'] / count
-            lines.append(
-                f"  {op_name}: {count} calls, avg {avg_time:.2f}s, "
-                f"min {stats['min_time']:.2f}s, max {stats['max_time']:.2f}s"
-            )
-        self.operations.clear()
-        self.last_summary_time = time.time()
-        return lines
 
 class AdminPanel:
     def __init__(self, username: str, password: str) -> None:
@@ -180,7 +136,7 @@ class AdminPanel:
             if self.ACCOUNT_URL not in response.url:
                 self.logger.warning(f"Unexpected redirect URL: {response.url}")
                 return False
-            soup = BeautifulSoup(response.text, "html.parser")
+            soup = BeautifulSoup(response.text, "lxml")
             token_input = soup.select_one("input[name='__RequestVerificationToken']")
             if not token_input:
                 self.logger.error("Anti-forgery token not found")
@@ -206,7 +162,7 @@ class AdminPanel:
             )
             response.raise_for_status()
             if f"{self.BASE_ADMIN_URL}/signin-oidc" in response.text:
-                soup = BeautifulSoup(response.text, "html.parser")
+                soup = BeautifulSoup(response.text, "lxml")
                 form = soup.select_one("form")
                 if not form:
                     self.logger.error("Redirect form not found")
@@ -673,7 +629,7 @@ class AdminPanel:
                 response.raise_for_status()
                 html_content = response.text
                 self._cache_response(ban_hits_link, html_content)
-            soup = BeautifulSoup(html_content, 'html.parser')
+            soup = BeautifulSoup(html_content, 'lxml')
             dl = soup.find("dl")
             if dl:
                 dt_tags = dl.find_all("dt")

@@ -18,57 +18,14 @@ from services.cache_service import CacheService
 from services.discord_service import DiscordService
 from services.reporting import ReportService
 from utils.async_utils import gather_with_concurrency
+from utils.performance_monitor import PerformanceTracker, monitor_performance
 from utils.url_utils import extract_effective_search_term
-
-
-class PerformanceTracker:
-    def __init__(self, log_interval=60):
-        self.stats = defaultdict(list)
-        self.counts = defaultdict(int)
-        self.last_summary_time = time.time()
-        self.summary_interval = log_interval
-        self.logger = logging.getLogger(__name__ + ".performance")
-
-    def record(self, operation: str, duration: float):
-        self.stats[operation].append(duration)
-        self.counts[operation] += 1
-
-    def log_summary_if_needed(self):
-        if (time.time() - self.last_summary_time) > self.summary_interval:
-            summary = ["Performance summary:"]
-            for op, durations in sorted(self.stats.items()):
-                if durations:
-                    avg = sum(durations) / len(durations)
-                    summary.append(f"  {op}: {len(durations)} calls, avg {avg:.2f}s")
-            for line in summary:
-                self.logger.info(line)
-            self.stats.clear()
-            self.counts.clear()
-            self.last_summary_time = time.time()
-            return True
-        return False
-
-
-def monitor_performance(slow_threshold=10.0):
-    def decorator(func):
-        @functools.wraps(func)
-        async def wrapper(self, *args, **kwargs):
-            start_time = time.time()
-            try:
-                return await func(self, *args, **kwargs)
-            finally:
-                elapsed = time.time() - start_time
-                self.perf.record(func.__name__, elapsed)
-                if elapsed > slow_threshold:
-                    args_str = str(args)[:40] + "..." if len(str(args)) > 40 else str(args)
-                    self.perf.logger.debug(f"{func.__name__} took {elapsed:.2f}s: {args_str}")
-        return wrapper
-    return decorator
 
 
 def cached(ttl=300):
     def decorator(func):
         cache = {}
+
         @functools.wraps(func)
         async def wrapper(self, *args, **kwargs):
             cache_key = str(args[0]) if args else "default"
@@ -79,8 +36,11 @@ def cached(ttl=300):
             result = await func(self, *args, **kwargs)
             cache[cache_key] = (time.time(), result)
             return result
+
         return wrapper
+
     return decorator
+
 
 class Scanner:
     def __init__(self, discord_service: DiscordService, admin_service: AdminService,
