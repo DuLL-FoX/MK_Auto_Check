@@ -1,4 +1,3 @@
-
 import os
 import shutil
 from typing import Optional
@@ -224,6 +223,10 @@ class ReportConfig:
 
         self.report_filename = kwargs.get('report_filename', REPORT_FILE_SETTINGS['REPORT_FILENAME'])
         self.report_output_dir = kwargs.get('report_output_dir', REPORT_FILE_SETTINGS['REPORT_OUTPUT_DIR'])
+        
+        self.count_threshold_medium = kwargs.get('count_threshold_medium', DEFAULT_REPORT_CONFIG['COUNT_THRESHOLD_MEDIUM'])
+        self.count_threshold_high = kwargs.get('count_threshold_high', DEFAULT_REPORT_CONFIG['COUNT_THRESHOLD_HIGH'])
+
 
         os.makedirs(self.report_output_dir, exist_ok=True)
 
