@@ -902,12 +902,12 @@ class ReportService:
         if total_ban_reasons > limit:
             print(f"{sub_indent_str}{BOX_CHARS['BULLET']} {fmt['GRAY']}...and {total_ban_reasons - limit} more ban reasons.{fmt['END']}")
 
-
-    def _print_player_complaints_details_message_scan(self, player: Player, primary_nickname: str, indent_str: str) -> int:
+    def _print_player_complaints_details_message_scan(self, player: Player, primary_nickname: str,
+                                                      indent_str: str) -> int:
         fmt = self.formatter.fmt
         if not hasattr(player, 'complaint_links') or not player.complaint_links:
             return 0
-            
+
         direct, sub_hwid, sub_ip, other_assoc = analyze_complaints(player, primary_nickname)
         total_complaints_for_player = len(direct) + len(sub_hwid) + len(sub_ip) + len(other_assoc)
 
@@ -919,62 +919,78 @@ class ReportService:
         if sub_hwid: category_counts_parts.append(f"{fmt['YELLOW']}Via HWID-Alts: {len(sub_hwid)}{fmt['END']}")
         if sub_ip: category_counts_parts.append(f"{fmt['YELLOW']}Via IP-Alts: {len(sub_ip)}{fmt['END']}")
         if other_assoc: category_counts_parts.append(f"{fmt['CYAN']}Other Player Alts: {len(other_assoc)}{fmt['END']}")
-        
+
         category_summary_str = f"{fmt['GRAY']}, {fmt['END']}".join(category_counts_parts)
-        print(f"{indent_str}{fmt['WHITE_BOLD']}Complaints:{fmt['END']} Total {self.formatter.format_count(total_complaints_for_player)} ({category_summary_str})")
+        print(
+            f"{indent_str}{fmt['WHITE_BOLD']}Complaints:{fmt['END']} Total {self.formatter.format_count(total_complaints_for_player)} ({category_summary_str})")
 
         sub_indent_str = indent_str + LAYOUT_CONFIG['DEFAULT_INDENT_STRING']
-        content_link_indent_str = sub_indent_str + LAYOUT_CONFIG['DEFAULT_INDENT_STRING'] 
-        content_snippet_indent_str = content_link_indent_str + "  " 
+        content_link_indent_str = sub_indent_str + LAYOUT_CONFIG['DEFAULT_INDENT_STRING']
+        content_snippet_indent_str = content_link_indent_str + "  "
 
-        overall_content_width_guide = self.formatter.config.box_width_medium 
+        overall_content_width_guide = self.formatter.config.box_width_medium
 
-        def print_complaint_samples(complaints_list: List[Dict[str, Any]], 
-                                    cat_name_str: str, 
-                                    cat_color_keys: Tuple[str, ...], 
-                                    display_limit: int,
-                                    is_other_player_alts_category: bool): 
+        def print_complaint_samples(complaints_list: List[Dict[str, Any]],
+                                    cat_name_str: str,
+                                    cat_color_keys: Tuple[str, ...],
+                                    display_limit_key: str,  # Changed to accept key name
+                                    is_other_player_alts_category: bool):
             if not complaints_list: return
-            print(f"{sub_indent_str}{self.formatter._get_fmt(*cat_color_keys)}{BOX_CHARS['BULLET']} {cat_name_str} ({fmt['WHITE']}{len(complaints_list)}{fmt['END']}):{fmt['END']}")
-            
-            num_complaints_to_show = display_limit
+
+            # Get the specific limit using the key
+            num_complaints_to_show = self.config.get_specific_display_limit(display_limit_key)
+
+            print(
+                f"{sub_indent_str}{self.formatter._get_fmt(*cat_color_keys)}{BOX_CHARS['BULLET']} {cat_name_str} ({fmt['WHITE']}{len(complaints_list)}{fmt['END']}):{fmt['END']}")
+
+            # num_complaints_to_show is already fetched above
 
             for c_idx, c in enumerate(complaints_list[:num_complaints_to_show]):
                 link_str_raw = c.get('link', 'N/A')
                 plain_prefix_for_link = f"{content_link_indent_str}{BOX_CHARS['SUB_ARROW']} "
-                
+
                 width_for_link_text = overall_content_width_guide - len(plain_prefix_for_link)
                 if width_for_link_text < 20: width_for_link_text = 20
 
                 wrapped_link_parts = self.formatter.get_wrapped_lines(
                     link_str_raw, width=width_for_link_text,
-                    initial_indent="", subsequent_indent="" 
+                    initial_indent="", subsequent_indent=""
                 )
-                
+
                 for k_link, link_part_text in enumerate(wrapped_link_parts):
                     colored_link_part = f"{fmt['BLUE_UNDERLINE']}{link_part_text}{fmt['END']}"
                     if k_link == 0:
                         print(f"{content_link_indent_str}{BOX_CHARS['SUB_ARROW']} {colored_link_part}")
                     else:
                         print(f"{' ' * len(plain_prefix_for_link)}{colored_link_part}")
-                
-                raw_content = c.get('content','No content')
-                if raw_content and raw_content != "No content":
-                    content_lines = raw_content.splitlines()
-                    first_content_line = self.formatter.truncate_text(content_lines[0], overall_content_width_guide - len(content_snippet_indent_str) - 3)
-                    print(f"{content_snippet_indent_str}{fmt['GRAY']}{first_content_line}{fmt['END']}")
-                    if len(content_lines) > 1:
-                        print(f"{content_snippet_indent_str}{fmt['GRAY']}... (further content truncated){fmt['END']}")
-            
-            if len(complaints_list) > num_complaints_to_show:
-                print(f"{content_snippet_indent_str}{fmt['GRAY']}...and {len(complaints_list) - num_complaints_to_show} more complaints in this category.{fmt['END']}")
 
-        complaint_sample_limit = self.config.get_specific_display_limit('COMPLAINT_SAMPLE_LIMIT')
-        print_complaint_samples(direct, "Direct", ('RED', 'BOLD'), complaint_sample_limit, False)
-        print_complaint_samples(sub_hwid, "Via HWID-Alts", ('YELLOW', 'BOLD'), complaint_sample_limit, False)
-        print_complaint_samples(sub_ip, "Via IP-Alts", ('YELLOW',), complaint_sample_limit, False)
-        print_complaint_samples(other_assoc, "Other Player Alts", ('CYAN',), complaint_sample_limit, True)
-        
+                raw_content = c.get('content', 'No content')
+                if raw_content and raw_content != "No content":
+                    available_width_for_text = overall_content_width_guide - len(content_snippet_indent_str)
+                    if available_width_for_text < 20:
+                        available_width_for_text = 20
+                    wrapped_content_lines = self.formatter.get_wrapped_lines(
+                        raw_content,
+                        width=available_width_for_text,
+                        initial_indent="",
+                        subsequent_indent=""
+                    )
+                    for line_content in wrapped_content_lines:
+                        print(f"{content_snippet_indent_str}{fmt['WHITE']}{line_content}{fmt['END']}")
+
+            if len(complaints_list) > num_complaints_to_show:
+                print(
+                    f"{content_snippet_indent_str}{fmt['WHITE']}...and {len(complaints_list) - num_complaints_to_show} more complaints in this category.{fmt['END']}")
+
+        # Use specific limit keys now
+        print_complaint_samples(direct, "Direct", ('RED', 'BOLD'), 'COMPLAINT_LIMIT',
+                                False)  # Assuming 'COMPLAINT_LIMIT' for direct ones
+        print_complaint_samples(sub_hwid, "Via HWID-Alts", ('YELLOW', 'BOLD'), 'SUB-COMPLAINT_HWID_LIMIT', False)
+        print_complaint_samples(sub_ip, "Via IP-Alts", ('YELLOW',), 'SUB-COMPLAINT_IP_LIMIT',
+                                False)  # <-- THIS IS THE KEY CHANGE
+        print_complaint_samples(other_assoc, "Other Player Alts", ('CYAN',), 'COMPLAINT_SAMPLE_LIMIT',
+                                True)  # 'COMPLAINT_SAMPLE_LIMIT' can be kept for this or another specific key.
+
         return total_complaints_for_player
 
 
