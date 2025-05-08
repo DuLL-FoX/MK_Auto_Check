@@ -1,4 +1,7 @@
+
 import os
+import shutil
+from typing import Optional
 
 TERMINAL_FORMATTING = {
     'HEADER': '\033[95m',
@@ -66,58 +69,57 @@ BOX_CHARS = {
     'INFO': 'ℹ',
     'STAR': '★',
     'CIRCLE': '○',
-    'FILLED_CIRCLE': '●'
+    'FILLED_CIRCLE': '●',
+    'SUB_ARROW': '↳',
 }
 
-# Display limit configurations
 DISPLAY_LIMITS = {
     'SMALL': 3,
     'MEDIUM': 5,
     'LARGE': 10,
     'XLARGE': 20,
 
-    # Special display limits
-    'COMPLAINT_LIMIT': 3,
+    'COMPLAINT_LIMIT': 20,
     'NICKNAME_DISPLAY_LIMIT': 7,
     'BAN_REASON_DISPLAY_LIMIT': 5,
     'IP_OWNED_DISPLAY_LIMIT': 10,
     'IP_ALT_DISPLAY_LIMIT': 5,
-    'IP_OTHER_DISPLAY_LIMIT': 2,
+    'IP_OTHER_DISPLAY_LIMIT': 3,
     'HWID_OWNED_DISPLAY_LIMIT': 10,
-    'HWID_ALT_DISPLAY_LIMIT': 3,
-    'HWID_OTHER_DISPLAY_LIMIT': 2,
-    'LOGIN_DISPLAY_LIMIT': 3,
+    'HWID_ALT_DISPLAY_LIMIT': 5,
+    'HWID_OTHER_DISPLAY_LIMIT': 3,
+    'LOGIN_DISPLAY_LIMIT': 5,
     'IP_RANGE_DISPLAY_LIMIT': 5,
     'CONNECTION_PATH_DISPLAY_LIMIT': 5,
-    'MULTI_ALT_DISPLAY_LIMIT': 10,
-    'COMPLAINT_SAMPLE_LIMIT': 3
+    'MULTI_ALT_DISPLAY_LIMIT': 7,
+    'COMPLAINT_SAMPLE_LIMIT': 3,
+    'SUB-COMPLAINT_HWID_LIMIT': 20,
+    'SUB-COMPLAINT_IP_LIMIT': 20,
+    'SUMMARY_LIST_LIMIT': 5,
 }
 
-# Text formatting and layout configurations
 LAYOUT_CONFIG = {
-    'COLOR_INTENSITY_THRESHOLD': 2,
+    'COLOR_INTENSITY_THRESHOLD': 1,
     'PADDING_SMALL': 2,
     'PADDING_MEDIUM': 4,
     'PADDING_LARGE': 6,
     'CONTENT_WIDTH_REDUCTION': 12,
-    'HEADER_MIN_PADDING': 2,
+    'HEADER_MIN_PADDING': 1,
     'TABLE_COLUMN_MARGIN': 3,
     'INDENT_SIZE': 2,
     'SAMPLE_TEXT_SIZE': 500,
     'STAT_BOX_COLUMN_PADDING': 2,
-    'DETAIL_BOX_WIDTH_REDUCTION': 10,
-    'CONTENT_BOX_WIDTH_REDUCTION': 20
+    'DETAIL_BOX_WIDTH_REDUCTION': 8,
+    'CONTENT_BOX_WIDTH_REDUCTION': 10,
+    'DEFAULT_INDENT_STRING': "  ",
 }
 
-# Analysis parameters
 ANALYSIS_CONFIG = {
-    # Connection strength parameters
     'STRONG_CONNECTION_THRESHOLD': 1.0,
     'DIRECT_CONNECTION_STRENGTH': 2.0,
     'SINGLE_CONNECTION_STRENGTH': 1.0,
     'IP_CONNECTION_STRENGTH': 0.5,
 
-    # Owner determination
     'PRIMARY_OWNER_WEIGHT': 3,
     'ALT_OWNER_WEIGHT': 2,
     'LOGIN_OWNER_WEIGHT': 1
@@ -134,7 +136,7 @@ DEFAULT_REPORT_CONFIG = {
     'DISPLAY_LIMIT_MEDIUM': 40,
     'DISPLAY_LIMIT_LARGE': 80,
 
-    'DETAIL_LEVEL': 1,
+    'DETAIL_LEVEL': 2,
     'COLOR_INTENSITY': 1,
     'SHOW_TIMESTAMPS': True,
 
@@ -175,23 +177,24 @@ TIME_ANALYSIS_THRESHOLDS = {
 class ReportConfig:
 
     def __init__(self, **kwargs):
-        import shutil
-
         terminal_size = shutil.get_terminal_size((DEFAULT_REPORT_CONFIG['BOX_WIDTH_LARGE'], 40))
         terminal_width = terminal_size.columns
 
         self.box_width_large = min(
             kwargs.get('box_width_large', DEFAULT_REPORT_CONFIG['BOX_WIDTH_LARGE']),
-            terminal_width - LAYOUT_CONFIG['PADDING_SMALL']
+            terminal_width - LAYOUT_CONFIG['PADDING_SMALL'] 
         )
         self.box_width_medium = min(
             kwargs.get('box_width_medium', DEFAULT_REPORT_CONFIG['BOX_WIDTH_MEDIUM']),
-            terminal_width - LAYOUT_CONFIG['PADDING_MEDIUM']
+            terminal_width - LAYOUT_CONFIG['PADDING_SMALL']
         )
         self.box_width_small = min(
             kwargs.get('box_width_small', DEFAULT_REPORT_CONFIG['BOX_WIDTH_SMALL']),
-            terminal_width - LAYOUT_CONFIG['PADDING_LARGE']
+            terminal_width - LAYOUT_CONFIG['PADDING_SMALL']
         )
+        self.box_width_medium = min(self.box_width_medium, self.box_width_large)
+        self.box_width_small = min(self.box_width_small, self.box_width_medium)
+
 
         self.truncate_list_limit = kwargs.get(
             'truncate_list_limit',
@@ -201,15 +204,16 @@ class ReportConfig:
             'truncate_text_length',
             DEFAULT_REPORT_CONFIG['TRUNCATE_TEXT_LENGTH']
         )
-        self.display_limit_small = kwargs.get(
-            'display_limit_small',
+        
+        self.display_limit_small_items = kwargs.get(
+            'display_limit_small', 
             DEFAULT_REPORT_CONFIG['DISPLAY_LIMIT_SMALL']
         )
-        self.display_limit_medium = kwargs.get(
+        self.display_limit_medium_items = kwargs.get(
             'display_limit_medium',
             DEFAULT_REPORT_CONFIG['DISPLAY_LIMIT_MEDIUM']
         )
-        self.display_limit_large = kwargs.get(
+        self.display_limit_large_items = kwargs.get(
             'display_limit_large',
             DEFAULT_REPORT_CONFIG['DISPLAY_LIMIT_LARGE']
         )
@@ -223,10 +227,47 @@ class ReportConfig:
 
         os.makedirs(self.report_output_dir, exist_ok=True)
 
+    def get_dynamic_limit(self, category: Optional[str] = None) -> int:
+        """
+        Determines a display limit based on detail_level.
+        If category is provided, it tries to use a specific limit from DISPLAY_LIMITS.
+        """
+        if category and category.upper() in DISPLAY_LIMITS:
+            base_limit = DISPLAY_LIMITS[category.upper()]
+            if self.detail_level == 0:
+                return max(1, round(base_limit * 0.5))
+            elif self.detail_level == 1:
+                return base_limit
+            else:
+                return round(base_limit * 1.5) if base_limit > 2 else base_limit + 1
+        
+        if self.detail_level == 0:
+            return self.display_limit_small_items
+        elif self.detail_level == 1:
+            return self.display_limit_medium_items
+        else:
+            return self.display_limit_large_items
 
-def load_config_from_file(config_file=None):
+    def get_specific_display_limit(self, name: str) -> int:
+        """Gets a specific named limit from DISPLAY_LIMITS, adjusted by detail level."""
+        upper_name = name.upper()
+        if upper_name not in DISPLAY_LIMITS:
+            return self.get_dynamic_limit('MEDIUM') 
+            
+        base_limit = DISPLAY_LIMITS[upper_name]
+        
+        if self.detail_level == 0:
+            if base_limit <= 3: return max(1, base_limit -1)
+            return max(1, round(base_limit * 0.5))
+        elif self.detail_level == 1:
+            return base_limit
+        else:
+            if base_limit <=3 : return base_limit + 1
+            return round(base_limit * 1.5)
+
+
+def load_config_from_file(config_file: Optional[str] = None) -> dict:
     import json
-    import os
 
     config = DEFAULT_REPORT_CONFIG.copy()
 
@@ -236,6 +277,5 @@ def load_config_from_file(config_file=None):
                 user_config = json.load(f)
                 config.update(user_config)
         except Exception as e:
-            print(f"Error loading config file: {e}")
-
+            print(f"{TERMINAL_FORMATTING.get('RED', '')}Error loading config file '{config_file}': {e}{TERMINAL_FORMATTING.get('END', '')}")
     return config
