@@ -33,6 +33,9 @@ TERMINAL_FORMATTING = {
     'BRIGHT_MAGENTA': '\033[95m',
     'BRIGHT_CYAN': '\033[96m',
     'BRIGHT_WHITE': '\033[97m',
+
+    'BRIGHT_YELLOW_BOLD': '\033[93;1m',
+    'WHITE_BOLD': '\033[97;1m',
 }
 
 BOX_CHARS = {
