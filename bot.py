@@ -72,8 +72,19 @@ class BanCheckerBot:
         await self.close()
 
     async def close(self):
+        if hasattr(self, 'admin_service') and self.admin_service:
+            try:
+                await self.admin_service.close()
+                logging.info("AdminService closed successfully.")
+            except Exception as e:
+                logging.error(f"Error closing AdminService: {e}", exc_info=True)
+
         if self.client:
-            await self.client.close()
+            try:
+                await self.client.close()
+                logging.info("Discord client closed successfully.")
+            except Exception as e:
+                logging.error(f"Error closing Discord client: {e}", exc_info=True)
 
     def run(self):
         self.client.run(self.token, bot=False)

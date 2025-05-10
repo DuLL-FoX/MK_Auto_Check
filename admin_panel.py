@@ -84,6 +84,21 @@ class AdminPanel:
             self.logger.info(
                 f"AdminPanel (async) initialized with URLs: BASE={self.BASE_ADMIN_URL}, CONNECTIONS={self.CONNECTIONS_URL}")
 
+    async def _initialise(self):
+        await self.close()
+
+        self._connector = aiohttp.TCPConnector(limit_per_host=8, limit=10, ssl=False)
+        self._client_session: Optional[aiohttp.ClientSession] = None
+
+        self.login_attempts = 0
+        self._is_authenticated = False
+        self._request_metrics = {
+            "total": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
+        self._response_cache: OrderedDict[str, Tuple[str, float]] = OrderedDict()
+
     def _setup_loggers(self):
         from utils.logging_utils import get_logger
         self.perf_logger = get_logger(f"{__name__}.performance")
@@ -106,6 +121,13 @@ class AdminPanel:
             await self._client_session.close()
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug("Aiohttp client session closed.")
+        
+        if self._connector and not self._connector.closed:
+            await self._connector.close()
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("Aiohttp TCPConnector closed.")
+        
+        self._client_session = None
 
     async def login(self) -> bool:
         async with self._async_lock:
@@ -345,15 +367,30 @@ class AdminPanel:
 
     async def _cache_response(self, url: str, html: str) -> None:
         async with self._async_lock:
-            self._response_cache[url] = (time.time(), html)
+            self._response_cache[url] = (html, time.time())
             if len(self._response_cache) > self._RESPONSE_CACHE_MAX_SIZE:
                 self._response_cache.popitem(last=False)
+    
+    async def _get_cached_response_corrected(self, url: str) -> Optional[str]:
+        async with self._async_lock:
+            cache_entry = self._response_cache.get(url)
+            if cache_entry:
+                html, timestamp = cache_entry
+                if time.time() - timestamp < self._RESPONSE_CACHE_TTL:
+                    self._response_cache.move_to_end(url)
+                    return html
+                else:
+                    del self._response_cache[url]
+            return None
+    
+    _get_cached_response = _get_cached_response_corrected
+
 
     async def fetch_paginated_data(self, url: str, max_pages: int = 0) -> List[ConnectionData]:
         if self.logger.isEnabledFor(logging.INFO):
             self.logger.info(
                 f"Fetching paginated data from URL: {url}, max_pages={max_pages if max_pages > 0 else 'unlimited'}")
-        
+
         if not await self._ensure_authenticated():
             self.logger.error("Not authenticated, cannot fetch data")
             return []
@@ -370,7 +407,7 @@ class AdminPanel:
                 if self.logger.isEnabledFor(logging.INFO):
                     self.logger.info(f"Reached max pages limit ({max_pages}) after fetching {pages_fetched} pages.")
                 break
-            
+
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(f"Fetching page {page_num} from URL: {current_url}")
 
@@ -389,7 +426,7 @@ class AdminPanel:
                     await self._cache_response(current_url, html_content)
                 elif self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(f"Using cached response for page {page_num} URL: {current_url}")
-                
+
                 req_elapsed_time = time.time() - req_start_time
                 if req_elapsed_time > self.SLOW_REQUEST_THRESHOLD and not from_cache:
                     self._request_metrics["slow_requests"] += 1
@@ -400,7 +437,7 @@ class AdminPanel:
                 if not html_content:
                     self.logger.error(f"Failed to get HTML content for page {page_num} URL: {current_url}")
                     break
-                
+
                 if self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(f"Page {page_num} response length: {len(html_content)}. Parsing...")
                 soup = HTMLParser(html_content)
@@ -421,7 +458,7 @@ class AdminPanel:
                     page_num += 1
                 elif self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(f"No more pages found after page {page_num - 1 if page_num > 1 else 1}.")
-                
+
             except aiohttp.ClientResponseError as e:
                 self._request_metrics["errors"] += 1
                 self.logger.error(f"HTTP error {e.status} on page {page_num} for URL {current_url}: {e.message}")
@@ -437,7 +474,7 @@ class AdminPanel:
                 self._request_metrics["errors"] += 1
                 self.logger.error(f"Error processing page {page_num} for URL {current_url}: {str(e)}", exc_info=True)
                 break
-        
+
         total_elapsed_time = time.time() - start_time_total
         self.perf_stats.record("fetch_paginated_data", total_elapsed_time)
         if self.logger.isEnabledFor(logging.INFO):
@@ -449,7 +486,7 @@ class AdminPanel:
                             show_banned: str = "true", show_whitelist: str = "true", show_full: str = "true",
                             show_panic: str = "true") -> str:
         search_term = quote_plus(user_id if user_id else search)
-        return (f"{self.BASE_ADMIN_URL}/Connections?perPage=2000&showSet=true"
+        return (f"{self.BASE_ADMIN_URL}/Connections?perPage=200&showSet=true"
                f"&search={search_term}&showAccepted={show_accepted}&showBanned={show_banned}"
                f"&showWhitelist={show_whitelist}&showFull={show_full}&showPanic={show_panic}")
 
@@ -646,6 +683,7 @@ class AdminPanel:
             result["status"] = "banned"
             if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug("Status set to 'banned' due to 'Banned' status in connections.")
 
+
         if first_valid_conn_id: result["connection_link"] = f"{self.BASE_ADMIN_URL}/Connections/Info/{first_valid_conn_id}"
 
         final_uid_fetch = result["user_id"]
@@ -664,7 +702,7 @@ class AdminPanel:
             if len(nicks_s) > 1 and hwid_k != N_A: result["shared_hwid_nicknames"].update(nicks_s)
         
         if result["ban_counts"] > 0 and result["status"] != "banned": result["status"] = "banned"
-        if result["ban_counts"] >= 5 : result["status"] = "suspicious"
+        if result["ban_counts"] >= 5 and result["status"] == "banned" : result["status"] = "suspicious"
 
         result["nicknames"] = sorted(list(result["nicknames"]))
         result["ban_reasons"] = [{"reason": r, "username": u} for r, u in sorted(list(result["ban_reasons"]))]
@@ -684,7 +722,7 @@ class AdminPanel:
         return result
 
     async def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, str]]:
-        url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true&perPage=2000"
+        url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true&perPage=200"
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(f"Fetching ban hit connections, max_pages={max_pages if max_pages > 0 else 'unlimited'}")
 
@@ -732,7 +770,7 @@ class AdminPanel:
                 info_dl = { dt.text(strip=True).rstrip(":").lower().replace(" ", "_"): dd.text(strip=True)
                             for dt, dd in zip(dt_nodes, dd_nodes) if dt and dd }
                 ban_info["banned_user_name"] = info_dl.get("name", "")
-                ban_info["user_id"] = info_dl.get("user_id", info_dl.get("user id", ""))
+                ban_info["user_id"] = info_dl.get("user_id", info_dl.get("user_id", ""))
                 ban_info["ip_address"] = info_dl.get("ip", "")
                 ban_info["hwid"] = info_dl.get("hwid", "")
                 ban_info["time"] = info_dl.get("time", "")

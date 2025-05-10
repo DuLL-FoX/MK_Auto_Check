@@ -24,7 +24,7 @@ class AdminService:
         self.cache = AsyncCache(max_size=20000, default_ttl=3600)
         self.base_admin_connections_url = (
             f"{self.admin_panel.BASE_ADMIN_URL}/Connections?showSet=true&showAccepted=true&showBanned=true"
-            "&showWhitelist=true&showFull=true&showPanic=true&perPage=2000"
+            "&showWhitelist=true&showFull=true&showPanic=true&perPage=200"
         )
         self._request_stats = {"total": 0, "cache_hits": 0, "cache_misses": 0}
         
@@ -248,12 +248,20 @@ class AdminService:
             single_user_mode: bool, max_search_depth: int,
             glob_processed_terms: Set[str], glob_terms_in_flight: Set[str]
     ) -> Optional[Dict[str, Any]]:
-        
-        current_term_canonical = current_term_str if current_term_is_hwid else current_term_str.lower()
+
+        canonical_term_for_url = current_term_str
+        if not current_term_is_hwid:
+            canonical_term_for_url = current_term_str.lower()
+
+        current_term_canonical_for_tracking = current_term_str if current_term_is_hwid else current_term_str.lower()
+
         if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"Processing search for term: '{current_term_str}' (canonical: '{current_term_canonical}', is_hwid: {current_term_is_hwid}) at depth {current_depth}")
+            self.logger.debug(
+                f"Processing search for term: '{current_term_str}' (using URL term: '{canonical_term_for_url}', "
+                f"internal canonical: '{current_term_canonical_for_tracking}', is_hwid: {current_term_is_hwid}) at depth {current_depth}"
+            )
         try:
-            encoded_term = quote_plus(current_term_str)
+            encoded_term = quote_plus(canonical_term_for_url)
             connections_search_url = f"{self.base_admin_connections_url}&search={encoded_term}"
 
             term_data = await self.fetch_with_rate_limit(
@@ -263,7 +271,8 @@ class AdminService:
             )
 
             if not term_data or (isinstance(term_data, list) and not term_data):
-                if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(f"No data returned for term '{current_term_str}'.")
+                if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
+                    f"No data returned for term '{current_term_str}'.")
                 return None
 
             aggregated_data_for_term = term_data
@@ -280,27 +289,26 @@ class AdminService:
 
                     if all_connections_recent and aggregated_data_for_term["raw_html_snippet"]:
                         if self.logger.isEnabledFor(logging.DEBUG):
-                            self.logger.debug(f"Term '{current_term_str}' data appears very recent. Suppressing further expansion.")
+                            self.logger.debug(
+                                f"Term '{current_term_str}' data appears very recent. Suppressing further expansion.")
                     else:
                         extracted_identifiers_with_type = self._extract_prioritized_identifiers(
                             aggregated_data_for_term, current_term_str, current_term_is_hwid,
                             glob_processed_terms, glob_terms_in_flight
                         )
-                        
                         search_limit_for_depth = self._get_search_limit_for_depth(current_depth)
                         new_terms_to_queue.extend(extracted_identifiers_with_type[:search_limit_for_depth])
-                        
                         if new_terms_to_queue and self.logger.isEnabledFor(logging.DEBUG):
                             self.logger.debug(
                                 f"Identified {len(new_terms_to_queue)} new terms from '{current_term_str}' for depth {current_depth + 1}.")
                 elif self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(
                         f"Data for '{current_term_str}' (type: {type(aggregated_data_for_term)}) not dict, cannot extract new ids.")
-            
             return {'result_data': aggregated_data_for_term, 'new_terms_to_search': new_terms_to_queue}
         except Exception as e:
             if self.logger.isEnabledFor(logging.ERROR):
-                self.logger.error(f"Error processing search term '{current_term_str}' at depth {current_depth}: {e}", exc_info=False)
+                self.logger.error(f"Error processing search term '{current_term_str}' at depth {current_depth}: {e}",
+                                  exc_info=False)
             return None
 
     def _extract_prioritized_identifiers(
