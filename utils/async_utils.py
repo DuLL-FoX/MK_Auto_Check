@@ -98,77 +98,95 @@ class AsyncCache:
 
     async def get(self, key: str, factory: Callable[[], Coroutine], ttl: Optional[float] = None) -> Any:
         current_time = time.time()
-        ttl = ttl or self._get_ttl_for_key(key)
+        effective_ttl = ttl if ttl is not None else self._get_ttl_for_key(key)
 
-        if key in self.cache:
-            value, timestamp = self.cache[key]
-            if current_time - timestamp < ttl:
-                self.hits += 1
-                return value
+
+        async with self.lock:
+            if key in self.cache:
+                value, timestamp = self.cache[key]
+                if current_time - timestamp < effective_ttl:
+                    self.hits += 1
+                    self._key_access_times[key] = current_time
+                    return value
+                else:
+                    del self.cache[key]
+                    if key in self._key_access_times:
+                        del self._key_access_times[key]
+                    self.evictions +=1
+
+
+        self.misses += 1
+        try:
+            new_value = await factory()
+        except Exception as e:
+            logger.error(f"Cache factory error for key '{key}': {str(e)}")
+            return None 
+
+        async with self.lock:
+            if len(self.cache) >= self.max_size and key not in self.cache:
+                await self._evict_entries_locked()
+
+            self.cache[key] = (new_value, current_time)
+            self._key_access_times[key] = current_time
 
         if current_time - self._last_cleanup_time > self._cleanup_interval:
             asyncio.create_task(self._cleanup_expired())
             self._last_cleanup_time = current_time
+            
+        return new_value
 
-        self.misses += 1
-        try:
-            value = await factory()
-        except Exception as e:
-            logger.error(f"Cache fetch error for {key}: {str(e)}")
-            return None
+    async def _evict_entries_locked(self):
+        if len(self.cache) < self.max_size:
+            return
 
-        async with self.lock:
-            if len(self.cache) >= self.max_size:
-                await self._evict_entries()
-            self.cache[key] = (value, current_time)
-            self._key_access_times[key] = current_time
-
-        return value
-
-    async def _evict_entries(self):
-        current_time = time.time()
-        expired_keys = [
-            k for k, (_, timestamp) in self.cache.items()
-            if current_time - timestamp > self.default_ttl
-        ]
-        for key in expired_keys:
-            del self.cache[key]
-            if key in self._key_access_times:
-                del self._key_access_times[key]
-            self.evictions += 1
-        if len(self.cache) >= self.max_size:
-            to_remove = sorted(
-                self._key_access_times.items(),
-                key=lambda x: x[1]
-            )[:max(1, self.max_size // 10)]
-            for key, _ in to_remove:
-                if key in self.cache:
-                    del self.cache[key]
-                if key in self._key_access_times:
-                    del self._key_access_times[key]
+        num_to_evict = max(1, (len(self.cache) - self.max_size) + (self.max_size // 10))
+        
+        sorted_keys_by_access = sorted(self._key_access_times.items(), key=lambda item: item[1])
+        
+        evicted_count = 0
+        for key_to_evict, _ in sorted_keys_by_access:
+            if evicted_count >= num_to_evict:
+                break
+            if key_to_evict in self.cache:
+                del self.cache[key_to_evict]
+                if key_to_evict in self._key_access_times:
+                    del self._key_access_times[key_to_evict]
                 self.evictions += 1
+                evicted_count += 1
+        logger.debug(f"Evicted {evicted_count} entries from cache due to size limit.")
+
 
     async def _cleanup_expired(self):
         async with self.lock:
             current_time = time.time()
             self._last_cleanup_time = current_time
-            expired_keys = [
+            
+            expired_keys_in_cache = [
                 k for k, (_, timestamp) in self.cache.items()
-                if current_time - timestamp > self.default_ttl
+                if current_time - timestamp > self._get_ttl_for_key(k)
             ]
-            for key in expired_keys:
+            
+            for key in expired_keys_in_cache:
                 del self.cache[key]
                 if key in self._key_access_times:
                     del self._key_access_times[key]
                 self.evictions += 1
-            access_keys_to_remove = [
-                k for k in self._key_access_times
-                if k not in self.cache
-            ]
-            for key in access_keys_to_remove:
-                del self._key_access_times[key]
+            
+            if expired_keys_in_cache:
+                logger.debug(f"Cleaned up {len(expired_keys_in_cache)} expired entries from cache.")
+
+            access_keys_to_prune = [k for k in self._key_access_times if k not in self.cache]
+            if access_keys_to_prune:
+                for key in access_keys_to_prune:
+                    del self._key_access_times[key]
+                logger.debug(f"Pruned {len(access_keys_to_prune)} orphaned keys from _key_access_times.")
+
 
     async def clear(self):
         async with self.lock:
             self.cache.clear()
             self._key_access_times.clear()
+            self.hits = 0
+            self.misses = 0
+            self.evictions = 0
+            logger.info("AsyncCache cleared.")

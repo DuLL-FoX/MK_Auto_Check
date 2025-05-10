@@ -2,9 +2,10 @@ import asyncio
 import logging
 import time
 from collections import deque
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 from urllib.parse import urlparse, parse_qs, quote_plus
 
+from admin_panel import N_A
 from config_system import get_config
 from models.player import Player
 from utils.async_utils import RateLimiter, AsyncCache
@@ -37,65 +38,94 @@ class AdminService:
     async def login(self) -> bool:
         current_time = time.time()
         if current_time - self._last_login_time < self._auth_ttl:
+            self.logger.debug("Login token still considered valid.")
             return True
 
+        self.logger.info("Attempting AdminPanel login.")
         start_time = time.time()
         result = await asyncio.to_thread(self.admin_panel.login)
         elapsed = time.time() - start_time
-        self.perf_tracker.record("login", elapsed)
+        self.perf_tracker.record("admin_panel_login", elapsed)
 
         if result:
             self._last_login_time = current_time
+            self.logger.info(f"AdminPanel login successful in {elapsed:.2f}s.")
+        else:
+            self.logger.error(f"AdminPanel login failed after {elapsed:.2f}s.")
 
-        self.logger.info(f"Login completed in {elapsed:.2f}s with result: {result}")
         return result
 
     @monitor_performance
     async def fetch_with_rate_limit(self, func, *args, **kwargs):
-        func_name = func.__name__
+        func_name = func.__name__ if hasattr(func, '__name__') else str(func)
 
-        if func_name == "check_account_on_site" and args and isinstance(args[0], str) and "search=" in args[0]:
-            parsed_url = urlparse(args[0])
+        if func_name == "check_account_on_site" and args:
+            url_arg = str(args[0])
+            single_user_arg = args[1] if len(args) > 1 else kwargs.get('single_user', False)
+
+            parsed_url = urlparse(url_arg)
             query_params = parse_qs(parsed_url.query)
             search_term = query_params.get('search', [''])[0]
-            single_user = args[1] if len(args) > 1 else kwargs.get('single_user', False)
-            cache_key = f"{func_name}:search={search_term}:single_user={single_user}"
+
+            normalized_search = search_term.lower().strip()
+            cache_key = f"{func_name}:search={normalized_search}:single_user={single_user_arg}"
         else:
-            args_str = ','.join(str(a) for a in args if isinstance(a, (str, int, float, bool)) or len(str(a)) < 100)
-            cache_key = f"{func_name}:{args_str}"
+            arg_parts = []
+            for arg in args:
+                if isinstance(arg, (str, int, float, bool)):
+                    arg_parts.append(str(arg))
+                elif hasattr(arg, '__dict__'):
+                    arg_parts.append(f"obj:{arg.__class__.__name__}")
+                else:
+                    arg_parts.append(str(type(arg)))
+
+            kwarg_parts = [f"{k}={v}" for k, v in sorted(kwargs.items())]
+            cache_key = f"{func_name}:{':'.join(arg_parts)}:{':'.join(kwarg_parts)}"
+            if len(cache_key) > 256:
+                cache_key = cache_key[:253] + "..."
 
         self._request_stats["total"] += 1
 
-        async def fetch_factory():
+        async def factory_coro():
+            self.logger.debug(f"Cache miss for key: {cache_key}. Executing function: {func_name}")
             self._request_stats["cache_misses"] += 1
-            start_time = time.time()
 
+            if not await self.login():
+                self.logger.error(f"Login failed for {func_name}, cannot proceed with call.")
+                return None
+
+            op_start_time = time.time()
             async with self.semaphore:
                 await self.rate_limiter.acquire()
-                result = await asyncio.to_thread(func, *args, **kwargs)
+                call_result = await asyncio.to_thread(func, *args, **kwargs)
 
-            elapsed = time.time() - start_time
-            self.perf_tracker.record(func_name, elapsed)
+            op_elapsed_time = time.time() - op_start_time
+            self.perf_tracker.record(func_name, op_elapsed_time)
 
-            if elapsed > self.slow_operation_threshold:
-                log_args = str(args[0]) if args else ""
-                if len(log_args) > 40:
-                    log_args = log_args[:37] + "..."
-                self.perf_logger.debug(f"Slow operation: {func_name} took {elapsed:.2f}s with args: {log_args}")
+            if op_elapsed_time > self.slow_operation_threshold:
+                log_args_str = str(args[0]) if args else "N/A"
+                if len(log_args_str) > 60: log_args_str = log_args_str[:57] + "..."
+                self.perf_logger.warning(
+                    f"Slow operation: {func_name} took {op_elapsed_time:.2f}s with args preview: {log_args_str}"
+                )
+            return call_result
 
-            return result
+        result = await self.cache.get(cache_key, factory_coro)
 
-        result = await self.cache.get(cache_key, fetch_factory)
-        self._request_stats["cache_hits"] += 1
+        if result is not None:
+            pass
 
-        if func_name == "check_account_on_site" and isinstance(result, dict):
+        if func_name == "check_account_on_site" and isinstance(result, dict) and kwargs.get('single_user'):
             required_keys = ['status', 'nicknames', 'associated_ips', 'associated_hwids', 'user_id']
-            missing_keys = [k for k in required_keys if k not in result]
-            if missing_keys:
-                self.logger.warning(f"Missing keys in check_account_on_site result: {missing_keys}")
+            missing_or_none_keys = [k for k in required_keys if k not in result or result[k] is None]
+            if missing_or_none_keys:
+                self.logger.warning(
+                    f"Missing or None essential keys in 'check_account_on_site' single_user result: {missing_or_none_keys} for key {cache_key}"
+                )
 
         if self.perf_tracker.should_log_summary():
-            for line in self.perf_tracker.get_summary():
+            summary_lines = self.perf_tracker.get_summary()
+            for line in summary_lines:
                 self.perf_logger.info(line)
 
         return result
@@ -104,310 +134,345 @@ class AdminService:
     async def search_player(self, term: str, single_user: bool = True, max_depth: int = None) -> Optional[
         Dict[str, Any]]:
         cfg = get_config()
-        max_depth = max_depth if max_depth is not None else cfg.scan.search_max_depth
-        start_time = time.time()
-        self.logger.info(f"Searching for player with term: '{term}' (max depth: {max_depth})")
+        effective_max_depth = max_depth if max_depth is not None else getattr(cfg.scan, 'search_max_depth', 2)
 
-        cache_key = f"search_player:{term}:{single_user}:{max_depth}"
+        start_time_search = time.time()
+        self.logger.info(
+            f"Initiating player search for term: '{term}', single_user={single_user}, max_depth={effective_max_depth}")
+
+        search_cache_key = f"search_player_v2:{term.lower().strip()}:single_user={single_user}:max_depth={effective_max_depth}"
         current_time = time.time()
-        if cache_key in self._search_cache:
-            cached_result, timestamp = self._search_cache[cache_key]
+
+        if search_cache_key in self._search_cache:
+            cached_data, timestamp = self._search_cache[search_cache_key]
             if current_time - timestamp < self._search_cache_ttl:
-                self.logger.info(f"Using cached search result for '{term}'")
-                return cached_result
+                self.logger.info(f"Returning cached search result for '{term}' from _search_cache.")
+                self._request_stats["cache_hits"] += 1
+                return cached_data
+            else:
+                del self._search_cache[search_cache_key]
 
-        processed_terms = set()
-        queued_terms = set([term])
-        queue = deque([(term, 0)])
-        merged_result = None
-        stats = {"searches": 0, "depth_counts": {}}
+        self._request_stats["cache_misses"] += 1
 
-        while queue:
-            batch_size = min(5, len(queue))
-            batch = []
+        processed_terms: Set[str] = set()
+        search_queue = deque([(term.lower().strip(), 0)])
 
-            for _ in range(batch_size):
-                if not queue:
-                    break
-                batch.append(queue.popleft())
+        terms_in_flight: Set[str] = {term.lower().strip()}
 
-            batch_tasks = []
-            for current_term, current_depth in batch:
-                if current_term in processed_terms:
+        merged_result_data: Optional[Dict[str, Any]] = None
+        search_stats = {"unique_api_calls": 0, "depth_distribution": {}}
+
+        while search_queue:
+            current_batch_size = min(getattr(cfg.scan, 'search_batch_size', 5), len(search_queue))
+            batch_items_to_process = []
+            for _ in range(current_batch_size):
+                if not search_queue: break
+                batch_items_to_process.append(search_queue.popleft())
+
+            if not batch_items_to_process: continue
+
+            batch_processing_tasks = []
+            for current_search_term, current_search_depth in batch_items_to_process:
+                if current_search_term in processed_terms:
                     continue
 
-                processed_terms.add(current_term)
-                stats["searches"] += 1
-                stats["depth_counts"][current_depth] = stats["depth_counts"].get(current_depth, 0) + 1
+                processed_terms.add(current_search_term)
+                search_stats["unique_api_calls"] += 1
+                search_stats["depth_distribution"][current_search_depth] = search_stats["depth_distribution"].get(
+                    current_search_depth, 0) + 1
 
-                batch_tasks.append(self._process_search_term(
-                    current_term,
-                    current_depth,
-                    single_user,
-                    max_depth,
-                    processed_terms,
-                    queued_terms
+                batch_processing_tasks.append(self._process_search_term(
+                    current_search_term, current_search_depth, single_user, effective_max_depth,
+                    processed_terms, terms_in_flight
                 ))
 
-            if not batch_tasks:
-                continue
+            if not batch_processing_tasks: continue
 
-            batch_results = await asyncio.gather(*batch_tasks)
+            term_processing_results = await asyncio.gather(*batch_processing_tasks, return_exceptions=True)
 
-            for result in batch_results:
-                if not result or not result.get('result'):
-                    continue
-
-                if merged_result is None:
-                    merged_result = result['result']
+            for item_from_gather in term_processing_results:
+                if isinstance(item_from_gather, Exception):
+                    self.logger.error(f"Error during batched search term processing: {item_from_gather}")
                 else:
-                    self._merge_search_results(merged_result, result['result'])
+                    individual_result: Optional[Dict[str, Any]] = item_from_gather
 
-                for new_term, new_depth in result.get('new_terms', []):
-                    queue.append((new_term, new_depth))
-                    queued_terms.add(new_term)
+                    if not individual_result or not individual_result.get('result_data'):
+                        continue
 
-        elapsed = time.time() - start_time
+
+                    if merged_result_data is None:
+                        merged_result_data = individual_result['result_data']
+                    else:
+                        self._merge_search_results(merged_result_data, individual_result['result_data'])
+
+                    for new_term_to_search, new_depth_level in individual_result.get('new_terms_to_search', []):
+                        if new_term_to_search not in terms_in_flight:
+                            search_queue.append((new_term_to_search, new_depth_level))
+                            terms_in_flight.add(new_term_to_search)
+
+        search_elapsed_time = time.time() - start_time_search
         self.logger.info(
-            f"Search completed in {elapsed:.2f}s: {stats['searches']} unique searches performed, "
-            f"depth distribution: {stats['depth_counts']}"
+            f"Search for '{term}' completed in {search_elapsed_time:.2f}s. "
+            f"Stats: API Calls={search_stats['unique_api_calls']}, Depth Dist={search_stats['depth_distribution']}"
         )
 
-        self._search_cache[cache_key] = (merged_result, current_time)
+        if merged_result_data:
+            self._search_cache[search_cache_key] = (merged_result_data, current_time)
 
-        if len(self._search_cache) > 1000:
-            self._clean_search_cache()
+        if len(self._search_cache) > getattr(cfg.scan, 'search_cache_max_size', 1000):
+            self._clean_search_cache_lru(getattr(cfg.scan, 'search_cache_evict_count', 100))
 
-        return merged_result
+        return merged_result_data
 
-    async def _process_search_term(self, current_term, current_depth, single_user, max_depth, processed_terms,
-                                   queued_terms):
+    async def _process_search_term(
+            self, current_term: str, current_depth: int,
+            single_user_mode: bool, max_search_depth: int,
+            glob_processed_terms: Set[str],
+            glob_terms_in_flight: Set[str]
+    ) -> Optional[Dict[str, Any]]:
+
+        self.logger.debug(f"Processing search for term: '{current_term}' at depth {current_depth}")
+
         try:
-            clean_term = quote_plus(current_term)
-            search_url = f"{self.base_admin_connections_url}&search={clean_term}"
-            self.logger.info(f"Searching for player with term: '{current_term}' (depth: {current_depth})")
+            encoded_term = quote_plus(current_term)
+            connections_search_url = f"{self.base_admin_connections_url}&search={encoded_term}"
 
-            result = await self.fetch_with_rate_limit(
+            term_data = await self.fetch_with_rate_limit(
                 self.admin_panel.check_account_on_site,
-                search_url,
-                single_user
+                connections_search_url,
+                single_user_mode
             )
 
-            if not result:
-                self.logger.info(f"No results found for term: '{current_term}'")
+            if not term_data or (isinstance(term_data, list) and not term_data):
+                self.logger.debug(f"No data returned for term '{current_term}'.")
                 return None
 
-            if current_depth >= max_depth:
-                return {'result': result, 'new_terms': []}
+            aggregated_data_for_term = term_data
+            if isinstance(term_data, list):
+                self.logger.warning(
+                    f"Expected aggregated dict for '{current_term}', but got list. Cannot extract new identifiers if single_user=false.")
 
-            identifiers = self._extract_prioritized_identifiers(
-                result,
-                current_term,
-                processed_terms,
-                queued_terms
-            )
+            new_terms_to_add_to_queue: List[Tuple[str, int]] = []
+            if current_depth < max_search_depth:
+                if isinstance(aggregated_data_for_term, dict):
+                    extracted_identifiers = self._extract_prioritized_identifiers(
+                        aggregated_data_for_term, current_term,
+                        glob_processed_terms,
+                        glob_terms_in_flight
+                    )
 
-            limit = self._get_search_limit_for_depth(current_depth)
-            limited_identifiers = identifiers[:limit]
+                    search_limit_for_this_depth = self._get_search_limit_for_depth(current_depth)
 
-            new_terms = [(identifier, current_depth + 1) for identifier in limited_identifiers]
-            self.logger.info(f"Added {len(new_terms)} identifiers to search at depth {current_depth + 1}")
+                    count_added = 0
+                    for identifier in extracted_identifiers:
+                        if count_added >= search_limit_for_this_depth:
+                            break
+                        new_terms_to_add_to_queue.append((identifier, current_depth + 1))
+                        count_added += 1
 
-            return {'result': result, 'new_terms': new_terms}
+                    if new_terms_to_add_to_queue:
+                        self.logger.debug(
+                            f"Identified {len(new_terms_to_add_to_queue)} new terms from '{current_term}' for further search.")
+                else:
+                    self.logger.debug(f"Data for '{current_term}' is not a dict, cannot extract new identifiers.")
+
+            return {'result_data': aggregated_data_for_term, 'new_terms_to_search': new_terms_to_add_to_queue}
 
         except Exception as e:
-            self.logger.error(f"Error searching for '{current_term}': {str(e)}")
+            self.logger.error(f"Error processing search term '{current_term}' at depth {current_depth}: {e}",
+                              exc_info=True)
             return None
 
-    def _clean_search_cache(self):
-        current_time = time.time()
-        to_remove = []
+    def _clean_search_cache_lru(self, evict_count: int):
+        if len(self._search_cache) <= (evict_count * 2):
+            return
 
-        for key, (_, timestamp) in self._search_cache.items():
-            if current_time - timestamp > self._search_cache_ttl:
-                to_remove.append(key)
+        self.logger.debug(
+            f"Cleaning _search_cache. Current size: {len(self._search_cache)}. Evicting up to {evict_count}.")
 
-        for key in to_remove:
-            del self._search_cache[key]
+        sorted_items = sorted(self._search_cache.items(), key=lambda item: item[1][1])
 
-        if len(self._search_cache) > 900:
-            sorted_items = sorted(self._search_cache.items(), key=lambda x: x[1][1])
-            for key, _ in sorted_items[:100]:
-                del self._search_cache[key]
+        num_evicted = 0
+        for i in range(min(evict_count, len(sorted_items))):
+            key_to_remove = sorted_items[i][0]
+            del self._search_cache[key_to_remove]
+            num_evicted += 1
+
+        self.logger.info(f"Evicted {num_evicted} items from _search_cache.")
 
     def _extract_prioritized_identifiers(
             self,
-            result: Dict[str, Any],
-            current_term: str,
-            processed_terms: Set[str],
-            queued_terms: Set[str]
+            result_dict: Dict[str, Any],
+            origin_term: str,
+            glob_processed_terms: Set[str],
+            glob_terms_in_flight: Set[str]
     ) -> List[str]:
-        prioritized = []
-        processed_set = processed_terms
-        queued_set = queued_terms
 
-        def add_if_new(identifier, priority):
-            if (identifier and
-                    identifier != "N/A" and
-                    identifier != current_term and
-                    identifier not in processed_set and
-                    identifier not in queued_set):
-                prioritized.append((priority, identifier))
+        potential_new_identifiers: List[Tuple[int, str]] = []
 
-        user_id = result.get("user_id")
-        add_if_new(user_id, 0)
+        def add_if_valid_and_new(identifier: Optional[str], priority: int):
+            if not identifier or identifier == N_A or not isinstance(identifier, str):
+                return
 
-        associated_hwids = result.get("associated_hwids", {})
-        for hwid in associated_hwids:
-            add_if_new(hwid, 1)
+            clean_id = identifier.lower().strip()
+            if not clean_id or clean_id == origin_term.lower().strip():
+                return
 
-        associated_ips = result.get("associated_ips", {})
-        for ip in associated_ips:
-            add_if_new(ip, 2)
+            if clean_id not in glob_processed_terms and clean_id not in glob_terms_in_flight:
+                potential_new_identifiers.append(
+                    (priority, clean_id))
 
-        nicknames = result.get("nicknames", [])
-        for nickname in nicknames:
-            add_if_new(nickname, 3)
+        user_id = result_dict.get("user_id")
+        add_if_valid_and_new(user_id, 0)
 
-        prioritized.sort()
-        return [identifier for _, identifier in prioritized]
+        for hwid_val in result_dict.get("associated_hwids", {}).keys():
+            add_if_valid_and_new(hwid_val, 1)
+
+        for ip_val in result_dict.get("associated_ips", {}).keys():
+            add_if_valid_and_new(ip_val, 2)
+
+        for nickname_val in result_dict.get("nicknames", []):
+            add_if_valid_and_new(nickname_val, 3)
+
+        potential_new_identifiers.sort()
+
+        return [id_str for _, id_str in potential_new_identifiers]
 
     def _get_search_limit_for_depth(self, depth: int) -> int:
         cfg = get_config()
         if depth == 0:
-            return cfg.scan.search_limit_root
+            return getattr(cfg.scan, 'search_limit_root', 5)
         elif depth == 1:
-            return cfg.scan.search_limit_level1
+            return getattr(cfg.scan, 'search_limit_level1', 3)
         elif depth == 2:
-            return cfg.scan.search_limit_level2
+            return getattr(cfg.scan, 'search_limit_level2', 2)
         else:
-            return cfg.scan.search_limit_default
+            return getattr(cfg.scan, 'search_limit_default', 1)
 
-    def _merge_search_results(self, target: Dict[str, Any], source: Dict[str, Any]) -> None:
-        if not target or not source:
+    def _merge_search_results(self, main_result: Dict[str, Any], new_data: Dict[str, Any]) -> None:
+        if not isinstance(main_result, dict) or not isinstance(new_data, dict):
+            self.logger.warning(
+                f"Attempted to merge non-dict results. Main type: {type(main_result)}, New type: {type(new_data)}")
             return
 
-        for key in ['associated_ips', 'associated_hwids', 'nicknames', 'shared_hwid_nicknames']:
-            if key not in target:
-                target[key] = {} if key in ['associated_ips', 'associated_hwids'] else []
+        def merge_list_field(field_name: str, uniqueness_key_func=None):
+            main_list = main_result.get(field_name, [])
+            new_items = new_data.get(field_name, [])
 
-        source_ips = source.get('associated_ips', {})
-        for ip, nicks in source_ips.items():
-            if ip not in target['associated_ips']:
-                target['associated_ips'][ip] = nicks
+            if not isinstance(main_list, list): main_list = []
+
+            existing_keys = set()
+            if uniqueness_key_func:
+                for item in main_list:
+                    try:
+                        existing_keys.add(uniqueness_key_func(item))
+                    except Exception:
+                        pass
             else:
-                existing_nicks = set(target['associated_ips'][ip])
-                existing_nicks.update(nicks)
-                target['associated_ips'][ip] = list(existing_nicks)
+                existing_keys.update(item for item in main_list if isinstance(item, (str, int, float, bool, tuple)))
 
-        source_hwids = source.get('associated_hwids', {})
-        for hwid, nicks in source_hwids.items():
-            if hwid not in target['associated_hwids']:
-                target['associated_hwids'][hwid] = nicks
-            else:
-                existing_nicks = set(target['associated_hwids'][hwid])
-                existing_nicks.update(nicks)
-                target['associated_hwids'][hwid] = list(existing_nicks)
+            for item in new_items:
+                try:
+                    key_to_check = uniqueness_key_func(item) if uniqueness_key_func else item
+                    if not isinstance(key_to_check, (str, int, float, bool, tuple)) and uniqueness_key_func is None:
+                        if item not in main_list:
+                            main_list.append(item)
+                        continue
 
-        for key in ['nicknames', 'shared_hwid_nicknames']:
-            if key in source:
-                target_items = set(target.get(key, []))
-                source_items = source.get(key, [])
-                target_items.update(source_items)
-                target[key] = list(target_items)
+                    if key_to_check not in existing_keys:
+                        main_list.append(item)
+                        existing_keys.add(key_to_check)
+                except Exception:
+                    if item not in main_list:
+                        main_list.append(item)
 
-        if 'ban_reasons' in source:
-            if 'ban_reasons' not in target:
-                target['ban_reasons'] = []
+            main_result[field_name] = main_list
 
-            existing_ban_reason_keys = set()
-            for ban_info in target['ban_reasons']:
-                if isinstance(ban_info, dict) and 'reason' in ban_info and 'username' in ban_info:
-                    existing_ban_reason_keys.add((ban_info['reason'], ban_info['username']))
-                elif isinstance(ban_info, str):
-                    existing_ban_reason_keys.add((ban_info, "Unknown"))
+        def merge_dict_field_with_list_values(field_name: str):
+            main_dict = main_result.get(field_name, {})
+            new_items_dict = new_data.get(field_name, {})
 
-            for ban_info in source.get('ban_reasons', []):
-                if isinstance(ban_info, dict) and 'reason' in ban_info and 'username' in ban_info:
-                    key = (ban_info['reason'], ban_info['username'])
-                    if key not in existing_ban_reason_keys:
-                        target['ban_reasons'].append(ban_info)
-                        existing_ban_reason_keys.add(key)
-                elif isinstance(ban_info, str):
-                    key = (ban_info, "Unknown")
-                    if key not in existing_ban_reason_keys:
-                        target['ban_reasons'].append({
-                            'reason': ban_info,
-                            'username': "Unknown"
-                        })
-                        existing_ban_reason_keys.add(key)
+            if not isinstance(main_dict, dict): main_dict = {}
 
-        target['ban_counts'] = max(
-            target.get('ban_counts', 0),
-            source.get('ban_counts', 0)
-        )
+            for key, new_val_list in new_items_dict.items():
+                if not isinstance(new_val_list, list): continue
 
-        status_priority = {
-            'banned': 3,
-            'suspicious': 2,
-            'clean': 1,
-            'unknown': 0
-        }
-        target_status = target.get('status', 'unknown').lower()
-        source_status = source.get('status', 'unknown').lower()
-        if status_priority.get(source_status, 0) > status_priority.get(target_status, 0):
-            target['status'] = source.get('status')
+                if key not in main_dict:
+                    main_dict[key] = list(set(new_val_list))
+                else:
+                    existing_val_set = set(main_dict.get(key, []))
+                    existing_val_set.update(new_val_list)
+                    main_dict[key] = list(existing_val_set)
+            main_result[field_name] = main_dict
 
-        if 'denied_banned_connections' in source:
-            target_denied = target.get('denied_banned_connections', [])
-            source_denied = source.get('denied_banned_connections', [])
-            denied_set = {
-                (conn.get('user_name', ''), conn.get('time', ''), conn.get('ip_address', ''))
-                for conn in target_denied
-            }
-            for conn in source_denied:
-                conn_key = (conn.get('user_name', ''), conn.get('time', ''), conn.get('ip_address', ''))
-                if conn_key not in denied_set:
-                    target_denied.append(conn)
-                    denied_set.add(conn_key)
-            target['denied_banned_connections'] = target_denied
+        merge_list_field("nicknames")
+        merge_list_field("shared_hwid_nicknames")
 
-    def convert_to_player(self, account_info: Dict[str, Any]) -> Player:
-        if not account_info:
-            self.logger.warning("Empty account_info provided to convert_to_player")
-            return Player(user_id="N/A", nicknames=[], status="unknown")
+        merge_list_field("ban_reasons",
+                         lambda br: (br.get("reason", ""), br.get("username", "")) if isinstance(br, dict) else br)
 
-        required_fields = ['user_id', 'nicknames', 'status']
-        missing_fields = [field for field in required_fields if field not in account_info]
-        if missing_fields:
-            self.logger.warning(f"Missing required fields in account_info: {missing_fields}")
+        merge_list_field("denied_banned_connections",
+                         lambda dbc: (dbc.get("user_name", ""), dbc.get("time", ""),
+                                      dbc.get("ip_address", "")) if isinstance(dbc, dict) else dbc)
 
-        ban_reasons = account_info.get("ban_reasons", [])
-        formatted_ban_reasons = []
-        for reason in ban_reasons:
-            if isinstance(reason, dict) and "reason" in reason and "username" in reason:
-                formatted_ban_reasons.append(reason)
-            elif isinstance(reason, str):
-                formatted_ban_reasons.append({
-                    "reason": reason,
-                    "username": account_info.get("nicknames", ["Unknown"])[0] if account_info.get(
-                        "nicknames") else "Unknown"
-                })
+        merge_dict_field_with_list_values("associated_ips")
+        merge_dict_field_with_list_values("associated_hwids")
 
-        player = Player(
-            user_id=account_info.get("user_id", "N/A"),
-            nicknames=account_info.get("nicknames", []),
-            status=account_info.get("status", "unknown"),
-            ban_counts=account_info.get("ban_counts", 0),
+        main_result["ban_counts"] = max(main_result.get("ban_counts", 0), new_data.get("ban_counts", 0))
+
+        status_priority = {'banned': 3, 'suspicious': 2, 'clean': 1, 'unknown': 0, N_A: 0}
+        current_status_val = str(main_result.get("status", "unknown")).lower()
+        new_status_val = str(new_data.get("status", "unknown")).lower()
+
+        if status_priority.get(new_status_val, 0) > status_priority.get(current_status_val, 0):
+            main_result["status"] = new_data.get("status")
+
+        if main_result.get("user_id", N_A) == N_A and new_data.get("user_id", N_A) != N_A:
+            main_result["user_id"] = new_data.get("user_id")
+
+        if main_result.get("connection_link", N_A) == N_A and new_data.get("connection_link", N_A) != N_A:
+            main_result["connection_link"] = new_data.get("connection_link")
+
+    def convert_to_player(self, account_info_dict: Optional[Dict[str, Any]]) -> Player:
+        if not account_info_dict:
+            self.logger.warning(
+                "Empty or None account_info_dict provided to convert_to_player. Returning default Player.")
+            return Player(user_id=N_A, nicknames=[], status="unknown")
+
+        player_user_id = account_info_dict.get("user_id", N_A)
+        player_nicknames = account_info_dict.get("nicknames", [])
+        player_status = account_info_dict.get("status", "unknown")
+        player_ban_counts = account_info_dict.get("ban_counts", 0)
+
+        raw_ban_reasons = account_info_dict.get("ban_reasons", [])
+        formatted_ban_reasons: List[Dict[str, str]] = []
+        if isinstance(raw_ban_reasons, list):
+            for reason_entry in raw_ban_reasons:
+                if isinstance(reason_entry, dict) and "reason" in reason_entry and "username" in reason_entry:
+                    formatted_ban_reasons.append({
+                        "reason": str(reason_entry["reason"]),
+                        "username": str(reason_entry["username"])
+                    })
+
+        player_connection_link = account_info_dict.get("connection_link", N_A)
+        player_associated_ips = account_info_dict.get("associated_ips", {})
+        player_associated_hwids = account_info_dict.get("associated_hwids", {})
+        player_shared_hwid_nicknames = account_info_dict.get("shared_hwid_nicknames", [])
+        player_denied_logins = account_info_dict.get("denied_banned_connections", [])
+        player_hwid_erased = account_info_dict.get("hwid_erased", False)
+
+        player_instance = Player(
+            user_id=player_user_id if player_user_id is not None else N_A,
+            nicknames=player_nicknames if isinstance(player_nicknames, list) else [],
+            status=str(player_status) if player_status is not None else "unknown",
+            ban_counts=player_ban_counts if isinstance(player_ban_counts, int) else 0,
             ban_reasons=formatted_ban_reasons,
-            connection_link=account_info.get("connection_link", "N/A"),
-            associated_ips=account_info.get("associated_ips", {}),
-            associated_hwids=account_info.get("associated_hwids", {}),
-            shared_hwid_nicknames=account_info.get("shared_hwid_nicknames", []),
-            hwid_erased=account_info.get("hwid_erased", False)
+            connection_link=player_connection_link if player_connection_link is not None else N_A,
+            associated_ips=player_associated_ips if isinstance(player_associated_ips, dict) else {},
+            associated_hwids=player_associated_hwids if isinstance(player_associated_hwids, dict) else {},
+            shared_hwid_nicknames=player_shared_hwid_nicknames if isinstance(player_shared_hwid_nicknames,
+                                                                             list) else [],
+            denied_logins=player_denied_logins if isinstance(player_denied_logins, list) else [],
+            hwid_erased=bool(player_hwid_erased)
         )
-
-        if "denied_banned_connections" in account_info:
-            player.denied_logins = account_info["denied_banned_connections"]
-
-        return player
+        return player_instance
