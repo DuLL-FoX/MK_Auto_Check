@@ -385,22 +385,45 @@ class AdminPanel:
     
     _get_cached_response = _get_cached_response_corrected
 
+    async def _make_request(self, url: str) -> Optional[str]:
+        if not await self._ensure_authenticated():
+            self.logger.error(f"Authentication failed before making request to {url}")
+            return None
+
+        session = await self._get_session()
+        try:
+            async with session.get(url) as response:
+                if response.status in (401, 403):
+                    self.logger.warning(
+                        f"Request to {url} failed with status {response.status}. Re-authenticating and retrying once.")
+                    if not await self.login():
+                        self.logger.error("Re-login attempt failed. Aborting request.")
+                        return None
+
+                    async with session.get(url) as retry_response:
+                        retry_response.raise_for_status()
+                        return await retry_response.text()
+
+                response.raise_for_status()
+                return await response.text()
+
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Aiohttp client error during request to {url}: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Unexpected error during request to {url}: {e}", exc_info=True)
+            return None
 
     async def fetch_paginated_data(self, url: str, max_pages: int = 0) -> List[ConnectionData]:
         if self.logger.isEnabledFor(logging.INFO):
             self.logger.info(
                 f"Fetching paginated data from URL: {url}, max_pages={max_pages if max_pages > 0 else 'unlimited'}")
 
-        if not await self._ensure_authenticated():
-            self.logger.error("Not authenticated, cannot fetch data")
-            return []
-
         all_connections: List[ConnectionData] = []
         current_url: Optional[str] = url
         page_num = 1
         pages_fetched = 0
         start_time_total = time.time()
-        session = await self._get_session()
 
         while current_url:
             if max_pages > 0 and pages_fetched >= max_pages:
@@ -411,69 +434,50 @@ class AdminPanel:
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(f"Fetching page {page_num} from URL: {current_url}")
 
-            try:
-                self._request_metrics["total"] += 1
-                req_start_time = time.time()
-                html_content: Optional[str] = await self._get_cached_response(current_url)
-                from_cache = bool(html_content)
+            req_start_time = time.time()
+            html_content: Optional[str] = await self._get_cached_response(current_url)
+            from_cache = bool(html_content)
 
-                if not html_content:
-                    if self.logger.isEnabledFor(logging.DEBUG):
-                        self.logger.debug(f"Cache miss for page {page_num} URL: {current_url}. Fetching live.")
-                    async with session.get(current_url) as response:
-                        response.raise_for_status()
-                        html_content = await response.text()
-                    await self._cache_response(current_url, html_content)
-                elif self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(f"Using cached response for page {page_num} URL: {current_url}")
-
-                req_elapsed_time = time.time() - req_start_time
-                if req_elapsed_time > self.SLOW_REQUEST_THRESHOLD and not from_cache:
-                    self._request_metrics["slow_requests"] += 1
-                    log_url_display = current_url[:67] + "..." if len(current_url) > 70 else current_url
-                    if self.perf_logger.isEnabledFor(logging.DEBUG):
-                        self.perf_logger.debug(f"Slow request ({req_elapsed_time:.2f}s): {log_url_display}")
-
-                if not html_content:
-                    self.logger.error(f"Failed to get HTML content for page {page_num} URL: {current_url}")
-                    break
-
+            if not html_content:
                 if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(f"Page {page_num} response length: {len(html_content)}. Parsing...")
-                soup = HTMLParser(html_content)
-                connections_on_page = self._parse_connections_table(soup)
-                all_connections.extend(connections_on_page)
-                pages_fetched += 1
+                    self.logger.debug(f"Cache miss for page {page_num} URL: {current_url}. Fetching live.")
 
-                is_likely_search_page = "search=" in current_url.lower()
-                if not connections_on_page and is_likely_search_page and page_num == 1:
-                    if self.logger.isEnabledFor(logging.INFO):
-                        self.logger.info(f"Search results page {current_url} (page {page_num}) yielded no connections. Assuming end of relevant results for this search.")
-                    current_url = None
-                else:
-                    current_url = self._get_next_page_link(soup)
+                html_content = await self._make_request(current_url)
 
-                if current_url:
-                    if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(f"Next page link found: {current_url}")
-                    page_num += 1
-                elif self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(f"No more pages found after page {page_num - 1 if page_num > 1 else 1}.")
+                if html_content:
+                    await self._cache_response(current_url, html_content)
 
-            except aiohttp.ClientResponseError as e:
-                self._request_metrics["errors"] += 1
-                self.logger.error(f"HTTP error {e.status} on page {page_num} for URL {current_url}: {e.message}")
-                if e.status in (401, 403):
-                    self.logger.warning("Authentication may have expired. Re-login attempt on next call.")
-                    async with self._async_lock: self._is_authenticated = False
+            req_elapsed_time = time.time() - req_start_time
+            if req_elapsed_time > self.SLOW_REQUEST_THRESHOLD and not from_cache:
+                self._request_metrics["slow_requests"] += 1
+                log_url_display = current_url[:67] + "..." if len(current_url) > 70 else current_url
+                if self.perf_logger.isEnabledFor(logging.DEBUG):
+                    self.perf_logger.debug(f"Slow request ({req_elapsed_time:.2f}s): {log_url_display}")
+
+            if not html_content:
+                self.logger.error(
+                    f"Failed to get HTML content for page {page_num} URL: {current_url}. Stopping pagination here.")
                 break
-            except aiohttp.ClientError as e:
-                self._request_metrics["errors"] += 1
-                self.logger.error(f"Client error on page {page_num} for URL {current_url}: {str(e)}")
-                break
-            except Exception as e:
-                self._request_metrics["errors"] += 1
-                self.logger.error(f"Error processing page {page_num} for URL {current_url}: {str(e)}", exc_info=True)
-                break
+
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(f"Page {page_num} response length: {len(html_content)}. Parsing...")
+
+            soup = HTMLParser(html_content)
+            connections_on_page = self._parse_connections_table(soup)
+            all_connections.extend(connections_on_page)
+            pages_fetched += 1
+
+            is_likely_search_page = "search=" in current_url.lower()
+            if not connections_on_page and is_likely_search_page and page_num == 1:
+                if self.logger.isEnabledFor(logging.INFO):
+                    self.logger.info(
+                        f"Search results page {current_url} (page {page_num}) yielded no connections. Assuming end of relevant results.")
+                current_url = None
+            else:
+                current_url = self._get_next_page_link(soup)
+
+            if current_url:
+                page_num += 1
 
         total_elapsed_time = time.time() - start_time_total
         self.perf_stats.record("fetch_paginated_data", total_elapsed_time)

@@ -3,15 +3,16 @@ import hashlib
 import logging
 import time
 from collections import deque, OrderedDict
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Set, Tuple, Callable
 from urllib.parse import quote_plus
-from datetime import datetime, timedelta
+
+from aiolimiter import AsyncLimiter
 
 from admin_panel import N_A, AdminPanel
 from config_system import get_config
 from models.player import Player
 from utils.async_utils import AsyncCache
-from aiolimiter import AsyncLimiter
 from utils.performance_monitor import monitor_performance, PerformanceTracker
 
 
@@ -19,7 +20,7 @@ class AdminService:
     def __init__(self, admin_panel: AdminPanel, max_concurrent_requests: int = 100) -> None:
         self.admin_panel = admin_panel
         self.semaphore = asyncio.Semaphore(max_concurrent_requests)
-        self.rate_limiter = AsyncLimiter(150, 1.0)
+        self.rate_limiter = AsyncLimiter(10, 1.0)
         
         self.cache = AsyncCache(max_size=20000, default_ttl=3600)
         self.base_admin_connections_url = (
