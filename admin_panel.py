@@ -2,8 +2,6 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from enum import Enum
 from typing import Dict, Union, List, Any, Optional, Tuple, OrderedDict
 from urllib.parse import urljoin, quote_plus
 
@@ -15,59 +13,6 @@ from utils.performance_monitor import PerformanceStats
 
 N_A = "N/A"
 
-
-class CircuitState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
-class CircuitBreaker:
-    def __init__(self, failure_threshold=5, recovery_timeout=60, half_open_requests=3):
-        self.failure_threshold = failure_threshold
-        self.recovery_timeout = recovery_timeout
-        self.half_open_requests = half_open_requests
-
-        self.state = CircuitState.CLOSED
-        self.failure_count = 0
-        self.last_failure_time = None
-        self.half_open_successes = 0
-
-    def can_request(self) -> bool:
-        if self.state == CircuitState.CLOSED:
-            return True
-
-        if self.state == CircuitState.OPEN:
-            if self.last_failure_time:
-                if datetime.now() - self.last_failure_time > timedelta(seconds=self.recovery_timeout):
-                    self.state = CircuitState.HALF_OPEN
-                    self.half_open_successes = 0
-                    return True
-            return False
-
-        if self.state == CircuitState.HALF_OPEN:
-            return self.half_open_successes < self.half_open_requests
-
-        return False
-
-    def record_success(self):
-        if self.state == CircuitState.HALF_OPEN:
-            self.half_open_successes += 1
-            if self.half_open_successes >= self.half_open_requests:
-                self.state = CircuitState.CLOSED
-                self.failure_count = 0
-        elif self.state == CircuitState.CLOSED:
-            self.failure_count = max(0, self.failure_count - 1)
-
-    def record_failure(self):
-        self.failure_count += 1
-        self.last_failure_time = datetime.now()
-
-        if self.state == CircuitState.CLOSED:
-            if self.failure_count >= self.failure_threshold:
-                self.state = CircuitState.OPEN
-        elif self.state == CircuitState.HALF_OPEN:
-            self.state = CircuitState.OPEN
 
 @dataclass
 class ConnectionData:
@@ -133,9 +78,6 @@ class AdminPanel:
         self._response_cache: OrderedDict[str, Tuple[float, str]] = OrderedDict()
         self._RESPONSE_CACHE_MAX_SIZE = 1000
         self._RESPONSE_CACHE_TTL = 1800
-        self.circuit_breaker = CircuitBreaker()
-        self.request_backoff = 0.1  # Start with 100ms
-        self.max_backoff = 30.0  # Max 30 seconds
 
         self._async_lock = asyncio.Lock()
         if self.logger.isEnabledFor(logging.INFO):
@@ -444,74 +386,104 @@ class AdminPanel:
     _get_cached_response = _get_cached_response_corrected
 
     async def _make_request(self, url: str) -> Optional[str]:
-        if not self.circuit_breaker.can_request():
-            self.logger.warning(f"Circuit breaker OPEN - skipping request to {url[:50]}...")
+        if not await self._ensure_authenticated():
+            self.logger.error(f"Authentication failed before making request to {url}")
             return None
 
-        if self.request_backoff > 0.1:
-            await asyncio.sleep(self.request_backoff)
-
+        session = await self._get_session()
         try:
-            result = await self._make_request(url)
+            async with session.get(url) as response:
+                if response.status in (401, 403):
+                    self.logger.warning(
+                        f"Request to {url} failed with status {response.status}. Re-authenticating and retrying once.")
+                    if not await self.login():
+                        self.logger.error("Re-login attempt failed. Aborting request.")
+                        return None
 
-            if result:
-                self.circuit_breaker.record_success()
-                self.request_backoff = max(0.1, self.request_backoff * 0.5)
-                return result
-            else:
-                self.circuit_breaker.record_failure()
-                self.request_backoff = min(self.max_backoff, self.request_backoff * 2)
-                return None
+                    async with session.get(url) as retry_response:
+                        retry_response.raise_for_status()
+                        return await retry_response.text()
 
-        except aiohttp.ClientResponseError as e:
-            if e.status >= 500:
-                self.circuit_breaker.record_failure()
-                self.request_backoff = min(self.max_backoff, self.request_backoff * 2)
-                self.logger.error(f"Server error {e.status} - backing off {self.request_backoff}s")
-            elif e.status == 429:
-                self.request_backoff = min(self.max_backoff, self.request_backoff * 4)
-                self.logger.warning(f"Rate limited - backing off {self.request_backoff}s")
-            raise
+                response.raise_for_status()
+                return await response.text()
+
+        except aiohttp.ClientError as e:
+            self.logger.error(f"Aiohttp client error during request to {url}: {e}")
+            return None
         except Exception as e:
-            self.circuit_breaker.record_failure()
-            self.request_backoff = min(self.max_backoff, self.request_backoff * 2)
-            raise
+            self.logger.error(f"Unexpected error during request to {url}: {e}", exc_info=True)
+            return None
 
     async def fetch_paginated_data(self, url: str, max_pages: int = 0) -> List[ConnectionData]:
-        all_connections = []
-        current_url = url
-        page_num = 1
-        consecutive_failures = 0
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                f"Fetching paginated data from URL: {url}, max_pages={max_pages if max_pages > 0 else 'unlimited'}")
 
-        while current_url and (max_pages == 0 or page_num <= max_pages):
-            html_content = await self._get_cached_response(current_url)
+        all_connections: List[ConnectionData] = []
+        current_url: Optional[str] = url
+        page_num = 1
+        pages_fetched = 0
+        start_time_total = time.time()
+
+        while current_url:
+            if max_pages > 0 and pages_fetched >= max_pages:
+                if self.logger.isEnabledFor(logging.INFO):
+                    self.logger.info(f"Reached max pages limit ({max_pages}) after fetching {pages_fetched} pages.")
+                break
+
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(f"Fetching page {page_num} from URL: {current_url}")
+
+            req_start_time = time.time()
+            html_content: Optional[str] = await self._get_cached_response(current_url)
+            from_cache = bool(html_content)
 
             if not html_content:
+                if self.logger.isEnabledFor(logging.DEBUG):
+                    self.logger.debug(f"Cache miss for page {page_num} URL: {current_url}. Fetching live.")
+
                 html_content = await self._make_request(current_url)
 
-                if not html_content:
-                    consecutive_failures += 1
-                    if consecutive_failures >= 3:
-                        self.logger.error(f"Too many consecutive failures, stopping pagination")
-                        break
+                if html_content:
+                    await self._cache_response(current_url, html_content)
 
-                    await asyncio.sleep(2 ** consecutive_failures)
-                    continue
+            req_elapsed_time = time.time() - req_start_time
+            if req_elapsed_time > self.SLOW_REQUEST_THRESHOLD and not from_cache:
+                self._request_metrics["slow_requests"] += 1
+                log_url_display = current_url[:67] + "..." if len(current_url) > 70 else current_url
+                if self.perf_logger.isEnabledFor(logging.DEBUG):
+                    self.perf_logger.debug(f"Slow request ({req_elapsed_time:.2f}s): {log_url_display}")
 
-                await self._cache_response(current_url, html_content)
+            if not html_content:
+                self.logger.error(
+                    f"Failed to get HTML content for page {page_num} URL: {current_url}. Stopping pagination here.")
+                break
 
-            consecutive_failures = 0
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(f"Page {page_num} response length: {len(html_content)}. Parsing...")
 
             soup = HTMLParser(html_content)
-            connections = self._parse_connections_table(soup)
-            all_connections.extend(connections)
+            connections_on_page = self._parse_connections_table(soup)
+            all_connections.extend(connections_on_page)
+            pages_fetched += 1
 
-            current_url = self._get_next_page_link(soup)
-            page_num += 1
+            is_likely_search_page = "search=" in current_url.lower()
+            if not connections_on_page and is_likely_search_page and page_num == 1:
+                if self.logger.isEnabledFor(logging.INFO):
+                    self.logger.info(
+                        f"Search results page {current_url} (page {page_num}) yielded no connections. Assuming end of relevant results.")
+                current_url = None
+            else:
+                current_url = self._get_next_page_link(soup)
 
             if current_url:
-                await asyncio.sleep(0.5)
+                page_num += 1
 
+        total_elapsed_time = time.time() - start_time_total
+        self.perf_stats.record("fetch_paginated_data", total_elapsed_time)
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                f"Fetched {len(all_connections)} connections from {pages_fetched} page(s) in {total_elapsed_time:.2f}s")
         return all_connections
 
     def get_connections_url(self, user_id: str = "", search: str = "", show_accepted: str = "true",

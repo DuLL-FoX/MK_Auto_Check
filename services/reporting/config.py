@@ -38,13 +38,6 @@ TERMINAL_FORMATTING = {
     'WHITE_BOLD': '\033[97;1m',
 
     'BLUE_UNDERLINE': '\033[94;4m',
-    'GREEN_BOLD': '\033[92;1m',
-    'RED_BOLD': '\033[91;1m',
-    'YELLOW_BOLD': '\033[93;1m',
-    'CYAN_BOLD': '\033[96;1m',
-    'MAGENTA_BOLD': '\033[95;1m',
-    'GRAY_BOLD': '\033[90;1m',
-    'WHITE_UNDERLINE': '\033[97;4m',
 }
 
 BOX_CHARS = {
