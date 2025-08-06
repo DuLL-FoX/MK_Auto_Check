@@ -445,93 +445,173 @@ class Scanner:
         }
 
     async def _process_all_terms(self, all_terms, term_is_login_event, user_id_terms, processed_terms, message_data):
-        high_priority_terms = []
-        normal_priority_terms = []
+        user_id_terms_set = set(user_id_terms.values())
 
-        for term in all_terms:
-            if term in user_id_terms.values() or term_is_login_event.get(term, False):
-                high_priority_terms.append(term)
+        def is_likely_hwid(term):
+            if term.startswith('V2-'):
+                base64_part = term[3:]
             else:
-                normal_priority_terms.append(term)
+                base64_part = term
 
-        cache_lock = asyncio.Lock()
+            import re
+            base64_pattern = r'^[A-Za-z0-9+/]{30,}={0,2}$'
+
+            if re.match(base64_pattern, base64_part):
+                is_uuid = re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', term, re.I)
+                is_ip = re.match(r'^(\d{1,3}\.){3}\d{1,3}$', term)
+
+                has_base64_chars = ('+' in base64_part or '/' in base64_part or base64_part.endswith('='))
+
+                return not is_uuid and not is_ip and has_base64_chars
+
+            return False
+
+        hwid_terms = [t for t in all_terms if is_likely_hwid(t)]
+        ip_terms = [t for t in all_terms if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', t)]
+        uuid_terms = [t for t in all_terms if
+                      re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', t, re.I)]
+
+        hwid_set = set(hwid_terms)
+        ip_set = set(ip_terms)
+        uuid_set = set(uuid_terms)
+        nickname_terms = [t for t in all_terms if t not in hwid_set and t not in ip_set and t not in uuid_set]
+
         term_results = {}
-        message_nicknames = message_data.get('message_nicknames', {})
-        term_to_message_id = message_data.get('term_to_message_id', {})
 
-        if high_priority_terms:
-            self.logger.info(f"Processing {len(high_priority_terms)} high priority terms")
-            term_tasks = []
-            for term in high_priority_terms:
+        if uuid_terms:
+            self.logger.info(f"Processing {len(uuid_terms)} UUID terms")
+            uuid_results = await self._process_term_batch(
+                uuid_terms,
+                processed_terms,
+                term_is_login_event,
+                user_id_terms_set,
+                message_data,
+                max_concurrent=10
+            )
+            term_results.update(uuid_results)
+
+        if nickname_terms:
+            self.logger.info(f"Processing {len(nickname_terms)} nickname terms")
+            nickname_results = await self._process_term_batch(
+                nickname_terms,
+                processed_terms,
+                term_is_login_event,
+                user_id_terms_set,
+                message_data,
+                max_concurrent=5
+            )
+            term_results.update(nickname_results)
+
+        if hwid_terms:
+            self.logger.info(f"Processing {len(hwid_terms)} HWID terms")
+            hwid_results = await self._process_term_batch(
+                hwid_terms,
+                processed_terms,
+                term_is_login_event,
+                user_id_terms_set,
+                message_data,
+                max_concurrent=3
+            )
+            term_results.update(hwid_results)
+
+        if ip_terms:
+            self.logger.info(f"Processing {len(ip_terms)} IP terms")
+            ip_results = await self._process_term_batch(
+                ip_terms,
+                processed_terms,
+                term_is_login_event,
+                user_id_terms_set,
+                message_data,
+                max_concurrent=3
+            )
+            term_results.update(ip_results)
+
+        return term_results
+
+    async def _process_term_batch(self, terms, processed_terms, term_is_login_event,
+                                  user_id_terms_set, message_data, max_concurrent):
+        results = {}
+        term_to_message_id = message_data.get('term_to_message_id', {})
+        message_nicknames = message_data.get('message_nicknames', {})
+
+        terms_to_process = []
+        for term in terms:
+            if term not in processed_terms:
+                processed_terms.add(term)
+                terms_to_process.append(term)
+
+        if not terms_to_process:
+            return results
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def process_single_term(term):
+            async with semaphore:
                 message_id = term_to_message_id.get(term)
                 nickname = message_nicknames.get(message_id) if message_id else None
 
-                async with cache_lock:
-                    if term in processed_terms:
-                        continue
-                    processed_terms.add(term)
-
-                term_tasks.append(
-                    self.process_term(
+                try:
+                    result = await self.process_term(
                         term,
                         use_cache=True,
                         shared_cache=None,
                         cache_lock=None,
                         is_login_event=term_is_login_event.get(term, False),
-                        is_user_id=(term in user_id_terms.values()),
+                        is_user_id=(term in user_id_terms_set),
                         message_nickname=nickname
                     )
-                )
+                    return term, result
+                except Exception as e:
+                    self.logger.error(f"Error processing term {term}: {e}")
+                    return term, None
 
-            if term_tasks:
-                batch_size = max(5, self.max_concurrent // 2)
-                for i in range(0, len(term_tasks), batch_size):
-                    batch = term_tasks[i:i + batch_size]
-                    high_priority_results = await gather_with_concurrency(batch_size, *batch)
-                    for j, result in enumerate(high_priority_results):
-                        if result:
-                            term_index = i + j
-                            if term_index < len(high_priority_terms):
-                                term_results[high_priority_terms[term_index]] = result
+        tasks = [process_single_term(term) for term in terms_to_process]
+        batch_results = await asyncio.gather(*tasks, return_exceptions=False)
 
-        if normal_priority_terms:
-            self.logger.info(f"Processing {len(normal_priority_terms)} normal priority terms")
-            batch_size = min(20, self.max_concurrent)
-            for i in range(0, len(normal_priority_terms), batch_size):
-                batch_terms = normal_priority_terms[i:i + batch_size]
-                batch_tasks = []
+        for term, result in batch_results:
+            if result:
+                results[term] = result
 
-                for term in batch_terms:
-                    async with cache_lock:
-                        if term in processed_terms:
-                            continue
-                        processed_terms.add(term)
+        return results
 
-                    message_id = term_to_message_id.get(term)
-                    nickname = message_nicknames.get(message_id) if message_id else None
+    async def _fetch_player_connections(self, player: Player) -> None:
+        identifiers = self._get_player_identifiers(player)
+        if not identifiers:
+            return
 
-                    batch_tasks.append(
-                        self.process_term(
-                            term,
-                            use_cache=True,
-                            shared_cache=None,
-                            cache_lock=None,
-                            is_login_event=term_is_login_event.get(term, False),
-                            is_user_id=False,
-                            message_nickname=nickname
-                        )
-                    )
+        seen_results = set()
+        unique_identifiers = []
 
-                if batch_tasks:
-                    batch_results = await gather_with_concurrency(self.max_concurrent, *batch_tasks)
-                    for term, result in zip(batch_terms, batch_results):
-                        if result:
-                            term_results[term] = result
+        for identifier in identifiers[:20]:
+            cache_key = f"conn_{identifier}"
+            if cache_key not in self.connections_cache:
+                unique_identifiers.append(identifier)
 
-                if i + batch_size < len(normal_priority_terms):
-                    await asyncio.sleep(0.1)
+        if not unique_identifiers:
+            return
 
-        return term_results
+        batch_size = 3
+        all_connections = []
+
+        for i in range(0, len(unique_identifiers), batch_size):
+            batch = unique_identifiers[i:i + batch_size]
+            batch_tasks = [
+                self.admin.fetch_with_rate_limit(
+                    self.admin_panel.fetch_connections_for_user,
+                    identifier
+                ) for identifier in batch
+            ]
+
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+            for j, result in enumerate(batch_results):
+                if not isinstance(result, Exception) and result:
+                    identifier = batch[j]
+                    self.connections_cache[f"conn_{identifier}"] = result
+                    all_connections.extend(result)
+                    self._update_identity_graph(result)
+
+        self._process_player_connections(player, all_connections)
 
     async def _create_scan_results(self, messages, message_data, term_to_player):
         scan_results = []

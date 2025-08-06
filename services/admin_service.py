@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import logging
 import time
-from collections import deque, OrderedDict
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Set, Tuple, Callable
 from urllib.parse import quote_plus
@@ -152,97 +152,100 @@ class AdminService:
         return False
 
     @monitor_performance
-    async def search_player(self, term: str, single_user: bool = True, max_depth: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    async def search_player(self, term: str, single_user: bool = True, max_depth: Optional[int] = None) -> Optional[
+        Dict[str, Any]]:
         cfg = get_config()
         effective_max_depth = max_depth if max_depth is not None else getattr(cfg.scan, 'search_max_depth', 2)
-        start_time_search = time.time()
-        
-        initial_term_is_likely_hwid = len(term) > 20 and any(c.islower() for c in term) and any(c.isupper() for c in term) and ('/' in term or '+' in term or '=' in term)
-        
-        initial_search_term_str = term
-        initial_term_canonical = term.strip() if initial_term_is_likely_hwid else term.lower().strip()
 
-        if self.logger.isEnabledFor(logging.INFO):
-            self.logger.info(
-                f"Initiating player search for term: '{initial_search_term_str}' (canonical: '{initial_term_canonical}'), single_user={single_user}, max_depth={effective_max_depth}")
+        cache_key = f"search_player_v5:{term.lower().strip()}:{single_user}:{effective_max_depth}"
 
-        raw_search_cache_key = f"search_player_v4:{initial_term_canonical}:single_user={single_user}:max_depth={effective_max_depth}"
-        search_cache_key = hashlib.sha256(raw_search_cache_key.encode('utf-8')).hexdigest() if len(raw_search_cache_key) > 256 else raw_search_cache_key
-        
-        current_time = time.time()
-        if search_cache_key in self._search_cache:
-            cached_data, timestamp = self._search_cache[search_cache_key]
-            if current_time - timestamp < self._search_cache_ttl:
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(f"Returning cached search result for '{initial_term_canonical}' from _search_cache.")
-                self._search_cache.move_to_end(search_cache_key)
-                self._request_stats["cache_hits"] += 1
+        if cache_key in self._search_cache:
+            cached_data, timestamp = self._search_cache[cache_key]
+            if time.time() - timestamp < self._search_cache_ttl:
+                self._search_cache.move_to_end(cache_key)
                 return cached_data
-            else:
-                del self._search_cache[search_cache_key]
 
-        processed_terms: Set[str] = set()
-        search_queue = deque([((term.strip(), initial_term_is_likely_hwid), 0)])
-        terms_in_flight: Set[str] = {initial_term_canonical}
-        
-        merged_result_data: Optional[Dict[str, Any]] = None
-        search_stats = {"unique_api_calls": 0, "depth_distribution": {}}
+        global_seen = set()
+        results_by_identifier = {}
+
+        from heapq import heappush, heappop
+        search_queue = []
+        heappush(search_queue, (0, term, term))
+
+        merged_result = None
 
         while search_queue:
-            batch_size = min(getattr(cfg.scan, 'search_batch_size', 5), len(search_queue))
-            items_to_process_this_batch = [search_queue.popleft() for _ in range(batch_size)]
-            
-            tasks, actual_items_for_api = [], []
-            for (term_str_to_process, term_is_hwid_flag), depth in items_to_process_this_batch:
-                canonical_term_to_process = term_str_to_process if term_is_hwid_flag else term_str_to_process.lower()
-                if canonical_term_to_process in processed_terms: continue
-                
-                tasks.append(self._process_search_term(
-                    term_str_to_process, term_is_hwid_flag, depth, single_user, effective_max_depth,
-                    processed_terms, terms_in_flight
+            depth, original_term, current_term = heappop(search_queue)
+
+            if depth > effective_max_depth:
+                continue
+
+            canonical_term = current_term.lower().strip()
+            if canonical_term in global_seen:
+                continue
+            global_seen.add(canonical_term)
+
+            batch_terms = [(depth, original_term, current_term)]
+
+            while search_queue:
+                next_item = heappop(search_queue)
+                if next_item[0] <= effective_max_depth and next_item[2].lower().strip() not in global_seen:
+                    batch_terms.append(next_item)
+                elif next_item[0] <= effective_max_depth:
+                    heappush(search_queue, next_item)
+                    break
+
+            batch_tasks = []
+            for batch_depth, batch_orig, batch_term in batch_terms:
+                encoded_term = quote_plus(batch_term)
+                url = f"{self.base_admin_connections_url}&search={encoded_term}"
+                batch_tasks.append(self.fetch_with_rate_limit(
+                    self.admin_panel.check_account_on_site,
+                    url,
+                    single_user=single_user
                 ))
-                actual_items_for_api.append(((term_str_to_process, term_is_hwid_flag), depth, canonical_term_to_process))
 
-            if not tasks: continue
-            results_from_batch = await asyncio.gather(*tasks, return_exceptions=True)
+            batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
 
-            for i, res_or_exc in enumerate(results_from_batch):
-                (_original_term_tuple, original_depth, canonical_original_term) = actual_items_for_api[i]
-                original_term_str, _ = _original_term_tuple
-
-                if canonical_original_term not in processed_terms:
-                     processed_terms.add(canonical_original_term)
-                     search_stats["unique_api_calls"] += 1
-                     search_stats["depth_distribution"][original_depth] = search_stats["depth_distribution"].get(original_depth, 0) + 1
-
-                if isinstance(res_or_exc, Exception):
-                    if self.logger.isEnabledFor(logging.ERROR):
-                        self.logger.error(f"Error processing search term '{original_term_str}': {res_or_exc}", exc_info=False)
+            for i, result in enumerate(batch_results):
+                if isinstance(result, Exception):
                     continue
-                
-                individual_result: Optional[Dict[str, Any]] = res_or_exc
-                if not individual_result or not individual_result.get('result_data'): continue
 
-                if merged_result_data is None: merged_result_data = individual_result['result_data']
-                else: self._merge_search_results(merged_result_data, individual_result['result_data'])
+                batch_depth, _, batch_term = batch_terms[i]
+                if not result:
+                    continue
 
-                for new_term_str, new_term_is_hwid_flag in individual_result.get('new_terms_to_search', []):
-                    canonical_new_term = new_term_str if new_term_is_hwid_flag else new_term_str.lower()
-                    if canonical_new_term not in terms_in_flight:
-                        search_queue.append(((new_term_str, new_term_is_hwid_flag), original_depth + 1))
-                        terms_in_flight.add(canonical_new_term)
+                results_by_identifier[batch_term] = result
 
-        search_elapsed_time = time.time() - start_time_search
-        if self.logger.isEnabledFor(logging.INFO):
-            self.logger.info(
-                f"Search for '{initial_search_term_str}' (canonical '{initial_term_canonical}') completed in {search_elapsed_time:.2f}s. "
-                f"API Calls={search_stats['unique_api_calls']}, Depth Dist={search_stats['depth_distribution']}" )
+                if merged_result is None:
+                    merged_result = result
+                else:
+                    self._merge_search_results(merged_result, result)
 
-        if merged_result_data:
-            self._search_cache[search_cache_key] = (merged_result_data, current_time)
+                if batch_depth == 0 and isinstance(result, dict):
+                    new_identifiers = []
+
+                    if result.get("user_id") and result["user_id"] != "N/A":
+                        new_identifiers.append(result["user_id"])
+
+                    for hwid in result.get("associated_hwids", {}).keys():
+                        if hwid and hwid != "N/A":
+                            new_identifiers.append(hwid)
+
+                    for ip in result.get("associated_ips", {}).keys():
+                        if ip and ip != "N/A" and not ip.startswith("192.168."):
+                            new_identifiers.append(ip)
+
+                    for new_id in new_identifiers:
+                        if new_id.lower().strip() not in global_seen:
+                            heappush(search_queue, (batch_depth + 1, batch_term, new_id))
+
+        if merged_result:
+            self._search_cache[cache_key] = (merged_result, time.time())
             if len(self._search_cache) > self._search_cache_max_size:
                 self._search_cache.popitem(last=False)
-        return merged_result_data
+
+        return merged_result
 
     async def _process_search_term(
             self, current_term_str: str, current_term_is_hwid: bool, current_depth: int,
