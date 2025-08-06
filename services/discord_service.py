@@ -103,6 +103,98 @@ class DiscordService:
         self.logger.info(f"Found {len(messages)} matching messages after scanning {scanned_count} messages")
         return messages
 
+    async def scan_target_channel_interval(
+            self,
+            start_message_id: str,
+            end_message_id: str,
+            filter_func
+    ) -> List[DiscordMessage]:
+        messages = []
+
+        if not self.target_channel_id:
+            self.logger.error("Target channel ID is not set")
+            return messages
+
+        channel = self.client.get_channel(int(self.target_channel_id))
+        if not channel:
+            self.logger.error(f"Could not find channel with ID {self.target_channel_id}")
+            return messages
+
+        try:
+            start_id = int(start_message_id)
+            end_id = int(end_message_id)
+        except ValueError:
+            self.logger.error(f"Invalid message IDs: start={start_message_id}, end={end_message_id}")
+            return messages
+
+        if start_id > end_id:
+            start_id, end_id = end_id, start_id
+            self.logger.info(f"Swapped message IDs to ensure chronological order")
+
+        self.logger.info(f"Scanning messages from ID {start_id} to {end_id} in channel {channel.name}")
+
+        scanned_count = 0
+        found_start = False
+
+        try:
+            after_obj = discord.Object(id=start_id - 1)
+            before_obj = discord.Object(id=end_id + 1)
+
+            async for msg in channel.history(
+                    after=after_obj,
+                    before=before_obj,
+                    limit=None,
+                    oldest_first=True
+            ):
+                scanned_count += 1
+
+                try:
+                    if filter_func(msg):
+                        embed_links = {}
+                        embed_titles = []
+
+                        for embed in msg.embeds:
+                            from utils.embed_utils import collect_unique_links_from_embed
+                            links = collect_unique_links_from_embed(embed)
+                            embed_links.update(links)
+                            if embed.title:
+                                embed_titles.append(embed.title)
+
+                        message = DiscordMessage(
+                            id=str(msg.id),
+                            channel_id=str(msg.channel.id),
+                            author_id=str(msg.author.id),
+                            author_name=str(msg.author),
+                            content=msg.content,
+                            embed_titles=embed_titles,
+                            embed_links=embed_links,
+                            guild_id=str(msg.guild.id),
+                            created_at=msg.created_at
+                        )
+                        messages.append(message)
+
+                except Exception as e:
+                    self.logger.error(f"Error processing message {msg.id}: {e}", exc_info=True)
+                    continue
+
+                if scanned_count % 100 == 0:
+                    await asyncio.sleep(0.1)
+                    self.logger.info(f"Processed {scanned_count} messages, found {len(messages)} matches")
+
+        except discord.Forbidden:
+            self.logger.error(f"Insufficient permissions to read channel {channel.name} ({channel.id})")
+        except discord.HTTPException as e:
+            self.logger.error(f"Discord API error reading channel {channel.name} ({channel.id}): {e}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error reading channel {channel.name} ({channel.id}): {e}", exc_info=True)
+
+        self.logger.info(
+            f"Interval scan complete: scanned {scanned_count} messages, "
+            f"found {len(messages)} matching messages"
+        )
+
+        return messages
+
     async def update_complaint_cache(self, complaint_channels: Dict[int, ComplaintChannel],
                                      history_limit: int) -> Dict[int, ComplaintChannel]:
         self.logger.info("Updating complaint message cache for all complaint channels...")

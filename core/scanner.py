@@ -18,6 +18,7 @@ from services.cache_service import CacheService
 from services.discord_service import DiscordService
 from services.reporting import ReportService
 from utils.async_utils import gather_with_concurrency
+from utils.discord_utils import extract_message_id
 from utils.performance_monitor import PerformanceTracker, monitor_performance
 from utils.url_utils import extract_effective_search_term
 
@@ -127,6 +128,82 @@ class Scanner:
             return report_data
         except Exception as e:
             self.logger.error(f"Error during message scan: {str(e)}", exc_info=True)
+            return []
+        finally:
+            self.cache.save_complaint_cache(self.complaint_channels)
+
+    async def scan_message_interval(
+            self,
+            start_message: str,
+            end_message: str
+    ) -> List[Dict[str, Any]]:
+
+        start_time = datetime.now()
+
+        start_id = extract_message_id(start_message)
+        end_id = extract_message_id(end_message)
+
+        if not start_id or not end_id:
+            self.logger.error(f"Invalid message IDs: start={start_message}, end={end_message}")
+            return []
+
+        self.logger.info(f"Starting interval scan from message {start_id} to {end_id}")
+
+        processed_terms = set()
+
+        try:
+            self.complaint_channels = await self.discord.update_complaint_cache(
+                self.complaint_channels,
+                history_limit=self.cfg.discord.message_history_limit
+            )
+
+            messages = await self.discord.scan_target_channel_interval(
+                start_id,
+                end_id,
+                lambda m: any(embed.title == 'Arrived new player' for embed in m.embeds)
+            )
+
+            if not messages:
+                self.logger.info("No matching messages found in the interval")
+                return []
+
+            self.logger.info(f"Found {len(messages)} messages to process in the interval")
+
+            message_data = self._extract_message_data(messages)
+            all_terms = message_data['all_terms']
+
+            self.logger.info(f"Processing {len(all_terms)} unique terms")
+
+            term_results = await self._process_all_terms(
+                all_terms,
+                message_data['term_is_login_event'],
+                message_data['user_id_terms'],
+                processed_terms,
+                message_data
+            )
+
+            scan_results = await self._create_scan_results(
+                messages,
+                message_data,
+                term_results
+            )
+
+            consolidated_results = self._consolidate_results(scan_results)
+            report_data = self.report.generate_message_scan_report(consolidated_results)
+
+            duration = (datetime.now() - start_time).total_seconds()
+            hit_rate = (len(consolidated_results) / len(messages)) * 100 if messages else 0
+
+            self.perf.logger.info(
+                f"Interval scan completed in {duration:.2f}s: processed {len(messages)} messages, "
+                f"found {len(consolidated_results)} results ({hit_rate:.1f}% hit rate)"
+            )
+
+            self.perf.log_summary_if_needed()
+            return report_data
+
+        except Exception as e:
+            self.logger.error(f"Error during interval scan: {str(e)}", exc_info=True)
             return []
         finally:
             self.cache.save_complaint_cache(self.complaint_channels)

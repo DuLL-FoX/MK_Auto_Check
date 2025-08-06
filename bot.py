@@ -44,7 +44,16 @@ class BanCheckerBot:
         try:
             report_data: List[Dict[str, Any]] = []
 
-            if self.config.get("check_ban_bypass"):
+            message_interval_start = self.config.get("message_interval_start")
+            message_interval_end = self.config.get("message_interval_end")
+
+            if message_interval_start and message_interval_end:
+                logging.info(f"Starting interval scan from {message_interval_start} to {message_interval_end}")
+                report_data = await self.scanner.scan_message_interval(
+                    message_interval_start,
+                    message_interval_end
+                )
+            elif self.config.get("check_ban_bypass"):
                 logging.info("Starting ban bypass check")
                 report_data = await self.scanner.scan_ban_bypasses(
                     max_pages=self.config.get("ban_bypass_pages", 5)

@@ -36,6 +36,8 @@ TERMINAL_FORMATTING = {
 
     'BRIGHT_YELLOW_BOLD': '\033[93;1m',
     'WHITE_BOLD': '\033[97;1m',
+
+    'BLUE_UNDERLINE': '\033[94;4m',
 }
 
 BOX_CHARS = {

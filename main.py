@@ -6,11 +6,17 @@ from bot import BanCheckerBot
 from config_system import initialize, get_config
 from utils.logging_utils import setup_logging
 
-# ─── 1) MAIN-SPECIFIED VALUES (HIGHEST PRIORITY) ────────────────────────────────
-MESSAGE_LIMIT = 1
-USERNAME = None
+# ─── 1) MAIN-SPECIFIED VALUES (HIGHEST PRIORITY) ────────────────────────────
+MESSAGE_LIMIT = 70
+USERNAME = "aviasales"
 CHECK_BAN_BYPASS = False
 BAN_BYPASS_PAGES = 1
+
+MESSAGE_INTERVAL_START = None
+MESSAGE_INTERVAL_END = None
+# Example:
+MESSAGE_INTERVAL_START = "https://discord.com/channels/1030160796401016883/1315754807595761695/1402266517202141184"
+MESSAGE_INTERVAL_END = "https://discord.com/channels/1030160796401016883/1315754807595761695/1402287086844772383"
 
 SEARCH_DEPTH = None
 SEARCH_LIMIT_ROOT = None
@@ -65,9 +71,15 @@ def main():
     )
 
     logging.info("Starting Ban Checker Bot")
-    mode = ("Ban Bypass Check" if cfg.scan.check_ban_bypass
-            else f"Username: {cfg.scan.username}" if cfg.scan.username
-            else f"Messages: {cfg.scan.message_limit}")
+    if MESSAGE_INTERVAL_START and MESSAGE_INTERVAL_END:
+        mode = f"Interval: from {MESSAGE_INTERVAL_START} to {MESSAGE_INTERVAL_END}"
+    elif cfg.scan.check_ban_bypass:
+        mode = "Ban Bypass Check"
+    elif cfg.scan.username:
+        mode = f"Username: {cfg.scan.username}"
+    else:
+        mode = f"Messages: {cfg.scan.message_limit}"
+
     logging.info(f"Scan mode: {mode}")
 
     admin_panel = AdminPanel(cfg.auth.admin_username, cfg.auth.admin_password)
@@ -80,7 +92,9 @@ def main():
         "username": cfg.scan.username,
         "check_ban_bypass": cfg.scan.check_ban_bypass,
         "ban_bypass_pages": cfg.scan.ban_bypass_pages,
-        "html_report_filename": cfg.report.html_report_filename
+        "html_report_filename": cfg.report.html_report_filename,
+        "message_interval_start": MESSAGE_INTERVAL_START,
+        "message_interval_end": MESSAGE_INTERVAL_END
     }
 
     bot = BanCheckerBot(cfg.discord.discord_user_token, admin_panel, bot_config)
