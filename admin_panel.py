@@ -63,10 +63,10 @@ class AdminPanel:
         self.LOGIN_RETRY_LIMIT = cfg.api.login_retry_limit
         self.TIMEOUT = aiohttp.ClientTimeout(total=cfg.api.request_timeout)
         self.SLOW_REQUEST_THRESHOLD = 5.0
-        
+
         self._connector = aiohttp.TCPConnector(limit_per_host=50, limit=150, ssl=False)
         self._client_session: Optional[aiohttp.ClientSession] = None
-        
+
         self.login_attempts = 0
         self._is_authenticated = False
         self._auth_token_timestamp = 0
@@ -74,7 +74,7 @@ class AdminPanel:
         self._request_metrics = {"total": 0, "slow_requests": 0, "errors": 0}
         self._setup_loggers()
         self.perf_stats = PerformanceStats(self.perf_logger)
-        
+
         self._response_cache: OrderedDict[str, Tuple[float, str]] = OrderedDict()
         self._RESPONSE_CACHE_MAX_SIZE = 1000
         self._RESPONSE_CACHE_TTL = 1800
@@ -121,12 +121,12 @@ class AdminPanel:
             await self._client_session.close()
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug("Aiohttp client session closed.")
-        
+
         if self._connector and not self._connector.closed:
             await self._connector.close()
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug("Aiohttp TCPConnector closed.")
-        
+
         self._client_session = None
 
     async def login(self) -> bool:
@@ -156,7 +156,7 @@ class AdminPanel:
                 if self.logger.isEnabledFor(logging.WARNING):
                     self.logger.warning(f"Login attempt {self.login_attempts} failed")
                 await asyncio.sleep(1)
-            
+
             self.logger.error(f"Login failed after {self.LOGIN_RETRY_LIMIT} attempts")
             self._is_authenticated = False
             return False
@@ -168,7 +168,7 @@ class AdminPanel:
                     if self.logger.isEnabledFor(logging.DEBUG):
                         self.logger.debug("Already logged in (direct access to PLAYERS_URL)")
                     return True
-            
+
             async with session.get(self.PLAYERS_URL, allow_redirects=True) as response:
                 response_text = await response.text()
                 response.raise_for_status()
@@ -177,15 +177,16 @@ class AdminPanel:
                     if self.logger.isEnabledFor(logging.DEBUG):
                         self.logger.debug("Already logged in (redirected to PLAYERS_URL)")
                     return True
-                
+
                 if self.ACCOUNT_URL not in str(response.url):
-                    self.logger.warning(f"Unexpected redirect URL: {response.url}")
+                    self.logger.warning(
+                        f"Unexpected redirect URL during login: {response.url}. Expected to be redirected to {self.ACCOUNT_URL}.")
                     return False
 
                 soup = HTMLParser(response_text)
                 token_input = soup.css_first("input[name='__RequestVerificationToken']")
                 if not token_input or not token_input.attributes.get("value"):
-                    self.logger.error("Anti-forgery token not found")
+                    self.logger.error("Anti-forgery token not found on the login page. This is required for login.")
                     return False
                 token = token_input.attributes["value"]
 
@@ -204,14 +205,15 @@ class AdminPanel:
             async with session.post(sso_login_url, data=payload, headers=headers, allow_redirects=True) as response:
                 response_text = await response.text()
                 response.raise_for_status()
-                
+
                 if f"{self.BASE_ADMIN_URL}/signin-oidc" in response_text:
                     soup_oidc = HTMLParser(response_text)
                     form = soup_oidc.css_first("form[action*='signin-oidc']")
                     if not form: form = soup_oidc.css_first("form")
-                    
+
                     if not form:
-                        self.logger.error("signin-oidc: Redirect form not found on page.")
+                        self.logger.error(
+                            "signin-oidc: Redirect form not found on the page. This is part of the authentication flow.")
                         if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(f"Page content for missing oidc form:\n{response_text[:1000]}")
                         if "Logout" in response_text or "Players" in response_text:
                             self.logger.info("Successfully authenticated (oidc page but logout/players link found).")
@@ -220,13 +222,14 @@ class AdminPanel:
 
                     redirect_action_url = form.attributes.get("action")
                     if not redirect_action_url:
-                        self.logger.error("signin-oidc: Redirect form action URL not found.")
+                        self.logger.error(
+                            "signin-oidc: Redirect form action URL not found. Cannot complete authentication.")
                         return False
-                    
+
                     redirect_action_url = urljoin(str(response.url), redirect_action_url)
                     inputs = form.css("input")
                     form_data = {inp.attributes.get("name"): inp.attributes.get("value", "") for inp in inputs if inp.attributes.get("name")}
-                    
+
                     async with session.post(redirect_action_url, data=form_data, headers={"Referer": str(response.url)}, allow_redirects=True) as final_response:
                         final_response_text = await final_response.text()
                         final_response.raise_for_status()
@@ -234,22 +237,27 @@ class AdminPanel:
                             self.logger.info("Successfully authenticated after OIDC redirect.")
                             return True
                         else:
-                            self.logger.warning("Authentication failed after OIDC - no logout/players links in final response.")
+                            self.logger.warning(
+                                "Authentication failed after OIDC. The final page did not contain expected content (e.g., 'Logout' or 'Players' links).")
                             if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(f"Final OIDC response text (snippet): {final_response_text[:1000]}")
                             return False
                 elif "Logout" in response_text or "Players" in response_text or self.BASE_ADMIN_URL in str(response.url):
                     self.logger.info("Successfully authenticated.")
                     return True
                 else:
-                    self.logger.warning("Authentication failed - no OIDC, logout, or players links in response.")
+                    self.logger.warning(
+                        "Authentication may have failed. The response did not contain expected markers like 'Logout' or 'Players' links, nor an OIDC redirect.")
+                    if "Invalid login attempt" in response_text:
+                        self.logger.warning("Login failed due to invalid credentials.")
                     if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(f"Login response text (snippet): {response_text[:1000]}")
                     return False
-        
+
         except aiohttp.ClientError as e:
-            self.logger.error(f"Network error during login: {str(e)}")
+            self.logger.error(
+                f"A network error occurred during login: {str(e)}. This could be a connection issue or a DNS problem.")
             return False
         except Exception as e:
-            self.logger.error(f"Unexpected error during login: {str(e)}", exc_info=True)
+            self.logger.error(f"An unexpected error occurred during login: {str(e)}", exc_info=True)
             return False
 
     async def _ensure_authenticated(self) -> bool:
@@ -282,7 +290,7 @@ class AdminPanel:
                             except IndexError:
                                 if self.logger.isEnabledFor(logging.WARNING):
                                     self.logger.warning(f"Could not parse connection_id from ban_hits_link: {ban_hits_link}")
-            
+
             user_name_el = cols[0].css_first("strong")
             user_name = user_name_el.text(strip=True) if user_name_el else cols[0].text(strip=True)
             user_id = cols[1].text(strip=True)
@@ -311,7 +319,7 @@ class AdminPanel:
         if not table:
             if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug("No table.table found in the HTML")
             return connections
-        
+
         tbody = table.css_first("tbody")
         if not tbody:
             if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug("No tbody found in the table")
@@ -324,7 +332,7 @@ class AdminPanel:
             self.logger.info(
                 f"Found 0 <tr> rows in <tbody> on what appears to be a search results page. "
             )
-        
+
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(f"Found {len(rows)} rows in the connections table to process.")
         for row_idx, row_node in enumerate(rows):
@@ -370,7 +378,7 @@ class AdminPanel:
             self._response_cache[url] = (html, time.time())
             if len(self._response_cache) > self._RESPONSE_CACHE_MAX_SIZE:
                 self._response_cache.popitem(last=False)
-    
+
     async def _get_cached_response_corrected(self, url: str) -> Optional[str]:
         async with self._async_lock:
             cache_entry = self._response_cache.get(url)
@@ -382,7 +390,7 @@ class AdminPanel:
                 else:
                     del self._response_cache[url]
             return None
-    
+
     _get_cached_response = _get_cached_response_corrected
 
     async def _make_request(self, url: str) -> Optional[str]:
@@ -610,7 +618,7 @@ class AdminPanel:
                     info_result["ban_counts"] = len(ban_info_list)
             elif self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(f"No bans table found for player {user_id} on their info page.")
-        
+
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
                 if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(f"Player profile not found (404) for user_id: {user_id} at {info_url}")
@@ -679,7 +687,7 @@ class AdminPanel:
                         "user_name": nickname, "time": time_val, "ip_address": ip,
                         "hwid": hwid_val, "server": srv, "status": status_txt })
                 elif "Banned" in status_txt: banned_status_found = True
-        
+
         if denied_banned_status_found:
             result["status"], result["ban_counts"] = "banned", max(result["ban_counts"], 1)
             if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug("Status set to 'banned' due to 'Denied: Banned' connections.")
@@ -699,12 +707,12 @@ class AdminPanel:
                 if isinstance(ban_entry, dict) and "reason" in ban_entry and "username" in ban_entry:
                     result["ban_reasons"].add((ban_entry["reason"], ban_entry["username"]))
                 elif self.logger.isEnabledFor(logging.WARNING): self.logger.warning(f"Malformed ban entry from fetch_player_info: {ban_entry}")
-        
+
         result["associated_ips"] = {ip_k: sorted(list(nicks_v)) for ip_k, nicks_v in all_ips.items()}
         result["associated_hwids"] = {hwid_k: sorted(list(nicks_v)) for hwid_k, nicks_v in all_hwids.items()}
         for hwid_k, nicks_s in all_hwids.items():
             if len(nicks_s) > 1 and hwid_k != N_A: result["shared_hwid_nicknames"].update(nicks_s)
-        
+
         if result["ban_counts"] > 0 and result["status"] != "banned": result["status"] = "banned"
         if result["ban_counts"] >= 5 and result["status"] == "banned" : result["status"] = "suspicious"
 
@@ -746,7 +754,7 @@ class AdminPanel:
 
         ban_info: Dict[str, str] = {}
         if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(f"Fetching ban info from URL: {ban_hits_link}")
-        
+
         start_time = time.time()
         session = await self._get_session()
         from_cache = False
@@ -789,7 +797,7 @@ class AdminPanel:
                     if len(cols) >= 6:
                         ban_info["ban_time"], ban_info["expires"] = cols[2].text(strip=True), cols[4].text(strip=True)
                         break
-            
+
             if not ban_info and self.logger.isEnabledFor(logging.WARNING):
                  self.logger.warning(f"Could not parse detailed ban info from {ban_hits_link}.")
 
