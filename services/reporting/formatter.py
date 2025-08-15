@@ -1,7 +1,7 @@
 import sys
-from datetime import datetime
-from typing import Dict, Any, List, Optional, Callable, Tuple
 import textwrap
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
 
 from services.reporting.config import (
     ReportConfig, TERMINAL_FORMATTING, BOX_CHARS,
@@ -19,10 +19,6 @@ class ReportFormatter:
         self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def _get_fmt(self, main_key: str, *modifier_keys: str, default: str = '') -> str:
-        """
-        Safely gets a format code, preferring combined keys if available
-        (e.g., RED_BOLD over RED + BOLD).
-        """
         main_key_upper = main_key.upper()
         mod_keys_upper = [mk.upper() for mk in modifier_keys]
 

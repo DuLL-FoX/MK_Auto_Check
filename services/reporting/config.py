@@ -38,6 +38,15 @@ TERMINAL_FORMATTING = {
     'WHITE_BOLD': '\033[97;1m',
 
     'BLUE_UNDERLINE': '\033[94;4m',
+
+    'RED_UNDERLINE': '\033[91;4m',
+    'GREEN_UNDERLINE': '\033[92;4m',
+    'YELLOW_UNDERLINE': '\033[93;4m',
+    'CYAN_UNDERLINE': '\033[96;4m',
+
+    'GREEN_BOLD': '\033[92;1m',
+    'YELLOW_BOLD': '\033[93;1m',
+    'RED_BOLD': '\033[91;1m',
 }
 
 BOX_CHARS = {
@@ -236,10 +245,7 @@ class ReportConfig:
         os.makedirs(self.report_output_dir, exist_ok=True)
 
     def get_dynamic_limit(self, category: Optional[str] = None) -> int:
-        """
-        Determines a display limit based on detail_level.
-        If category is provided, it tries to use a specific limit from DISPLAY_LIMITS.
-        """
+
         if category and category.upper() in DISPLAY_LIMITS:
             base_limit = DISPLAY_LIMITS[category.upper()]
             if self.detail_level == 0:
@@ -257,7 +263,6 @@ class ReportConfig:
             return self.display_limit_large_items
 
     def get_specific_display_limit(self, name: str) -> int:
-        """Gets a specific named limit from DISPLAY_LIMITS, adjusted by detail level."""
         upper_name = name.upper()
         if upper_name not in DISPLAY_LIMITS:
             return self.get_dynamic_limit('MEDIUM') 

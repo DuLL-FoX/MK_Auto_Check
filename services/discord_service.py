@@ -371,7 +371,7 @@ class DiscordService:
         processed_message_ids = set()
         total_messages = sum(len(channel_data.messages) for channel_data in complaint_channels.values())
         self.logger.info(
-            f"Optimized search for {len(valid_nicknames)} nicknames across {total_messages} messages in {len(complaint_channels)} channels")
+            f"Search for {len(valid_nicknames)} nicknames across {total_messages} messages in {len(complaint_channels)} channels")
 
         async def process_channel(ch_id, ch_data):
             nonlocal processed_message_ids
