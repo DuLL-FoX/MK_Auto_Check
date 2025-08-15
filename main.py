@@ -8,7 +8,7 @@ from utils.logging_utils import setup_logging
 
 # ─── 1) MAIN-SPECIFIED VALUES (HIGHEST PRIORITY) ────────────────────────────
 MESSAGE_LIMIT = 700
-USERNAME = "DuLL_FoX"
+USERNAME = None
 CHECK_BAN_BYPASS = False
 BAN_BYPASS_PAGES = 1
 
@@ -25,7 +25,7 @@ SEARCH_LIMIT_LEVEL2 = None
 SEARCH_LIMIT_DEFAULT = None
 
 LOG_LEVEL = None
-CONFIG_FILE = "config_DuLL_FoX.py"
+CONFIG_FILE = "config.py"
 # ────────────────────────────────────────────────────────────────────────────────
 
 def main():
