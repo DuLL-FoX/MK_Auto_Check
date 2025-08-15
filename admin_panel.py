@@ -64,7 +64,7 @@ class AdminPanel:
         self.TIMEOUT = aiohttp.ClientTimeout(total=cfg.api.request_timeout)
         self.SLOW_REQUEST_THRESHOLD = 5.0
 
-        self._connector = aiohttp.TCPConnector(limit_per_host=50, limit=150, ssl=False)
+        self._connector = aiohttp.TCPConnector(limit_per_host=10, limit=50, ssl=False)
         self._client_session: Optional[aiohttp.ClientSession] = None
 
         self.login_attempts = 0
@@ -75,7 +75,7 @@ class AdminPanel:
         self._setup_loggers()
         self.perf_stats = PerformanceStats(self.perf_logger)
 
-        self._response_cache: OrderedDict[str, Tuple[float, str]] = OrderedDict()
+        self._response_cache: OrderedDict[str, Tuple[str, float]] = OrderedDict()
         self._RESPONSE_CACHE_MAX_SIZE = 1000
         self._RESPONSE_CACHE_TTL = 1800
 
@@ -397,9 +397,10 @@ class AdminPanel:
         async with self._async_lock:
             cache_entry = self._response_cache.get(url)
             if cache_entry:
-                timestamp, html = cache_entry
+                html, timestamp = cache_entry
                 if time.time() - timestamp < self._RESPONSE_CACHE_TTL:
                     self._response_cache.move_to_end(url)
+                    self._request_metrics["cache_hits"] = self._request_metrics.get("cache_hits", 0) + 1
                     return html
                 else:
                     del self._response_cache[url]
@@ -408,22 +409,9 @@ class AdminPanel:
     async def _cache_response(self, url: str, html: str) -> None:
         async with self._async_lock:
             self._response_cache[url] = (html, time.time())
+            self._request_metrics["cache_misses"] = self._request_metrics.get("cache_misses", 0) + 1
             if len(self._response_cache) > self._RESPONSE_CACHE_MAX_SIZE:
                 self._response_cache.popitem(last=False)
-
-    async def _get_cached_response_corrected(self, url: str) -> Optional[str]:
-        async with self._async_lock:
-            cache_entry = self._response_cache.get(url)
-            if cache_entry:
-                html, timestamp = cache_entry
-                if time.time() - timestamp < self._RESPONSE_CACHE_TTL:
-                    self._response_cache.move_to_end(url)
-                    return html
-                else:
-                    del self._response_cache[url]
-            return None
-
-    _get_cached_response = _get_cached_response_corrected
 
     async def _make_request(self, url: str) -> Optional[str]:
         if not await self._ensure_authenticated():

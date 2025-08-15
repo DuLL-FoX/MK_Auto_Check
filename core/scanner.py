@@ -43,6 +43,73 @@ def cached(ttl=300):
     return decorator
 
 
+class CircuitBreaker:
+
+    def __init__(self, failure_threshold=10, recovery_timeout=60, half_open_max_calls=5):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.half_open_max_calls = half_open_max_calls
+
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = 'CLOSED'
+        self.half_open_calls = 0
+
+    def call_succeeded(self):
+        self.failure_count = 0
+        if self.state == 'HALF_OPEN':
+            self.state = 'CLOSED'
+        self.half_open_calls = 0
+
+    def call_failed(self):
+        self.failure_count += 1
+        self.last_failure_time = time.time()
+
+        if self.failure_count >= self.failure_threshold:
+            self.state = 'OPEN'
+
+    def can_execute(self):
+        if self.state == 'CLOSED':
+            return True
+
+        if self.state == 'OPEN':
+            if time.time() - self.last_failure_time > self.recovery_timeout:
+                self.state = 'HALF_OPEN'
+                self.half_open_calls = 0
+                return True
+            return False
+
+        if self.state == 'HALF_OPEN':
+            if self.half_open_calls < self.half_open_max_calls:
+                self.half_open_calls += 1
+                return True
+            return False
+
+        return False
+
+
+class ExponentialBackoff:
+
+    def __init__(self, initial_delay=1.0, max_delay=60.0, multiplier=2.0, jitter=True):
+        self.initial_delay = initial_delay
+        self.max_delay = max_delay
+        self.multiplier = multiplier
+        self.jitter = jitter
+        self.current_delay = initial_delay
+
+    def get_delay(self):
+        delay = min(self.current_delay, self.max_delay)
+        if self.jitter:
+            import random
+            delay = delay * (0.5 + random.random() * 0.5)
+
+        self.current_delay *= self.multiplier
+        return delay
+
+    def reset(self):
+        self.current_delay = self.initial_delay
+
+
 class Scanner:
     def __init__(self, discord_service: DiscordService, admin_service: AdminService,
                  cache_service: CacheService, report_service: ReportService,
@@ -72,6 +139,45 @@ class Scanner:
         }
         self.connections_cache = {}
 
+        self._operation_timeout = self.cfg.api.operation_timeout
+        self._term_timeout = self.cfg.api.term_timeout
+        self._batch_timeout = self.cfg.api.batch_timeout
+
+        self.circuit_breaker = CircuitBreaker(
+            failure_threshold=self.cfg.api.circuit_breaker.failure_threshold,
+            recovery_timeout=self.cfg.api.circuit_breaker.recovery_timeout,
+            half_open_max_calls=self.cfg.api.circuit_breaker.half_open_max_calls
+        )
+
+        self.backoff = ExponentialBackoff(
+            initial_delay=self.cfg.api.backoff.initial_delay,
+            max_delay=self.cfg.api.backoff.max_delay,
+            multiplier=self.cfg.api.backoff.multiplier,
+            jitter=self.cfg.api.backoff.jitter
+        )
+
+        self._conservative_batch_size = self.cfg.scan.batch_processing.conservative_batch_size
+        self._aggressive_batch_size = self.cfg.scan.batch_processing.aggressive_batch_size
+        self._batch_delay_base = self.cfg.scan.batch_processing.batch_delay_base
+        self._max_terms_per_scan = self.cfg.scan.max_terms_per_scan
+
+        self.error_stats = {
+            'timeouts': 0,
+            'circuit_breaker_trips': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'retries': 0
+        }
+
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(
+                f"Scanner initialized with settings: "
+                f"max_concurrent={self.max_concurrent}, "
+                f"batch_sizes={self._conservative_batch_size}-{self._aggressive_batch_size}, "
+                f"batch_delay={self._batch_delay_base}s, "
+                f"max_terms={self._max_terms_per_scan}"
+            )
+
     async def setup(self, target_channel_id: int, complaint_channel_ids: List[int]) -> bool:
         self.logger.info("Setting up scanner...")
         if not await self.discord.setup_channels(target_channel_id, complaint_channel_ids):
@@ -83,61 +189,337 @@ class Scanner:
         self.logger.info("Scanner setup complete")
         return True
 
+    def _should_limit_processing(self, total_terms: int) -> tuple[bool, int]:
+        if total_terms <= self._max_terms_per_scan:
+            return False, total_terms
+
+        self.logger.warning(
+            f"Found {total_terms} terms, which exceeds limit of {self._max_terms_per_scan}. "
+            f"Will process first {self._max_terms_per_scan} terms."
+        )
+        return True, self._max_terms_per_scan
+
+    def _get_adaptive_batch_size(self) -> int:
+        if self.circuit_breaker.state == 'OPEN':
+            return 1
+        elif self.circuit_breaker.state == 'HALF_OPEN':
+            return max(2, self._conservative_batch_size // 2)
+        elif self.circuit_breaker.failure_count > 5:
+            return self._conservative_batch_size
+        else:
+            total_requests = self.error_stats['successful_requests'] + self.error_stats['failed_requests']
+            if total_requests > 10:
+                success_rate = self.error_stats['successful_requests'] / total_requests
+                if success_rate > 0.9:
+                    return self._aggressive_batch_size
+                elif success_rate > 0.7:
+                    return (self._conservative_batch_size + self._aggressive_batch_size) // 2
+
+            return self._conservative_batch_size
+
+    def _get_adaptive_delay(self) -> float:
+        base_delay = self._batch_delay_base
+
+        if self.circuit_breaker.state == 'OPEN':
+            return base_delay * 10
+        elif self.circuit_breaker.state == 'HALF_OPEN':
+            return base_delay * 3
+        elif self.circuit_breaker.failure_count > 0:
+            return base_delay * (1 + self.circuit_breaker.failure_count * 0.5)
+
+        return base_delay
+
     @monitor_performance()
     async def scan_messages(self, message_limit: int) -> List[Dict[str, Any]]:
         start_time = datetime.now()
         self.logger.info(f"Starting message scan with limit {message_limit}")
         processed_terms = set()
+
         try:
+            self.error_stats = {k: 0 for k in self.error_stats}
+
             self.complaint_channels = await self.discord.update_complaint_cache(
                 self.complaint_channels,
                 history_limit=self.cfg.discord.message_history_limit
             )
+
             messages = await self.discord.scan_target_channel(
                 message_limit,
                 lambda m: any(embed.title == 'Arrived new player' for embed in m.embeds)
             )
+
             if not messages:
                 self.logger.info("No matching messages found")
                 return []
+
             self.logger.info(f"Found {len(messages)} messages to process")
             message_data = self._extract_message_data(messages)
             all_terms = message_data['all_terms']
+
+            should_limit, terms_to_process = self._should_limit_processing(len(all_terms))
+            if should_limit:
+                all_terms = list(all_terms)[:terms_to_process]
+
             self.logger.info(f"Processing {len(all_terms)} unique terms")
-            term_results = await self._process_all_terms(
+
+            term_results = await self._process_all_terms_enhanced(
                 all_terms,
                 message_data['term_is_login_event'],
                 message_data['user_id_terms'],
                 processed_terms,
                 message_data
             )
+
             scan_results = await self._create_scan_results(
                 messages,
                 message_data,
                 term_results
             )
+
             consolidated_results = self._consolidate_results(scan_results)
             report_data = self.report.generate_message_scan_report(consolidated_results)
+
             duration = (datetime.now() - start_time).total_seconds()
             hit_rate = (len(consolidated_results) / len(messages)) * 100 if messages else 0
-            self.perf.logger.info(
+
+            self.logger.info(
                 f"Message scan completed in {duration:.2f}s: processed {len(messages)} messages, "
                 f"found {len(consolidated_results)} results ({hit_rate:.1f}% hit rate)"
             )
+
+            self._log_error_statistics()
+
             self.perf.log_summary_if_needed()
             return report_data
+
         except Exception as e:
             self.logger.error(f"Error during message scan: {str(e)}", exc_info=True)
             return []
         finally:
             self.cache.save_complaint_cache(self.complaint_channels)
 
-    async def scan_message_interval(
-            self,
-            start_message: str,
-            end_message: str
-    ) -> List[Dict[str, Any]]:
+    async def _process_all_terms_enhanced(self, all_terms, term_is_login_event, user_id_terms,
+                                          processed_terms, message_data):
+        if not all_terms:
+            return {}
 
+        high_priority_terms = []
+        normal_priority_terms = []
+
+        for term in all_terms:
+            if term in user_id_terms.values() or term_is_login_event.get(term, False):
+                high_priority_terms.append(term)
+            else:
+                normal_priority_terms.append(term)
+
+        all_priority_terms = high_priority_terms + normal_priority_terms
+
+        if not all_priority_terms:
+            return {}
+
+        self.logger.info(f"Processing {len(all_priority_terms)} terms with enhanced batching")
+
+        term_results = {}
+        message_nicknames = message_data.get('message_nicknames', {})
+        term_to_message_id = message_data.get('term_to_message_id', {})
+        cache_lock = asyncio.Lock()
+
+        batch_number = 0
+        successful_batches = 0
+        failed_batches = 0
+
+        i = 0
+        while i < len(all_priority_terms):
+            batch_number += 1
+
+            if not self.circuit_breaker.can_execute():
+                self.logger.warning(
+                    f"Circuit breaker is OPEN. Waiting {self.circuit_breaker.recovery_timeout}s before retry..."
+                )
+                self.error_stats['circuit_breaker_trips'] += 1
+                await asyncio.sleep(self.circuit_breaker.recovery_timeout)
+                continue
+
+            batch_size = self._get_adaptive_batch_size()
+            batch_delay = self._get_adaptive_delay()
+
+            batch_terms = all_priority_terms[i:i + batch_size]
+
+            self.logger.info(
+                f"Processing batch {batch_number} with {len(batch_terms)} terms "
+                f"(batch_size={batch_size}, delay={batch_delay:.1f}s, "
+                f"circuit_state={self.circuit_breaker.state})"
+            )
+
+            try:
+                batch_results = await self._process_batch_with_retry(
+                    batch_terms, cache_lock, processed_terms, term_is_login_event,
+                    user_id_terms, message_nicknames, term_to_message_id
+                )
+
+                for term, result in zip(batch_terms, batch_results):
+                    if result:
+                        term_results[term] = result
+
+                successful_batches += 1
+                self.circuit_breaker.call_succeeded()
+                self.backoff.reset()
+
+                i += batch_size
+
+                progress_pct = (i / len(all_priority_terms)) * 100
+                self.logger.info(
+                    f"Completed batch {batch_number}. Progress: {i}/{len(all_priority_terms)} "
+                    f"({progress_pct:.1f}%). Success rate: "
+                    f"{successful_batches}/{successful_batches + failed_batches}"
+                )
+
+                if i < len(all_priority_terms):
+                    await asyncio.sleep(batch_delay)
+
+            except Exception as e:
+                failed_batches += 1
+                self.circuit_breaker.call_failed()
+                self.error_stats['failed_requests'] += len(batch_terms)
+
+                self.logger.error(f"Batch {batch_number} failed: {e}")
+
+                backoff_delay = self.backoff.get_delay()
+                self.logger.info(f"Applying backoff delay: {backoff_delay:.1f}s")
+                await asyncio.sleep(backoff_delay)
+
+                i += batch_size
+
+        self.logger.info(
+            f"Term processing completed. Processed {len(term_results)} successful terms. "
+            f"Successful batches: {successful_batches}, Failed batches: {failed_batches}"
+        )
+
+        return term_results
+
+    async def _process_batch_with_retry(self, batch_terms, cache_lock, processed_terms,
+                                        term_is_login_event, user_id_terms, message_nicknames,
+                                        term_to_message_id, max_retries=2):
+
+        for attempt in range(max_retries + 1):
+            try:
+                async with asyncio.timeout(self._batch_timeout):
+                    term_tasks = []
+
+                    for term in batch_terms:
+                        async with cache_lock:
+                            if term in processed_terms:
+                                continue
+                            processed_terms.add(term)
+
+                        message_id = term_to_message_id.get(term)
+                        nickname = message_nicknames.get(message_id) if message_id else None
+
+                        term_tasks.append(
+                            self._process_term_with_enhanced_timeout(
+                                term,
+                                use_cache=True,
+                                shared_cache=None,
+                                cache_lock=None,
+                                is_login_event=term_is_login_event.get(term, False),
+                                is_user_id=(term in user_id_terms.values()),
+                                message_nickname=nickname
+                            )
+                        )
+
+                    if term_tasks:
+                        batch_results = await asyncio.gather(*term_tasks, return_exceptions=True)
+
+                        processed_results = []
+                        for i, result in enumerate(batch_results):
+                            if isinstance(result, Exception):
+                                self.logger.warning(f"Term '{batch_terms[i][:50]}' failed: {result}")
+                                self.error_stats['failed_requests'] += 1
+                                processed_results.append(None)
+                            else:
+                                if result:
+                                    self.error_stats['successful_requests'] += 1
+                                processed_results.append(result)
+
+                        return processed_results
+
+                    return []
+
+            except asyncio.TimeoutError:
+                self.error_stats['timeouts'] += 1
+                if attempt < max_retries:
+                    self.error_stats['retries'] += 1
+                    retry_delay = (attempt + 1) * 5
+                    self.logger.warning(
+                        f"Batch timeout on attempt {attempt + 1}/{max_retries + 1}. "
+                        f"Retrying in {retry_delay}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    self.logger.error(f"Batch timed out after {max_retries + 1} attempts")
+                    raise
+
+            except Exception as e:
+                if attempt < max_retries:
+                    self.error_stats['retries'] += 1
+                    retry_delay = (attempt + 1) * 3
+                    self.logger.warning(
+                        f"Batch error on attempt {attempt + 1}/{max_retries + 1}: {e}. "
+                        f"Retrying in {retry_delay}s..."
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    self.logger.error(f"Batch failed after {max_retries + 1} attempts: {e}")
+                    raise
+
+    async def _process_term_with_enhanced_timeout(self, term: str, **kwargs) -> Optional[Player]:
+        start_time = time.time()
+
+        try:
+            async with asyncio.timeout(self._term_timeout):
+                result = await self.process_term(term, **kwargs)
+
+                elapsed = time.time() - start_time
+                if elapsed > self._term_timeout * 0.8:
+                    self.logger.warning(
+                        f"Term '{term[:50]}' took {elapsed:.1f}s (close to timeout of {self._term_timeout}s)"
+                    )
+
+                return result
+
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time
+            self.error_stats['timeouts'] += 1
+            self.logger.error(
+                f"Term processing timed out for '{term[:50]}' after {elapsed:.1f}s "
+                f"(timeout: {self._term_timeout}s)"
+            )
+            return None
+
+        except Exception as e:
+            elapsed = time.time() - start_time
+            self.logger.error(
+                f"Error in _process_term_with_enhanced_timeout for '{term[:50]}' "
+                f"after {elapsed:.1f}s: {e}"
+            )
+            return None
+
+    def _log_error_statistics(self):
+        total_requests = self.error_stats['successful_requests'] + self.error_stats['failed_requests']
+        if total_requests > 0:
+            success_rate = (self.error_stats['successful_requests'] / total_requests) * 100
+
+            self.logger.info("=== Scan Error Statistics ===")
+            self.logger.info(f"Total requests: {total_requests}")
+            self.logger.info(f"Successful: {self.error_stats['successful_requests']} ({success_rate:.1f}%)")
+            self.logger.info(f"Failed: {self.error_stats['failed_requests']}")
+            self.logger.info(f"Timeouts: {self.error_stats['timeouts']}")
+            self.logger.info(f"Circuit breaker trips: {self.error_stats['circuit_breaker_trips']}")
+            self.logger.info(f"Retries: {self.error_stats['retries']}")
+            self.logger.info(f"Final circuit breaker state: {self.circuit_breaker.state}")
+            self.logger.info("=============================")
+
+    async def scan_message_interval(self, start_message: str, end_message: str) -> List[Dict[str, Any]]:
         start_time = datetime.now()
 
         start_id = extract_message_id(start_message)
@@ -152,6 +534,8 @@ class Scanner:
         processed_terms = set()
 
         try:
+            self.error_stats = {k: 0 for k in self.error_stats}
+
             self.complaint_channels = await self.discord.update_complaint_cache(
                 self.complaint_channels,
                 history_limit=self.cfg.discord.message_history_limit
@@ -172,9 +556,13 @@ class Scanner:
             message_data = self._extract_message_data(messages)
             all_terms = message_data['all_terms']
 
+            should_limit, terms_to_process = self._should_limit_processing(len(all_terms))
+            if should_limit:
+                all_terms = list(all_terms)[:terms_to_process]
+
             self.logger.info(f"Processing {len(all_terms)} unique terms")
 
-            term_results = await self._process_all_terms(
+            term_results = await self._process_all_terms_enhanced(
                 all_terms,
                 message_data['term_is_login_event'],
                 message_data['user_id_terms'],
@@ -199,6 +587,7 @@ class Scanner:
                 f"found {len(consolidated_results)} results ({hit_rate:.1f}% hit rate)"
             )
 
+            self._log_error_statistics()
             self.perf.log_summary_if_needed()
             return report_data
 
@@ -368,7 +757,6 @@ class Scanner:
                 elif isinstance(ban_info, str):
                     existing_ban_reasons.add((ban_info, "Unknown"))
 
-            # Add new ban reasons
             for ban_info in source_player.ban_reasons:
                 if isinstance(ban_info, dict) and "reason" in ban_info and "username" in ban_info:
                     key = (ban_info["reason"], ban_info["username"])
@@ -454,25 +842,35 @@ class Scanner:
             else:
                 normal_priority_terms.append(term)
 
-        cache_lock = asyncio.Lock()
+        all_priority_terms = high_priority_terms + normal_priority_terms
+
+        if not all_priority_terms:
+            return {}
+
+        self.logger.info(f"Processing {len(all_priority_terms)} terms in batches.")
+
         term_results = {}
         message_nicknames = message_data.get('message_nicknames', {})
         term_to_message_id = message_data.get('term_to_message_id', {})
+        cache_lock = asyncio.Lock()
 
-        if high_priority_terms:
-            self.logger.info(f"Processing {len(high_priority_terms)} high priority terms")
+        batch_size = self.max_concurrent * 2
+
+        for i in range(0, len(all_priority_terms), batch_size):
+            batch_terms = all_priority_terms[i:i + batch_size]
             term_tasks = []
-            for term in high_priority_terms:
-                message_id = term_to_message_id.get(term)
-                nickname = message_nicknames.get(message_id) if message_id else None
 
+            for term in batch_terms:
                 async with cache_lock:
                     if term in processed_terms:
                         continue
                     processed_terms.add(term)
 
+                message_id = term_to_message_id.get(term)
+                nickname = message_nicknames.get(message_id) if message_id else None
+
                 term_tasks.append(
-                    self.process_term(
+                    self._process_term_with_timeout(
                         term,
                         use_cache=True,
                         shared_cache=None,
@@ -484,54 +882,36 @@ class Scanner:
                 )
 
             if term_tasks:
-                batch_size = max(5, self.max_concurrent // 2)
-                for i in range(0, len(term_tasks), batch_size):
-                    batch = term_tasks[i:i + batch_size]
-                    high_priority_results = await gather_with_concurrency(batch_size, *batch)
-                    for j, result in enumerate(high_priority_results):
-                        if result:
-                            term_index = i + j
-                            if term_index < len(high_priority_terms):
-                                term_results[high_priority_terms[term_index]] = result
-
-        if normal_priority_terms:
-            self.logger.info(f"Processing {len(normal_priority_terms)} normal priority terms")
-            batch_size = min(20, self.max_concurrent)
-            for i in range(0, len(normal_priority_terms), batch_size):
-                batch_terms = normal_priority_terms[i:i + batch_size]
-                batch_tasks = []
-
-                for term in batch_terms:
-                    async with cache_lock:
-                        if term in processed_terms:
-                            continue
-                        processed_terms.add(term)
-
-                    message_id = term_to_message_id.get(term)
-                    nickname = message_nicknames.get(message_id) if message_id else None
-
-                    batch_tasks.append(
-                        self.process_term(
-                            term,
-                            use_cache=True,
-                            shared_cache=None,
-                            cache_lock=None,
-                            is_login_event=term_is_login_event.get(term, False),
-                            is_user_id=False,
-                            message_nickname=nickname
-                        )
-                    )
-
-                if batch_tasks:
-                    batch_results = await gather_with_concurrency(self.max_concurrent, *batch_tasks)
+                try:
+                    batch_results = await asyncio.gather(*term_tasks)
                     for term, result in zip(batch_terms, batch_results):
                         if result:
                             term_results[term] = result
+                except Exception as e:
+                    self.logger.error(f"Error processing a batch of terms: {e}", exc_info=True)
 
-                if i + batch_size < len(normal_priority_terms):
-                    await asyncio.sleep(0.1)
+            processed_count = i + len(batch_terms)
+            total_count = len(all_priority_terms)
+            self.logger.info(
+                f"Completed batch {i // batch_size + 1}/{(total_count + batch_size - 1) // batch_size}. "
+                f"Processed {processed_count}/{total_count} terms."
+            )
+
+            if processed_count < total_count:
+                await asyncio.sleep(0.5)
 
         return term_results
+
+    async def _process_term_with_timeout(self, term: str, **kwargs) -> Optional[Player]:
+        try:
+            async with asyncio.timeout(self._term_timeout):
+                return await self.process_term(term, **kwargs)
+        except asyncio.TimeoutError:
+            self.logger.error(f"Term processing timed out for '{term[:50]}' after {self._term_timeout}s")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error in _process_term_with_timeout for '{term[:50]}': {e}")
+            return None
 
     async def _create_scan_results(self, messages, message_data, term_to_player):
         scan_results = []
@@ -597,6 +977,7 @@ class Scanner:
                     if term in shared_cache:
                         return None
                     shared_cache.add(term)
+
             if term in self.cache_data["players"]:
                 player = self.cache_data["players"][term]
                 if message_nickname and message_nickname in player.nicknames:
@@ -610,14 +991,17 @@ class Scanner:
                 elif is_login_event:
                     self._update_player_login_info(player, is_user_id)
                 return player
+
             self.logger.info(f"Searching for player with term: '{term}'")
             account_info = await self.admin.search_player(term)
             if not account_info:
                 self.logger.info(f"No account found for term: '{term}'")
                 return None
+
             player = self.admin.convert_to_player(account_info)
             player.is_from_user_id = is_user_id
             player.search_term = term
+
             if message_nickname and message_nickname in player.nicknames:
                 player.nicknames.remove(message_nickname)
                 player.nicknames.insert(0, message_nickname)
@@ -628,9 +1012,12 @@ class Scanner:
                 player.primary_nickname = message_nickname
             elif is_login_event:
                 self._update_player_login_info(player, is_user_id)
+
             await self._fetch_player_connections(player)
+
             if not getattr(player, 'is_primary', False):
                 self._identify_primary_nickname_from_search_term(player)
+
             self.cache_data["players"][term] = player
             processing_duration = (datetime.now() - term_start).total_seconds()
             self.perf.record("process_term", processing_duration)
@@ -685,29 +1072,54 @@ class Scanner:
         identifiers = self._get_player_identifiers(player)
         if not identifiers:
             return
+
         max_identifiers = min(10, len(identifiers))
         selected_identifiers = identifiers[:max_identifiers]
-        connection_tasks = []
-        for identifier in selected_identifiers:
-            if identifier in self.cache_data["connections"]:
-                continue
-            connection_tasks.append(
-                self.admin.fetch_with_rate_limit(
+
+        identifiers_to_fetch = [
+            identifier for identifier in selected_identifiers if identifier not in self.cache_data["connections"]
+        ]
+
+        if not identifiers_to_fetch:
+            return
+
+        connection_tasks = [
+            asyncio.create_task(self._fetch_connections_with_timeout(identifier))
+            for identifier in identifiers_to_fetch
+        ]
+
+        if connection_tasks:
+            try:
+                connection_results = await gather_with_concurrency(
+                    self.max_concurrent,
+                    *connection_tasks
+                )
+
+                all_connections = []
+
+                for identifier, result in zip(identifiers_to_fetch, connection_results):
+                    if result is not None:
+                        self.cache_data["connections"][identifier] = result
+                        all_connections.extend(result)
+                        self._update_identity_graph(result)
+
+                self._process_player_connections(player, all_connections)
+            except Exception as e:
+                self.logger.error(f"Error fetching player connections for player '{player.user_id}': {e}",
+                                  exc_info=True)
+
+    async def _fetch_connections_with_timeout(self, identifier: str) -> List[Dict[str, Any]]:
+        try:
+            async with asyncio.timeout(self._operation_timeout):
+                return await self.admin.fetch_with_rate_limit(
                     self.admin_panel.fetch_connections_for_user, identifier
                 )
-            )
-        if connection_tasks:
-            connection_results = await gather_with_concurrency(
-                self.max_concurrent,
-                *connection_tasks
-            )
-            all_connections = []
-            for i, result in enumerate(connection_results):
-                identifier = selected_identifiers[i]
-                self.cache_data["connections"][identifier] = result
-                all_connections.extend(result)
-                self._update_identity_graph(result)
-            self._process_player_connections(player, all_connections)
+        except asyncio.TimeoutError:
+            self.logger.error(f"Connection fetch timed out for identifier: {identifier}")
+            return []
+        except Exception as e:
+            self.logger.error(f"Error fetching connections for {identifier}: {e}")
+            return []
 
     def _get_player_identifiers(self, player: Player) -> List[str]:
         identifiers = set()
@@ -819,53 +1231,80 @@ class Scanner:
         start_time = datetime.now()
         max_depth = getattr(self.cfg.scan, 'bypass_search_max_depth', 2)
         self.logger.info(f"Starting Ban Bypass Check, fetching up to {max_pages} pages with max depth {max_depth}...")
+
+        try:
+            async with asyncio.timeout(self._operation_timeout * 10):
+                return await self._scan_ban_bypasses_internal(max_pages, max_depth, start_time)
+        except asyncio.TimeoutError:
+            self.logger.error(f"Ban bypass scan timed out after {self._operation_timeout * 10}s")
+            return []
+        except Exception as e:
+            self.logger.error(f"Error during ban bypass check: {str(e)}", exc_info=True)
+            return []
+        finally:
+            self.cache.save_complaint_cache(self.complaint_channels)
+
+    async def _scan_ban_bypasses_internal(self, max_pages: int, max_depth: int, start_time: datetime) -> List[
+        Dict[str, Any]]:
         try:
             self.complaint_channels = await self.discord.update_complaint_cache(
                 self.complaint_channels,
                 history_limit=self.cfg.discord.message_history_limit
             )
-            ban_hit_connections = await asyncio.to_thread(
-                self.admin_panel.fetch_ban_hit_connections,
-                max_pages=max_pages
+
+            ban_hit_connections = await asyncio.wait_for(
+                asyncio.to_thread(self.admin_panel.fetch_ban_hit_connections, max_pages=max_pages),
+                timeout=self._operation_timeout
             )
+
             if not ban_hit_connections:
                 self.logger.info("No ban hit connections found.")
                 return []
+
             self.logger.info(f"Processing {len(ban_hit_connections)} ban hits with max depth {max_depth}")
             processed_terms = set()
             self.connections_cache = {}
             ban_hit_connections.sort(key=lambda x: x.get("time", ""), reverse=True)
             batch_size = min(self.max_concurrent // 2, 10)
             results = []
+
             for i in range(0, len(ban_hit_connections), batch_size):
                 batch = ban_hit_connections[i:i + batch_size]
                 self.logger.info(
                     f"Processing batch {i // batch_size + 1}/{(len(ban_hit_connections) + batch_size - 1) // batch_size}")
                 progress_stats = defaultdict(int)
                 batch_tasks = []
+
                 for ban_hit in batch:
-                    task = asyncio.create_task(self._process_ban_hit(
+                    task = self._process_ban_hit_with_timeout(
                         ban_hit,
                         max_depth,
                         processed_terms,
                         progress_stats
-                    ))
+                    )
                     batch_tasks.append(task)
-                batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
-                valid_results = []
-                for result in batch_results:
-                    if isinstance(result, Exception):
-                        self.logger.error(f"Error in batch processing: {str(result)}")
-                        continue
-                    if result:
-                        valid_results.append(result)
-                results.extend(valid_results)
-                self.logger.info(f"Batch {i // batch_size + 1} stats: " +
-                                 f"processed={progress_stats['processed']}, " +
-                                 f"hwid_matches={progress_stats.get('hwid_matches', 0)}, " +
-                                 f"ip_matches={progress_stats.get('ip_matches', 0)}")
-                if i + batch_size < len(ban_hit_connections):
-                    await asyncio.sleep(0.5)
+
+                try:
+                    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    valid_results = []
+                    for result in batch_results:
+                        if isinstance(result, Exception):
+                            self.logger.error(f"Error in batch processing: {str(result)}")
+                            continue
+                        if result:
+                            valid_results.append(result)
+                    results.extend(valid_results)
+
+                    self.logger.info(f"Batch {i // batch_size + 1} stats: " +
+                                     f"processed={progress_stats['processed']}, " +
+                                     f"hwid_matches={progress_stats.get('hwid_matches', 0)}, " +
+                                     f"ip_matches={progress_stats.get('ip_matches', 0)}")
+
+                    if i + batch_size < len(ban_hit_connections):
+                        await asyncio.sleep(0.5)
+                except Exception as e:
+                    self.logger.error(f"Error processing batch {i // batch_size + 1}: {e}")
+
             cache_hits = sum(1 for term in processed_terms if term in self.connections_cache)
             duration = (datetime.now() - start_time).total_seconds()
             self.logger.info(
@@ -875,11 +1314,21 @@ class Scanner:
             )
             self.connections_cache.clear()
             return results
-        except Exception as e:
-            self.logger.error(f"Error during ban bypass check: {str(e)}", exc_info=True)
+
+        except asyncio.TimeoutError:
+            self.logger.error("Ban bypass scan internal process timed out")
             return []
-        finally:
-            self.cache.save_complaint_cache(self.complaint_channels)
+
+    async def _process_ban_hit_with_timeout(self, ban_hit, max_depth, processed_terms, progress_stats):
+        try:
+            async with asyncio.timeout(self._operation_timeout):
+                return await self._process_ban_hit(ban_hit, max_depth, processed_terms, progress_stats)
+        except asyncio.TimeoutError:
+            self.logger.error(f"Ban hit processing timed out for {ban_hit.get('ban_hits_link')}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error in _process_ban_hit_with_timeout: {e}")
+            return None
 
     async def _process_ban_hit(self, ban_hit, max_depth, processed_terms, progress_stats):
         try:

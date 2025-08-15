@@ -136,7 +136,6 @@ def monitor_performance(func=None):
                 return result
             finally:
                 elapsed = time.time() - start_time
-                # Log or store performance data here
 
         return async_wrapper
     else:
@@ -148,7 +147,6 @@ def monitor_performance(func=None):
                 return result
             finally:
                 elapsed = time.time() - start_time
-                # Log or store performance data here
 
         return sync_wrapper
 
