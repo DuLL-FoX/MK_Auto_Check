@@ -8,7 +8,7 @@ from utils.logging_utils import setup_logging
 
 # ─── 1) MAIN-SPECIFIED VALUES (HIGHEST PRIORITY) ────────────────────────────
 MESSAGE_LIMIT = 700
-USERNAME = None
+USERNAME = "DuLL_FoX"
 CHECK_BAN_BYPASS = False
 BAN_BYPASS_PAGES = 1
 

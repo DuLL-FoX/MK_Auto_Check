@@ -1,12 +1,20 @@
 import asyncio
 import logging
+import random
 import time
 from dataclasses import dataclass
 from typing import Dict, Union, List, Any, Optional, Tuple, OrderedDict
 from urllib.parse import urljoin, quote_plus
 
 import aiohttp
-from selectolax.parser import HTMLParser, Node
+
+try:
+    from selectolax.parser import HTMLParser, Node
+
+    LXML_AVAILABLE = True
+except ImportError:
+    LXML_AVAILABLE = False
+    from selectolax.parser import HTMLParser, Node
 
 from config_system import get_config
 from utils.performance_monitor import PerformanceStats
@@ -64,6 +72,8 @@ class AdminPanel:
         self.TIMEOUT = aiohttp.ClientTimeout(total=cfg.api.request_timeout)
         self.SLOW_REQUEST_THRESHOLD = 5.0
 
+        self.DEFAULT_PER_PAGE = 2000
+
         self._connector = aiohttp.TCPConnector(limit_per_host=10, limit=50, ssl=False)
         self._client_session: Optional[aiohttp.ClientSession] = None
 
@@ -80,9 +90,89 @@ class AdminPanel:
         self._RESPONSE_CACHE_TTL = 1800
 
         self._async_lock = asyncio.Lock()
+        self._singleflight_fetches: dict[str, asyncio.Future] = {}
+
+        self.use_lxml = LXML_AVAILABLE
+        if not LXML_AVAILABLE:
+            self.logger.warning("lxml not available, falling back to html.parser")
+
         if self.logger.isEnabledFor(logging.INFO):
             self.logger.info(
-                f"AdminPanel (async) initialized with URLs: BASE={self.BASE_ADMIN_URL}, CONNECTIONS={self.CONNECTIONS_URL}")
+                f"AdminPanel (async) initialized with URLs: BASE={self.BASE_ADMIN_URL}, "
+                f"CONNECTIONS={self.CONNECTIONS_URL}, perPage={self.DEFAULT_PER_PAGE}, "
+                f"parser={'lxml' if self.use_lxml else 'html.parser'}"
+            )
+
+    def _get_parser_type(self) -> str:
+        return "lxml" if self.use_lxml else "html.parser"
+
+    def _parse_html(self, html_content: str) -> HTMLParser:
+        try:
+            return HTMLParser(html_content)
+        except Exception as e:
+            self.logger.warning(f"HTML parsing failed: {e}")
+            return HTMLParser(html_content)
+
+    def _build_connections_url(self, search: str = "", user_id: str = "", show_accepted: str = "true",
+                               show_banned: str = "true", show_whitelist: str = "true",
+                               show_full: str = "true", show_panic: str = "true",
+                               per_page: Optional[int] = None) -> str:
+        if per_page is None:
+            per_page = self.DEFAULT_PER_PAGE
+
+        search_term = quote_plus(user_id if user_id else search)
+        return (f"{self.BASE_ADMIN_URL}/Connections?perPage={per_page}&showSet=true"
+                f"&search={search_term}&showAccepted={show_accepted}&showBanned={show_banned}"
+                f"&showWhitelist={show_whitelist}&showFull={show_full}&showPanic={show_panic}")
+
+    def _log_debug(self, msg: str):
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(msg)
+
+    def _log_info(self, msg: str):
+        if self.logger.isEnabledFor(logging.INFO):
+            self.logger.info(msg)
+
+    def _log_warning(self, msg: str):
+        if self.logger.isEnabledFor(logging.WARNING):
+            self.logger.warning(msg)
+
+    async def _get_html(self, url: str, *, use_cache: bool = True, retry_on_auth: bool = True) -> Tuple[
+        Optional[str], bool]:
+        if use_cache:
+            cached = await self._get_cached_response(url)
+            if cached is not None:
+                return cached, True
+
+        if retry_on_auth and not await self._ensure_authenticated():
+            self._log_warning(f"Authentication failed before request: {url}")
+            return None, False
+
+        session = await self._get_session()
+        try:
+            self._request_metrics["total"] += 1
+            async with session.get(url) as resp:
+                if resp.status in (401, 403) and retry_on_auth:
+                    self._log_warning(f"Auth status {resp.status} for {url}; re-authenticating once.")
+                    if await self.login():
+                        async with session.get(url) as retry_resp:
+                            retry_resp.raise_for_status()
+                            html_text = await retry_resp.text()
+                            if use_cache and html_text:
+                                await self._cache_response(url, html_text)
+                            return html_text, False
+                resp.raise_for_status()
+                html_text = await resp.text()
+                if use_cache and html_text:
+                    await self._cache_response(url, html_text)
+                return html_text, False
+        except aiohttp.ClientError as e:
+            self._request_metrics["errors"] += 1
+            self.logger.error(f"Request error for {url}: {e}")
+        except Exception as e:
+            self._request_metrics["errors"] += 1
+            self.logger.error(f"Unexpected error for {url}: {e}", exc_info=True)
+        return None, False
 
     async def _initialise(self):
         await self.close()
@@ -185,13 +275,13 @@ class AdminPanel:
 
                 sso_login_url = str(response.url)
 
-                soup = HTMLParser(response_text)
+                soup = self._parse_html(response_text)
                 token_input = soup.css_first("input[name='__RequestVerificationToken']")
                 if not token_input or not token_input.attributes.get("value"):
                     self.logger.error(
                         f"Anti-forgery token not found on the login page ({sso_login_url}). This is a critical part of the login process. The page structure might have changed.")
-                    if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                        f"HTML content where token was expected:\n{response_text[:2000]}")
+                    if self.logger.isEnabledFor(logging.DEBUG):
+                        self.logger.debug(f"HTML content where token was expected:\n{response_text[:2000]}")
                     return False
                 token = token_input.attributes["value"]
 
@@ -213,15 +303,16 @@ class AdminPanel:
 
                 if f"{self.BASE_ADMIN_URL}/signin-oidc" in response_text:
                     self.logger.info("OIDC redirect detected, processing...")
-                    soup_oidc = HTMLParser(response_text)
+                    soup_oidc = self._parse_html(response_text)
                     form = soup_oidc.css_first("form[action*='signin-oidc']")
-                    if not form: form = soup_oidc.css_first("form")
+                    if not form:
+                        form = soup_oidc.css_first("form")
 
                     if not form:
                         self.logger.error(
                             "signin-oidc: Redirect form not found. This is an expected part of the OIDC authentication flow and its absence is an error.")
-                        if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                            f"Page content for missing OIDC form:\n{response_text[:1500]}")
+                        if self.logger.isEnabledFor(logging.DEBUG):
+                            self.logger.debug(f"Page content for missing OIDC form:\n{response_text[:1500]}")
                         return "Logout" in response_text or "Players" in response_text
 
                     redirect_action_url = form.attributes.get("action")
@@ -246,8 +337,9 @@ class AdminPanel:
                         else:
                             self.logger.error(
                                 "Authentication failed after OIDC redirect. The final page did not contain expected content ('Logout'/'Players').")
-                            if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                                f"Final OIDC response URL: {str(final_response.url)}\nFinal OIDC response text (snippet):\n{final_response_text[:2000]}")
+                            if self.logger.isEnabledFor(logging.DEBUG):
+                                self.logger.debug(
+                                    f"Final OIDC response URL: {str(final_response.url)}\nFinal OIDC response text (snippet):\n{final_response_text[:2000]}")
                             return False
 
                 elif "Logout" in response_text or "Players" in response_text or self.BASE_ADMIN_URL in final_url:
@@ -341,40 +433,78 @@ class AdminPanel:
             )
         except Exception as e:
             self.logger.error(f"Error parsing connection row: {str(e)}", exc_info=True)
-            if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                f"Problematic row HTML: {row_node.html[:500]}")
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(f"Problematic row HTML: {row_node.html[:500]}")
             return None
 
-    def _parse_connections_table(self, soup: HTMLParser) -> List[ConnectionData]:
+    def _parse_connections_table(self, soup: HTMLParser,
+                                 existing_data_sets: Optional[Dict[str, set]] = None) -> Tuple[
+        List[ConnectionData], bool]:
         connections = []
+        has_new_info = True
+
+        if existing_data_sets is None:
+            existing_data_sets = {'user_names': set(), 'user_ids': set(), 'ips': set(), 'hwids': set()}
+
         table = soup.css_first("table.table")
         if not table:
-            if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug("No table.table found in the HTML")
-            return connections
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("No table.table found in the HTML")
+            return connections, False
 
         tbody = table.css_first("tbody")
         if not tbody:
-            if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug("No tbody found in the table")
-            return connections
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("No tbody found in the table")
+            return connections, False
 
         rows = tbody.css("tr")
         is_search_page_context = bool(soup.css_first("form[action*='search='], form input[name='search']"))
 
         if not rows and is_search_page_context and self.logger.isEnabledFor(logging.INFO):
-            self.logger.info(
-                f"Found 0 <tr> rows in <tbody> on what appears to be a search results page. "
-            )
+            self.logger.info("Found 0 <tr> rows in <tbody> on what appears to be a search results page.")
 
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(f"Found {len(rows)} rows in the connections table to process.")
+
+        new_user_names = set()
+        new_user_ids = set()
+        new_ips = set()
+        new_hwids = set()
+
         for row_idx, row_node in enumerate(rows):
             conn = self._parse_connection_row(row_node)
             if conn:
                 connections.append(conn)
+
+                if conn.user_name and conn.user_name not in existing_data_sets['user_names']:
+                    new_user_names.add(conn.user_name)
+                if conn.user_id and conn.user_id not in existing_data_sets['user_ids']:
+                    new_user_ids.add(conn.user_id)
+                if conn.ip_address and conn.ip_address != N_A and conn.ip_address not in existing_data_sets['ips']:
+                    new_ips.add(conn.ip_address)
+                if conn.hwid and conn.hwid != N_A and conn.hwid not in existing_data_sets['hwids']:
+                    new_hwids.add(conn.hwid)
+
             elif self.logger.isEnabledFor(logging.WARNING):
                 self.logger.warning(
                     f"Failed to parse connection data from row {row_idx}. Row content snippet (debug): {row_node.html[:300]}")
-        return connections
+
+        existing_data_sets['user_names'].update(new_user_names)
+        existing_data_sets['user_ids'].update(new_user_ids)
+        existing_data_sets['ips'].update(new_ips)
+        existing_data_sets['hwids'].update(new_hwids)
+
+        has_new_info = bool(new_user_names or new_user_ids or new_ips or new_hwids)
+
+        if self.logger.isEnabledFor(logging.DEBUG) and existing_data_sets:
+            self.logger.debug(
+                f"Page processing: {len(connections)} connections, "
+                f"new: {len(new_user_names)} names, {len(new_user_ids)} IDs, "
+                f"{len(new_ips)} IPs, {len(new_hwids)} HWIDs. Has new info: {has_new_info}"
+            )
+
+        return connections, has_new_info
 
     def _get_next_page_link(self, soup: HTMLParser) -> Optional[str]:
         next_page_link_tag = soup.css_first("a.page-link[rel='next']")
@@ -385,10 +515,13 @@ class AdminPanel:
 
         potential_next_buttons = soup.css("a.btn")
         for btn_link_tag in potential_next_buttons:
-            if "Next" not in btn_link_tag.text(strip=True): continue
-            if "disabled" in btn_link_tag.attributes.get("class", ""): continue
+            if "Next" not in btn_link_tag.text(strip=True):
+                continue
+            if "disabled" in btn_link_tag.attributes.get("class", ""):
+                continue
             href_value = btn_link_tag.attributes.get("href")
-            if not href_value or href_value.strip() == "#": continue
+            if not href_value or href_value.strip() == "#":
+                continue
             if "page=" in href_value.lower() or "pageindex=" in href_value.lower():
                 return urljoin(self.BASE_ADMIN_URL, href_value)
         return None
@@ -442,10 +575,37 @@ class AdminPanel:
             self.logger.error(f"Unexpected error during request to {url}: {e}", exc_info=True)
             return None
 
-    async def fetch_paginated_data(self, url: str, max_pages: int = 0) -> List[ConnectionData]:
-        if self.logger.isEnabledFor(logging.INFO):
-            self.logger.info(
-                f"Fetching paginated data from URL: {url}, max_pages={max_pages if max_pages > 0 else 'unlimited'}")
+    async def fetch_paginated_data(self, url: str, max_pages: int = 0,
+                                   enable_early_stop: bool = False) -> List[ConnectionData]:
+        key = f"{url}|{max_pages}|{enable_early_stop}"
+        existing = self._singleflight_fetches.get(key)
+        if existing:
+            try:
+                return await existing
+            except Exception:
+                pass
+
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._singleflight_fetches[key] = fut
+
+        try:
+            result = await self._fetch_paginated_data_inner(url, max_pages=max_pages,
+                                                            enable_early_stop=enable_early_stop)
+            if not fut.done():
+                fut.set_result(result)
+            return result
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+            raise
+        finally:
+            self._singleflight_fetches.pop(key, None)
+
+    async def _fetch_paginated_data_inner(self, url: str, max_pages: int = 0,
+                                          enable_early_stop: bool = False) -> List[ConnectionData]:
+        self._log_info(
+            f"Fetching paginated data from URL: {url}, max_pages={max_pages if max_pages > 0 else 'unlimited'}, early_stop={enable_early_stop}")
 
         all_connections: List[ConnectionData] = []
         current_url: Optional[str] = url
@@ -453,81 +613,153 @@ class AdminPanel:
         pages_fetched = 0
         start_time_total = time.time()
 
-        while current_url:
-            if max_pages > 0 and pages_fetched >= max_pages:
-                if self.logger.isEnabledFor(logging.INFO):
-                    self.logger.info(f"Reached max pages limit ({max_pages}) after fetching {pages_fetched} pages.")
-                break
+        base_total = getattr(self.TIMEOUT, 'total', 90) or 90
+        global_timeout = min(base_total + 30, base_total * 1.4)
+        slow_page_threshold = max(self.SLOW_REQUEST_THRESHOLD, min(20.0, base_total * 0.35))
 
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Fetching page {page_num} from URL: {current_url}")
+        consecutive_slow_pages = 0
+        consecutive_empty_pages = 0
 
-            req_start_time = time.time()
-            html_content: Optional[str] = await self._get_cached_response(current_url)
-            from_cache = bool(html_content)
+        existing_data_sets = {'user_names': set(), 'user_ids': set(), 'ips': set(),
+                              'hwids': set()} if enable_early_stop else None
+        pages_without_new_info = 0
+        max_pages_without_info = 2
 
-            if not html_content:
-                if self.logger.isEnabledFor(logging.DEBUG):
-                    self.logger.debug(f"Cache miss for page {page_num} URL: {current_url}. Fetching live.")
+        try:
+            async with asyncio.timeout(global_timeout):
+                while current_url:
+                    if max_pages > 0 and pages_fetched >= max_pages:
+                        self._log_info(f"Reached max pages limit ({max_pages}) after fetching {pages_fetched} pages.")
+                        break
 
-                html_content = await self._make_request(current_url)
+                    self._log_debug(f"Fetching page {page_num} from URL: {current_url}")
 
-                if html_content:
-                    await self._cache_response(current_url, html_content)
+                    req_start_time = time.time()
+                    html_content: Optional[str] = None
+                    from_cache = False
 
-            req_elapsed_time = time.time() - req_start_time
-            if req_elapsed_time > self.SLOW_REQUEST_THRESHOLD and not from_cache:
-                self._request_metrics["slow_requests"] += 1
-                log_url_display = current_url[:67] + "..." if len(current_url) > 70 else current_url
-                if self.perf_logger.isEnabledFor(logging.DEBUG):
-                    self.perf_logger.debug(f"Slow request ({req_elapsed_time:.2f}s): {log_url_display}")
+                    dynamic_factor = 0.6 - (consecutive_slow_pages * 0.1)
+                    if dynamic_factor < 0.3:
+                        dynamic_factor = 0.3
+                    per_page_timeout = min(max(20, int(base_total * dynamic_factor)), int(base_total))
 
-            if not html_content:
-                self.logger.error(
-                    f"Failed to get HTML content for page {page_num} URL: {current_url}. Stopping pagination here.")
-                break
+                    attempt = 0
+                    while attempt < 2 and html_content is None:
+                        attempt += 1
+                        try:
+                            async with asyncio.timeout(per_page_timeout):
+                                html_content, from_cache = await self._get_html(current_url, use_cache=True)
+                        except asyncio.TimeoutError:
+                            if attempt < 2:
+                                self.logger.warning(
+                                    f"Timeout fetching page {page_num} (attempt {attempt}) for {current_url}; retrying once (timeout={per_page_timeout}s)...")
+                                await asyncio.sleep(1 + random.random())
+                            else:
+                                self.logger.error(
+                                    f"Timed out fetching page {page_num} for {current_url} after {per_page_timeout}s (final attempt) — keeping partial results.")
+                        except Exception as e:
+                            self.logger.error(f"Unexpected error fetching page {page_num} for {current_url}: {e}")
+                            break
 
-            if self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Page {page_num} response length: {len(html_content)}. Parsing...")
+                    req_elapsed_time = time.time() - req_start_time
+                    if req_elapsed_time > self.SLOW_REQUEST_THRESHOLD and html_content and not from_cache:
+                        self._request_metrics["slow_requests"] += 1
+                        consecutive_slow_pages += 1
+                        if self.perf_logger.isEnabledFor(logging.DEBUG):
+                            log_url_display = current_url[:67] + "..." if len(current_url) > 70 else current_url
+                            self.perf_logger.debug(f"Slow request ({req_elapsed_time:.2f}s): {log_url_display}")
+                    else:
+                        if req_elapsed_time <= slow_page_threshold:
+                            consecutive_slow_pages = 0
 
-            soup = HTMLParser(html_content)
-            connections_on_page = self._parse_connections_table(soup)
-            all_connections.extend(connections_on_page)
-            pages_fetched += 1
+                    if not html_content:
+                        self.logger.warning(
+                            f"Stopping pagination at page {page_num}; no HTML content retrieved (timeout or error). Returning {len(all_connections)} partial connections.")
+                        break
 
-            is_likely_search_page = "search=" in current_url.lower()
-            if not connections_on_page and is_likely_search_page and page_num == 1:
-                if self.logger.isEnabledFor(logging.INFO):
-                    self.logger.info(
-                        f"Search results page {current_url} (page {page_num}) yielded no connections. Assuming end of relevant results.")
-                current_url = None
-            else:
-                current_url = self._get_next_page_link(soup)
+                    self._log_debug(f"Page {page_num} response length: {len(html_content)}. Parsing...")
+                    soup = self._parse_html(html_content)
 
-            if current_url:
-                page_num += 1
+                    if enable_early_stop and existing_data_sets is not None:
+                        connections_on_page, has_new_info = self._parse_connections_table(soup, existing_data_sets)
+                        if not has_new_info:
+                            pages_without_new_info += 1
+                            self._log_info(
+                                f"Page {page_num} provided no new information (streak: {pages_without_new_info})")
+                        else:
+                            pages_without_new_info = 0
 
-        total_elapsed_time = time.time() - start_time_total
-        self.perf_stats.record("fetch_paginated_data", total_elapsed_time)
-        if self.logger.isEnabledFor(logging.INFO):
-            self.logger.info(
-                f"Fetched {len(all_connections)} connections from {pages_fetched} page(s) in {total_elapsed_time:.2f}s")
+                        if pages_without_new_info >= max_pages_without_info:
+                            self._log_info(
+                                f"Early stopping: {pages_without_new_info} consecutive pages without new information")
+                            break
+                    else:
+                        connections_on_page, _ = self._parse_connections_table(soup)
+
+                    prev_total = len(all_connections)
+                    all_connections.extend(connections_on_page)
+                    pages_fetched += 1
+
+                    if not connections_on_page:
+                        consecutive_empty_pages += 1
+                    else:
+                        consecutive_empty_pages = 0
+
+                    if consecutive_empty_pages >= 2:
+                        self._log_info(
+                            f"Encountered {consecutive_empty_pages} consecutive empty pages; stopping early.")
+                        break
+
+                    is_likely_search_page = "search=" in current_url.lower()
+                    if not connections_on_page and is_likely_search_page and page_num == 1:
+                        self._log_info(
+                            f"Search results page {current_url} (page {page_num}) yielded no connections. Assuming end of relevant results.")
+                        current_url = None
+                    else:
+                        next_url = self._get_next_page_link(soup)
+                        current_url = next_url
+
+                    if current_url:
+                        page_num += 1
+                        await asyncio.sleep(0.05 + random.random() * 0.1)
+
+        except asyncio.TimeoutError:
+            elapsed = time.time() - start_time_total
+            self.logger.warning(
+                f"Global pagination timeout after {elapsed:.1f}s for base URL {url}. Returning {len(all_connections)} partial connections from {pages_fetched} page(s).")
+        except asyncio.CancelledError:
+            self.logger.warning(
+                f"Pagination task cancelled for {url}; returning {len(all_connections)} partial connections.")
+            raise
+        finally:
+            total_elapsed_time = time.time() - start_time_total
+            self.perf_stats.record("fetch_paginated_data", total_elapsed_time)
+            early_stop_info = ""
+            if enable_early_stop and existing_data_sets is not None:
+                early_stop_info = f", early_stop_triggered={'yes' if pages_without_new_info >= max_pages_without_info else 'no'}"
+            self._log_info(
+                f"Fetched {len(all_connections)} connections from {pages_fetched} page(s) in {total_elapsed_time:.2f}s "
+                f"(partial={'yes' if current_url else 'no'}{early_stop_info})"
+            )
+
         return all_connections
 
     def get_connections_url(self, user_id: str = "", search: str = "", show_accepted: str = "true",
                             show_banned: str = "true", show_whitelist: str = "true", show_full: str = "true",
                             show_panic: str = "true") -> str:
-        search_term = quote_plus(user_id if user_id else search)
-        return (f"{self.BASE_ADMIN_URL}/Connections?perPage=200&showSet=true"
-                f"&search={search_term}&showAccepted={show_accepted}&showBanned={show_banned}"
-                f"&showWhitelist={show_whitelist}&showFull={show_full}&showPanic={show_panic}")
+        return self._build_connections_url(
+            search=search, user_id=user_id, show_accepted=show_accepted,
+            show_banned=show_banned, show_whitelist=show_whitelist,
+            show_full=show_full, show_panic=show_panic
+        )
 
-    async def fetch_connections_for_user(self, user_id: str) -> List[Dict[str, Any]]:
+    async def fetch_connections_for_user(self, user_id: str, enable_early_stop: bool = False) -> List[Dict[str, Any]]:
         url = self.get_connections_url(user_id=user_id)
         if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"Fetching connections for user_id: {user_id} from URL: {url}")
+            self.logger.debug(
+                f"Fetching connections for user_id: {user_id} from URL: {url} (early_stop={enable_early_stop})")
         start_time = time.time()
-        connections = await self.fetch_paginated_data(url)
+        connections = await self.fetch_paginated_data(url, enable_early_stop=enable_early_stop)
         elapsed = time.time() - start_time
         self.perf_stats.record(f"fetch_connections_for_user", elapsed)
         connection_dicts = [conn.to_dict() for conn in connections]
@@ -535,12 +767,14 @@ class AdminPanel:
             self.logger.debug(f"Found {len(connection_dicts)} connections for user_id: {user_id}")
         return connection_dicts
 
-    async def check_account_on_site(self, url: str, single_user: bool = False) -> Union[
+    async def check_account_on_site(self, url: str, single_user: bool = False,
+                                    enable_early_stop: bool = False) -> Union[
         List[Dict[str, Any]], Dict[str, Union[str, List[str], bool, int]]]:
         if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"Checking account on site: url={url}, single_user={single_user}")
+            self.logger.debug(
+                f"Checking account on site: url={url}, single_user={single_user}, early_stop={enable_early_stop}")
         start_time = time.time()
-        connections_data = await self.fetch_paginated_data(url)
+        connections_data = await self.fetch_paginated_data(url, enable_early_stop=enable_early_stop)
         elapsed = time.time() - start_time
         self.perf_stats.record("check_account_on_site", elapsed)
         if self.logger.isEnabledFor(logging.DEBUG):
@@ -549,7 +783,7 @@ class AdminPanel:
         if single_user:
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug("Aggregating single user info from connections data.")
-            result = await self.aggregate_single_user_info(connections_data)
+            result = await self.aggregate_single_user_info(connections_data, fetch_player_details=True)
             if self.logger.isEnabledFor(logging.DEBUG):
                 self.logger.debug(f"Aggregated result for single user, status: {result.get('status', 'unknown')}")
             return result
@@ -561,37 +795,22 @@ class AdminPanel:
 
     async def fetch_player_info(self, user_id: str) -> Dict[str, Union[int, List[Dict[str, str]]]]:
         if not await self._ensure_authenticated():
-            if self.logger.isEnabledFor(logging.WARNING):
-                self.logger.warning(f"Not authenticated, cannot fetch player info for {user_id}")
+            self._log_warning(f"Not authenticated, cannot fetch player info for {user_id}")
             return {"ban_counts": 0, "ban_reasons": []}
 
         info_result: Dict[str, Union[int, List[Dict[str, str]]]] = {"ban_counts": 0, "ban_reasons": []}
         info_url = self.PLAYER_INFO_URL_PATTERN.format(user_id)
-        if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"Fetching player info from URL: {info_url}")
+        self._log_debug(f"Fetching player info from URL: {info_url}")
 
         start_time = time.time()
-        session = await self._get_session()
         from_cache = False
         try:
-            html_content: Optional[str] = await self._get_cached_response(info_url)
-            from_cache = bool(html_content)
-            if not html_content:
-                if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                    f"Cache miss for player info: {user_id}. Fetching live.")
-                self._request_metrics["total"] += 1
-                async with session.get(info_url) as resp:
-                    resp.raise_for_status()
-                    html_content = await resp.text()
-                await self._cache_response(info_url, html_content)
-            elif self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Using cached response for player info: {user_id}")
-
+            html_content, from_cache = await self._get_html(info_url, use_cache=True)
             if not html_content:
                 self.logger.error(f"Failed to get HTML content for player info: {user_id}")
                 return info_result
 
-            soup = HTMLParser(html_content)
+            soup = self._parse_html(html_content)
             player_name = "Unknown"
             name_header = soup.css_first("h1")
             if name_header:
@@ -602,8 +821,8 @@ class AdminPanel:
                         player_name = parts[1].strip()
                     else:
                         parts_no_space = name_text.lower().split("information for", 1)
-                        if len(parts_no_space) > 1: player_name = name_text[
-                                                                  len(name_text) - len(parts_no_space[1]):].strip()
+                        if len(parts_no_space) > 1:
+                            player_name = name_text[len(name_text) - len(parts_no_space[1]):].strip()
 
             ban_table_node = None
             for h2_node in soup.css("h2"):
@@ -612,9 +831,10 @@ class AdminPanel:
                     current_node = h2_node.next
                     while current_node:
                         if current_node.tag == 'table' and 'table' in current_node.attributes.get('class', ''):
-                            ban_table_node = current_node;
+                            ban_table_node = current_node
                             break
-                        if current_node.tag == 'h2': break
+                        if current_node.tag == 'h2':
+                            break
                         current_node = current_node.next
                     break
 
@@ -647,8 +867,7 @@ class AdminPanel:
 
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
-                if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                    f"Player profile not found (404) for user_id: {user_id} at {info_url}")
+                self._log_debug(f"Player profile not found (404) for user_id: {user_id} at {info_url}")
             else:
                 self._request_metrics["errors"] += 1
                 self.logger.error(f"HTTP error fetching player info for {user_id} from {info_url}: {str(e)}")
@@ -666,10 +885,12 @@ class AdminPanel:
                 self.perf_logger.debug(f"Slow player info fetch: {elapsed_time:.2f}s for user {user_id}")
         return info_result
 
-    async def aggregate_single_user_info(self, connections: List[Union[ConnectionData, Dict[str, Any]]]) -> Dict[
+    async def aggregate_single_user_info(self, connections: List[Union[ConnectionData, Dict[str, Any]]],
+                                         fetch_player_details: bool = True) -> Dict[
         str, Union[str, List[str], bool, int]]:
         if self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(f"Aggregating user info from {len(connections)} connections")
+            self.logger.debug(
+                f"Aggregating user info from {len(connections)} connections (fetch_details={fetch_player_details})")
 
         result: Dict[str, Any] = {
             "status": "unknown", "nicknames": set(), "ban_counts": 0, "ban_reasons": set(),
@@ -698,17 +919,23 @@ class AdminPanel:
                         conn_data.get("server", ""), conn_data.get("connection_id")
                 is_den_ban = "Denied: Banned" in status_txt
             else:
-                self.logger.warning(f"Unexpected connection data type: {type(conn_data)}");
+                self.logger.warning(f"Unexpected connection data type: {type(conn_data)}")
                 continue
 
-            if curr_uid and curr_uid != N_A and result["user_id"] == N_A: result["user_id"] = curr_uid
-            if not first_valid_conn_id and curr_conn_id: first_valid_conn_id = curr_conn_id
-            if nickname: result["nicknames"].add(nickname)
-            if ip and ip != N_A: all_ips.setdefault(ip, set()).add(nickname)
-            if hwid_val and hwid_val != N_A: all_hwids.setdefault(hwid_val, set()).add(nickname)
+            if curr_uid and curr_uid != N_A and result["user_id"] == N_A:
+                result["user_id"] = curr_uid
+            if not first_valid_conn_id and curr_conn_id:
+                first_valid_conn_id = curr_conn_id
+            if nickname:
+                result["nicknames"].add(nickname)
+            if ip and ip != N_A:
+                all_ips.setdefault(ip, set()).add(nickname)
+            if hwid_val and hwid_val != N_A:
+                all_hwids.setdefault(hwid_val, set()).add(nickname)
 
             if status_txt:
-                if "Accepted" in status_txt and result["status"] == "unknown": result["status"] = "clean"
+                if "Accepted" in status_txt and result["status"] == "unknown":
+                    result["status"] = "clean"
                 if is_den_ban:
                     denied_banned_status_found = True
                     result["denied_banned_connections"].append({
@@ -719,35 +946,46 @@ class AdminPanel:
 
         if denied_banned_status_found:
             result["status"], result["ban_counts"] = "banned", max(result["ban_counts"], 1)
-            if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                "Status set to 'banned' due to 'Denied: Banned' connections.")
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("Status set to 'banned' due to 'Denied: Banned' connections.")
         elif banned_status_found and result["status"] != "banned":
             result["status"] = "banned"
-            if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                "Status set to 'banned' due to 'Banned' status in connections.")
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug("Status set to 'banned' due to 'Banned' status in connections.")
 
-        if first_valid_conn_id: result[
-            "connection_link"] = f"{self.BASE_ADMIN_URL}/Connections/Info/{first_valid_conn_id}"
+        if first_valid_conn_id:
+            result["connection_link"] = f"{self.BASE_ADMIN_URL}/Connections/Info/{first_valid_conn_id}"
 
         final_uid_fetch = result["user_id"]
-        if final_uid_fetch and final_uid_fetch != N_A:
-            if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                f"Fetching player-specific ban info for user_id: {final_uid_fetch}")
-            player_page_info = await self.fetch_player_info(final_uid_fetch)
-            result["ban_counts"] = max(result["ban_counts"], player_page_info.get("ban_counts", 0))
-            for ban_entry in player_page_info.get("ban_reasons", []):
-                if isinstance(ban_entry, dict) and "reason" in ban_entry and "username" in ban_entry:
-                    result["ban_reasons"].add((ban_entry["reason"], ban_entry["username"]))
-                elif self.logger.isEnabledFor(logging.WARNING):
-                    self.logger.warning(f"Malformed ban entry from fetch_player_info: {ban_entry}")
+        if fetch_player_details and final_uid_fetch and final_uid_fetch != N_A:
+            enrich_timeout = min(30, getattr(self.TIMEOUT, 'total', 90) or 90)
+            try:
+                async with asyncio.timeout(enrich_timeout):
+                    player_page_info = await self.fetch_player_info(final_uid_fetch)
+                result["ban_counts"] = max(result["ban_counts"], player_page_info.get("ban_counts", 0))
+                for ban_entry in player_page_info.get("ban_reasons", []):
+                    if isinstance(ban_entry, dict) and "reason" in ban_entry and "username" in ban_entry:
+                        result["ban_reasons"].add((ban_entry["reason"], ban_entry["username"]))
+                    elif self.logger.isEnabledFor(logging.WARNING):
+                        self.logger.warning(f"Malformed ban entry from fetch_player_info: {ban_entry}")
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"Timeout fetching player info for {final_uid_fetch} after {enrich_timeout}s; proceeding without extra ban reasons.")
+            except Exception as e:
+                self.logger.error(f"Error fetching player info for {final_uid_fetch}: {e}")
+        elif not fetch_player_details and self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(f"Skipping player details fetch for {final_uid_fetch} (delayed enrichment)")
 
         result["associated_ips"] = {ip_k: sorted(list(nicks_v)) for ip_k, nicks_v in all_ips.items()}
         result["associated_hwids"] = {hwid_k: sorted(list(nicks_v)) for hwid_k, nicks_v in all_hwids.items()}
         for hwid_k, nicks_s in all_hwids.items():
-            if len(nicks_s) > 1 and hwid_k != N_A: result["shared_hwid_nicknames"].update(nicks_s)
+            if len(nicks_s) > 1 and hwid_k != N_A:
+                result["shared_hwid_nicknames"].update(nicks_s)
 
-        if result["ban_counts"] > 0 and result["status"] != "banned": result["status"] = "banned"
-        if result["ban_counts"] >= 5 and result["status"] == "banned": result["status"] = "suspicious"
+        if result["ban_counts"] > 0 and result["status"] != "banned":
+            result["status"] = "banned"
+        if result["ban_counts"] >= 5 and result["status"] == "banned":
+            result["status"] = "suspicious"
 
         result["nicknames"] = sorted(list(result["nicknames"]))
         result["ban_reasons"] = [{"reason": r, "username": u} for r, u in sorted(list(result["ban_reasons"]))]
@@ -765,11 +1003,13 @@ class AdminPanel:
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(
                 f"Aggregation complete for user_id '{result['user_id']}': status={result['status']}, "
-                f"nicknames_count={len(result['nicknames'])}, ban_counts={result['ban_counts']}")
+                f"nicknames_count={len(result['nicknames'])}, ban_counts={result['ban_counts']}, "
+                f"details_fetched={fetch_player_details}"
+            )
         return result
 
     async def fetch_ban_hit_connections(self, max_pages: int = 0) -> List[Dict[str, str]]:
-        url = f"{self.CONNECTIONS_URL}?showSet=true&search=&showBanned=true&perPage=200"
+        url = self._build_connections_url(show_banned="true", search="")
         if self.logger.isEnabledFor(logging.DEBUG):
             self.logger.debug(f"Fetching ban hit connections, max_pages={max_pages if max_pages > 0 else 'unlimited'}")
 
@@ -782,39 +1022,24 @@ class AdminPanel:
 
     async def fetch_ban_info(self, ban_hits_link: str) -> Dict[str, str]:
         if not ban_hits_link:
-            if self.logger.isEnabledFor(logging.WARNING): self.logger.warning(
-                "fetch_ban_info called with empty ban_hits_link.")
+            self._log_warning("fetch_ban_info called with empty ban_hits_link.")
             return {}
         if not await self._ensure_authenticated():
-            if self.logger.isEnabledFor(logging.WARNING): self.logger.warning(
-                f"Not authenticated, cannot fetch ban info from {ban_hits_link}")
+            self._log_warning(f"Not authenticated, cannot fetch ban info from {ban_hits_link}")
             return {}
 
         ban_info: Dict[str, str] = {}
-        if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(f"Fetching ban info from URL: {ban_hits_link}")
+        self._log_debug(f"Fetching ban info from URL: {ban_hits_link}")
 
         start_time = time.time()
-        session = await self._get_session()
         from_cache = False
         try:
-            html_content: Optional[str] = await self._get_cached_response(ban_hits_link)
-            from_cache = bool(html_content)
-            if not html_content:
-                if self.logger.isEnabledFor(logging.DEBUG): self.logger.debug(
-                    f"Cache miss for ban info: {ban_hits_link}. Fetching live.")
-                self._request_metrics["total"] += 1
-                async with session.get(ban_hits_link) as response:
-                    response.raise_for_status()
-                    html_content = await response.text()
-                await self._cache_response(ban_hits_link, html_content)
-            elif self.logger.isEnabledFor(logging.DEBUG):
-                self.logger.debug(f"Using cached response for ban info: {ban_hits_link}")
-
+            html_content, from_cache = await self._get_html(ban_hits_link, use_cache=True)
             if not html_content:
                 self.logger.error(f"Failed to get HTML content for ban info: {ban_hits_link}")
                 return ban_info
 
-            soup = HTMLParser(html_content)
+            soup = self._parse_html(html_content)
             dl_element = soup.css_first("dl.row, dl")
             if dl_element:
                 dt_nodes, dd_nodes = dl_element.css("dt"), dl_element.css("dd")
@@ -842,15 +1067,16 @@ class AdminPanel:
 
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
-                if self.logger.isEnabledFor(logging.WARNING): self.logger.warning(
-                    f"Ban hits link not found (404): {ban_hits_link}")
+                self._log_warning(f"Ban hits link not found (404): {ban_hits_link}")
             else:
                 self._request_metrics["errors"] += 1
                 self.logger.error(f"HTTP error fetching ban info from {ban_hits_link}: {e}")
         except aiohttp.ClientError as e:
-            self._request_metrics["errors"] += 1; self.logger.error(f"Request error fetching ban info from {ban_hits_link}: {e}")
+            self._request_metrics["errors"] += 1
+            self.logger.error(f"Request error fetching ban info from {ban_hits_link}: {e}")
         except Exception as e:
-            self._request_metrics["errors"] += 1; self.logger.error(f"Error parsing ban info from {ban_hits_link}: {e}", exc_info=True)
+            self._request_metrics["errors"] += 1
+            self.logger.error(f"Error parsing ban info from {ban_hits_link}: {e}", exc_info=True)
 
         elapsed = time.time() - start_time
         self.perf_stats.record("fetch_ban_info", elapsed)
