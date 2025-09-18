@@ -1020,15 +1020,15 @@ class AdminPanel:
                 f"Found {len(ban_hit_list)} connections with 'Denied: Banned' status and a ban_hits_link.")
         return ban_hit_list
 
-    async def fetch_ban_info(self, ban_hits_link: str) -> Dict[str, str]:
+    async def fetch_ban_info(self, ban_hits_link: str) -> List[Dict[str, str]]:
         if not ban_hits_link:
             self._log_warning("fetch_ban_info called with empty ban_hits_link.")
-            return {}
+            return []
         if not await self._ensure_authenticated():
             self._log_warning(f"Not authenticated, cannot fetch ban info from {ban_hits_link}")
-            return {}
+            return []
 
-        ban_info: Dict[str, str] = {}
+        ban_entries: List[Dict[str, str]] = []
         self._log_debug(f"Fetching ban info from URL: {ban_hits_link}")
 
         start_time = time.time()
@@ -1037,33 +1037,49 @@ class AdminPanel:
             html_content, from_cache = await self._get_html(ban_hits_link, use_cache=True)
             if not html_content:
                 self.logger.error(f"Failed to get HTML content for ban info: {ban_hits_link}")
-                return ban_info
+                return ban_entries
 
             soup = self._parse_html(html_content)
+            
+            common_info = {}
             dl_element = soup.css_first("dl.row, dl")
             if dl_element:
                 dt_nodes, dd_nodes = dl_element.css("dt"), dl_element.css("dd")
                 info_dl = {dt.text(strip=True).rstrip(":").lower().replace(" ", "_"): dd.text(strip=True)
                            for dt, dd in zip(dt_nodes, dd_nodes) if dt and dd}
-                ban_info["banned_user_name"] = info_dl.get("name", "")
-                ban_info["user_id"] = info_dl.get("user_id", info_dl.get("user_id", ""))
-                ban_info["ip_address"] = info_dl.get("ip", "")
-                ban_info["hwid"] = info_dl.get("hwid", "")
-                ban_info["time"] = info_dl.get("time", "")
+                common_info["banned_user_name"] = info_dl.get("name", "")
+                common_info["user_id"] = info_dl.get("user_id", info_dl.get("user_id", ""))
+                common_info["ip_address"] = info_dl.get("ip", "")
+                common_info["hwid"] = info_dl.get("hwid", "")
+                common_info["time"] = info_dl.get("time", "")
 
             table = soup.css_first("table.table")
             if table:
                 tbody = table.css_first("tbody")
                 rows_src = tbody if tbody else table
                 rows = rows_src.css("tr") if rows_src else []
-                for row in rows:
+                
+                for row_idx, row in enumerate(rows):
                     cols = row.css("td")
                     if len(cols) >= 6:
-                        ban_info["ban_time"], ban_info["expires"] = cols[2].text(strip=True), cols[4].text(strip=True)
-                        break
+                        ban_entry = common_info.copy()
+                        ban_entry["ban_time"] = cols[2].text(strip=True)
+                        ban_entry["expires"] = cols[4].text(strip=True)
+                        
+                        if len(cols) > 6:
+                            ban_entry["ban_reason"] = cols[1].text(strip=True) if len(cols) > 1 else ""
+                            ban_entry["admin"] = cols[3].text(strip=True) if len(cols) > 3 else ""
+                            ban_entry["ban_id"] = cols[0].text(strip=True) if len(cols) > 0 else ""
+                        
+                        ban_entries.append(ban_entry)
+                        self._log_debug(f"Extracted ban entry {row_idx + 1}: {ban_entry.get('ban_time', 'unknown time')}")
 
-            if not ban_info and self.logger.isEnabledFor(logging.WARNING):
-                self.logger.warning(f"Could not parse detailed ban info from {ban_hits_link}.")
+            if not ban_entries:
+                if common_info:
+                    ban_entries.append(common_info)
+                    self._log_debug("No ban table found, returning common connection info only")
+                elif self.logger.isEnabledFor(logging.WARNING):
+                    self.logger.warning(f"Could not parse any ban info from {ban_hits_link}.")
 
         except aiohttp.ClientResponseError as e:
             if e.status == 404:
@@ -1083,4 +1099,6 @@ class AdminPanel:
         if elapsed > self.SLOW_REQUEST_THRESHOLD and not from_cache:
             if self.perf_logger.isEnabledFor(logging.DEBUG):
                 self.perf_logger.debug(f"Slow ban info fetch: {elapsed:.2f}s for link: {ban_hits_link}")
-        return ban_info
+        
+        self._log_debug(f"Extracted {len(ban_entries)} ban entries from {ban_hits_link}")
+        return ban_entries

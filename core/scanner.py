@@ -1253,7 +1253,7 @@ class Scanner:
             )
 
             ban_hit_connections = await asyncio.wait_for(
-                asyncio.to_thread(self.admin_panel.fetch_ban_hit_connections, max_pages=max_pages),
+                self.admin_panel.fetch_ban_hit_connections(max_pages=max_pages),
                 timeout=self._operation_timeout
             )
 
@@ -1344,10 +1344,23 @@ class Scanner:
                     return None
                 if ban_id:
                     processed_terms.add(ban_id)
-            ban_info = await self.admin.fetch_with_rate_limit(
+            ban_info_list = await self.admin.fetch_with_rate_limit(
                 self.admin_panel.fetch_ban_info,
                 ban_hits_link
             )
+            
+            if not ban_info_list:
+                self.logger.warning(f"No ban info found for link: {ban_hits_link}")
+                return None
+            
+            if len(ban_info_list) > 1:
+                self.logger.info(f"Found {len(ban_info_list)} ban bypass attempts for connection {ban_id}")
+                for idx, entry in enumerate(ban_info_list):
+                    ban_time = entry.get("ban_time", "unknown")
+                    ban_reason = entry.get("ban_reason", "unknown")
+                    self.logger.info(f"  Ban bypass #{idx + 1}: {ban_time} (reason: {ban_reason})")
+            
+            ban_info = ban_info_list[0]
             banned_user_name = ban_info.get("banned_user_name") or ban_hit.get("user_name", "")
             user_id = ban_info.get("user_id") or user_id
             ip_address = ban_info.get("ip_address") or ban_hit.get("ip_address", "")
@@ -1372,7 +1385,7 @@ class Scanner:
                 if hwid_match_users:
                     progress_stats['hwid_matches'] = progress_stats.get('hwid_matches', 0) + 1
                     self.logger.info(f"HWID match found for {banned_user_name}: {', '.join(sorted(hwid_match_users))}")
-            account_info = self.admin_panel.aggregate_single_user_info(connections)
+            account_info = await self.admin_panel.aggregate_single_user_info(connections)
             bypass_reason = self.analyzer.confidence_levels['no_match']
             bypass_user_names = []
             if hwid_match_users:
@@ -1434,6 +1447,8 @@ class Scanner:
                 "hwid_erased": hwid_erased,
                 "search_depth": max_depth,
                 "connections_analyzed": len(connections),
+                "ban_entries_count": len(ban_info_list),
+                "all_ban_entries": ban_info_list,
                 "results": [{
                     "initial_account": account_info,
                     "complaint_links": complaint_links,
@@ -1448,7 +1463,8 @@ class Scanner:
                 f"Ban hit for {banned_user_name}: Confidence: {bypass_reason}, " +
                 f"Bypass status: {bypass_success_status}, " +
                 f"Potential bypassers: {', '.join(bypass_user_names) if bypass_user_names else 'None'}, " +
-                f"Analyzed {len(connections)} connections"
+                f"Analyzed {len(connections)} connections, " +
+                f"Found {len(ban_info_list)} ban entries"
             )
             return report
         except Exception as e:
