@@ -351,6 +351,9 @@ class Scanner:
                 f"circuit_state={self.circuit_breaker.state})"
             )
 
+            delay_task = asyncio.create_task(asyncio.sleep(batch_delay)) if i + batch_size < len(
+                all_priority_terms) else None
+
             try:
                 batch_results = await self._process_batch_with_retry(
                     batch_terms, cache_lock, processed_terms, term_is_login_event,
@@ -374,8 +377,8 @@ class Scanner:
                     f"{successful_batches}/{successful_batches + failed_batches}"
                 )
 
-                if i < len(all_priority_terms):
-                    await asyncio.sleep(batch_delay)
+                if delay_task:
+                    await delay_task
 
             except Exception as e:
                 failed_batches += 1

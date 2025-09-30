@@ -509,12 +509,22 @@ class AdminService:
 
     def _make_cache_key(self, func: Callable, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> str:
         func_name = func.__name__ if hasattr(func, '__name__') else str(func)
-        payload = {"f": func_name, "a": args, "k": kwargs}
-        try:
-            raw = json.dumps(payload, sort_keys=True, default=str)
-        except Exception:
-            raw = repr(payload)
-        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+        if not kwargs and len(args) <= 2:
+            key_parts = [func_name]
+            for arg in args:
+                if isinstance(arg, (str, int, float, bool, type(None))):
+                    key_parts.append(str(arg))
+                else:
+                    key_parts.append(repr(arg)[:100])
+            cache_key_str = "|".join(key_parts)
+        else:
+            payload = {"f": func_name, "a": args[:3], "k": kwargs}
+            try:
+                raw = json.dumps(payload, sort_keys=True, default=str)
+            except Exception:
+                raw = repr(payload)[:500]
+            cache_key_str = raw
+        return hashlib.md5(cache_key_str.encode('utf-8'), usedforsecurity=False).hexdigest()
 
     async def fetch_connections_with_cache(self, identifier: str) -> Optional[List[Dict[str, Any]]]:
         cache_key = f"connections:{identifier}"
@@ -863,8 +873,11 @@ class AdminService:
 
         try:
             async with asyncio.timeout(self._request_timeout):
-                encoded_term = quote_plus(canonical_term_for_url)
-                connections_search_url = f"{self.base_admin_connections_url}&search={encoded_term}"
+                if canonical_term_for_url.replace('-', '').replace('.', '').replace('_', '').isalnum():
+                    connections_search_url = f"{self.base_admin_connections_url}&search={canonical_term_for_url}"
+                else:
+                    encoded_term = quote_plus(canonical_term_for_url)
+                    connections_search_url = f"{self.base_admin_connections_url}&search={encoded_term}"
 
                 term_data = await self.fetch_with_rate_limit(
                     self.admin_panel.check_account_on_site,
@@ -996,10 +1009,13 @@ class AdminService:
                     f"Attempted to merge non-dict results. Main: {type(main_result)}, New: {type(new_data)}")
             return
 
-        main_result["nicknames"] = sorted(
-            list(set(main_result.get("nicknames", [])) | set(new_data.get("nicknames", []))))
-        main_result["shared_hwid_nicknames"] = sorted(
-            list(set(main_result.get("shared_hwid_nicknames", [])) | set(new_data.get("shared_hwid_nicknames", []))))
+        main_nicks = set(main_result.get("nicknames", []))
+        main_nicks.update(new_data.get("nicknames", []))
+        main_result["nicknames"] = sorted(main_nicks)
+
+        main_shared = set(main_result.get("shared_hwid_nicknames", []))
+        main_shared.update(new_data.get("shared_hwid_nicknames", []))
+        main_result["shared_hwid_nicknames"] = sorted(main_shared)
 
         def br_key(br):
             return frozenset(br.items())
@@ -1020,14 +1036,22 @@ class AdminService:
 
         assoc_ips = main_result.get("associated_ips", {})
         for ip, nicks in new_data.get("associated_ips", {}).items():
-            assoc_ips[ip] = sorted(list(set(assoc_ips.get(ip, [])) | set(nicks)))
+            if ip in assoc_ips:
+                existing = set(assoc_ips[ip])
+                existing.update(nicks)
+                assoc_ips[ip] = sorted(existing)
+            else:
+                assoc_ips[ip] = sorted(nicks) if not isinstance(nicks, list) or nicks != sorted(nicks) else nicks
         main_result["associated_ips"] = assoc_ips
 
         assoc_hwids = main_result.get("associated_hwids", {})
         for hwid, nicks in new_data.get("associated_hwids", {}).items():
-            existing_nicks = set(assoc_hwids.get(hwid, []))
-            existing_nicks.update(nicks)
-            assoc_hwids[hwid] = sorted(list(existing_nicks))
+            if hwid in assoc_hwids:
+                existing_nicks = set(assoc_hwids[hwid])
+                existing_nicks.update(nicks)
+                assoc_hwids[hwid] = sorted(existing_nicks)
+            else:
+                assoc_hwids[hwid] = sorted(nicks) if not isinstance(nicks, list) or nicks != sorted(nicks) else nicks
         main_result["associated_hwids"] = assoc_hwids
 
         main_result["ban_counts"] = max(main_result.get("ban_counts", 0), new_data.get("ban_counts", 0))

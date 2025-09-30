@@ -392,14 +392,15 @@ class AdminPanel:
     def _parse_connection_row(self, row_node: Node) -> Optional[ConnectionData]:
         try:
             cols = row_node.css("td")
-            if len(cols) < 8:
+            col_count = len(cols)
+            if col_count < 8:
                 if self.logger.isEnabledFor(logging.DEBUG):
                     self.logger.debug(
-                        f"Too few columns in connection row: {len(cols)}. Row HTML: {row_node.html[:200]}")
+                        f"Too few columns in connection row: {col_count}. Row HTML: {row_node.html[:200]}")
                 return None
 
             ban_hits_link, connection_id = None, None
-            if len(cols) >= 9:
+            if col_count >= 9:
                 link_tag = cols[8].css_first("a")
                 if link_tag:
                     raw_link = link_tag.attributes.get("href")
@@ -408,7 +409,7 @@ class AdminPanel:
                         if "connection=" in potential_ban_hits_link:
                             ban_hits_link = potential_ban_hits_link
                             try:
-                                connection_id = ban_hits_link.split("connection=")[1].split("&")[0]
+                                connection_id = ban_hits_link.split("connection=", 1)[1].split("&", 1)[0]
                             except IndexError:
                                 if self.logger.isEnabledFor(logging.WARNING):
                                     self.logger.warning(
@@ -472,18 +473,23 @@ class AdminPanel:
         new_ips = set()
         new_hwids = set()
 
+        existing_names = existing_data_sets['user_names']
+        existing_ids = existing_data_sets['user_ids']
+        existing_ips = existing_data_sets['ips']
+        existing_hwids = existing_data_sets['hwids']
+
         for row_idx, row_node in enumerate(rows):
             conn = self._parse_connection_row(row_node)
             if conn:
                 connections.append(conn)
 
-                if conn.user_name and conn.user_name not in existing_data_sets['user_names']:
+                if conn.user_name and conn.user_name not in existing_names:
                     new_user_names.add(conn.user_name)
-                if conn.user_id and conn.user_id not in existing_data_sets['user_ids']:
+                if conn.user_id and conn.user_id not in existing_ids:
                     new_user_ids.add(conn.user_id)
-                if conn.ip_address and conn.ip_address != N_A and conn.ip_address not in existing_data_sets['ips']:
+                if conn.ip_address and conn.ip_address != N_A and conn.ip_address not in existing_ips:
                     new_ips.add(conn.ip_address)
-                if conn.hwid and conn.hwid != N_A and conn.hwid not in existing_data_sets['hwids']:
+                if conn.hwid and conn.hwid != N_A and conn.hwid not in existing_hwids:
                     new_hwids.add(conn.hwid)
 
             elif self.logger.isEnabledFor(logging.WARNING):
